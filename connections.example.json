@@ -1,0 +1,25 @@
+{
+  "default": "local2025r2",
+  "instances": {
+    "local2025r2": {
+      "base_url": "http://localhost/2025R2",
+      "client_id": "CLIENT_ID@CompanyLogin",
+      "client_secret": "secret",
+      "username": "admin",
+      "password": "password",
+      "endpoint_name": "Default",
+      "endpoint_version": "24.200.001",
+      "tenant": "CompanyLogin"
+    },
+    "grp-vps": {
+      "base_url": "https://your-grp-instance",
+      "client_id": "CLIENT_ID@CompanyLogin",
+      "client_secret": "secret",
+      "username": "admin",
+      "password": "password",
+      "endpoint_name": "Default",
+      "endpoint_version": "24.200.001",
+      "tenant": "CompanyLogin"
+    }
+  }
+}

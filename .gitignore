@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+connections.json
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
