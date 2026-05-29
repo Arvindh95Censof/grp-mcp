@@ -30,7 +30,26 @@ class AcumaticaClient:
         self._expires_at: float = 0.0
 
     async def aclose(self) -> None:
+        await self.logout()
         await self._http.aclose()
+
+    async def logout(self) -> None:
+        """Close the API session to free the license seat (trial = 2 seats).
+
+        Acumatica counts each unclosed sign-in against the Max Web Services API
+        Users limit, so callers must release the session when done.
+        """
+        if not self._access_token:
+            return
+        try:
+            await self._http.post(
+                f"{self.instance.base_url.rstrip('/')}/entity/auth/logout",
+                headers={"Authorization": f"Bearer {self._access_token}"},
+            )
+        except Exception:
+            pass
+        self._access_token = None
+        self._expires_at = 0.0
 
     # ---- auth -----------------------------------------------------------
 
