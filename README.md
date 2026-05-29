@@ -14,9 +14,28 @@ base URL + OAuth credentials.
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
 | `run_generic_inquiry` | Run a Generic Inquiry via OData. |
+| `list_published` | List published customization projects (read-only). |
+| `import_customization` | Import a customization `.zip` (does not publish). |
+| `publish_customization` | Publish projects (async begin + poll). |
+| `unpublish_customization` | Unpublish all customization projects (rollback). |
 
 Every tool takes an optional `instance` arg to pick a connection; defaults to the
 configured default instance.
+
+The data tools use the **contract REST API** over OAuth2. The customization tools
+use the **Customization Web API** over a cookie session (it rejects OAuth bearer);
+both reuse the same credentials from your config.
+
+### Publishing customization projects
+
+Publishing is **website-level — it recompiles the site and affects ALL tenants**
+on the instance, not just one. As a safety gate, `publish_customization`,
+`import_customization`, and `unpublish_customization` are refused unless the
+instance profile sets `"allow_publish": true`. Keep it `false` on prod profiles.
+
+`publish_customization` runs the async flow automatically (`publishBegin` → poll
+`publishEnd` until `isCompleted`). `tenant_mode` is `Current` (default), `All`, or
+`List` (with `tenant_login_names`).
 
 ## Setup
 

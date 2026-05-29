@@ -13,11 +13,13 @@ from mcp.server.fastmcp import FastMCP
 
 from .acumatica import AcumaticaClient
 from .config import Config, load_config
+from .customization import CustomizationClient, encode_zip
 
 mcp = FastMCP("grp-mcp")
 
 _config: Config | None = None
 _clients: dict[str, AcumaticaClient] = {}
+_cust_clients: dict[str, CustomizationClient] = {}
 
 
 def _cfg() -> Config:
@@ -33,6 +35,26 @@ def _client(instance: str | None) -> AcumaticaClient:
     if name not in _clients:
         _clients[name] = AcumaticaClient(cfg.get(name))
     return _clients[name]
+
+
+def _cust_client(instance: str | None) -> CustomizationClient:
+    cfg = _cfg()
+    name = instance or cfg.default
+    if name not in _cust_clients:
+        _cust_clients[name] = CustomizationClient(cfg.get(name))
+    return _cust_clients[name]
+
+
+def _require_publish(instance: str | None) -> None:
+    """Block Customization API write ops unless the instance opted in."""
+    cfg = _cfg()
+    name = instance or cfg.default
+    if not cfg.get(name).allow_publish:
+        raise PermissionError(
+            f"Publishing is disabled for instance '{name}'. Set \"allow_publish\": true "
+            f"in its connections.json profile to permit publish/import/unpublish. "
+            f"Note: publishing is website-level and affects ALL tenants on the instance."
+        )
 
 
 def _wrap(value: Any) -> Any:
@@ -150,6 +172,75 @@ async def run_generic_inquiry(
     if top:
         params["$top"] = top
     return await _client(instance).run_gi(name, params)
+
+
+@mcp.tool()
+async def list_published(instance: str | None = None) -> Any:
+    """List customization projects currently published on the instance (read-only)."""
+    return await _cust_client(instance).get_published()
+
+
+@mcp.tool()
+async def import_customization(
+    project_name: str,
+    zip_path: str,
+    is_replace_if_exists: bool = True,
+    project_level: int | None = None,
+    project_description: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Import a customization package (.zip on disk) into the instance.
+
+    Creates/replaces the project; does NOT publish it. Requires the instance's
+    profile to have "allow_publish": true.
+    """
+    _require_publish(instance)
+    content = encode_zip(zip_path)
+    return await _cust_client(instance).import_project(
+        project_name,
+        content_base64=content,
+        is_replace_if_exists=is_replace_if_exists,
+        project_level=project_level,
+        project_description=project_description,
+    )
+
+
+@mcp.tool()
+async def publish_customization(
+    project_names: list[str],
+    tenant_mode: str = "Current",
+    tenant_login_names: list[str] | None = None,
+    options: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Publish one or more customization projects (async begin + poll until done).
+
+    WARNING: website-level — recompiles the site and affects ALL tenants on the
+    instance. tenant_mode: Current | All | List (with tenant_login_names).
+    `options` passes extra publishBegin flags (e.g. merge/db-script options).
+    Requires the instance's profile to have "allow_publish": true.
+    """
+    _require_publish(instance)
+    return await _cust_client(instance).publish(
+        project_names,
+        tenant_mode=tenant_mode,
+        tenant_login_names=tenant_login_names,
+        options=options,
+    )
+
+
+@mcp.tool()
+async def unpublish_customization(
+    tenant_mode: str = "Current",
+    tenant_login_names: list[str] | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Unpublish ALL customization projects (rollback). Website-level recompile.
+
+    tenant_mode: Current | All | List. Requires "allow_publish": true.
+    """
+    _require_publish(instance)
+    return await _cust_client(instance).unpublish_all(tenant_mode, tenant_login_names)
 
 
 def main() -> None:

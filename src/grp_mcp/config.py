@@ -31,6 +31,8 @@ class Instance(BaseModel):
     endpoint_name: str = "Default"
     endpoint_version: str = "24.200.001"
     tenant: str = ""  # company login name, needed for OData / GI calls
+    branch: str = ""  # optional login branch
+    allow_publish: bool = False  # gate for Customization API write ops (publish/import/unpublish)
 
     @property
     def token_url(self) -> str:
@@ -75,6 +77,8 @@ def _from_env() -> Config | None:
         endpoint_name=os.getenv("GRP_MCP_ENDPOINT_NAME", "Default"),
         endpoint_version=os.getenv("GRP_MCP_ENDPOINT_VERSION", "24.200.001"),
         tenant=os.getenv("GRP_MCP_TENANT", ""),
+        branch=os.getenv("GRP_MCP_BRANCH", ""),
+        allow_publish=os.getenv("GRP_MCP_ALLOW_PUBLISH", "").lower() in ("1", "true", "yes"),
     )
     return Config(default="default", instances={"default": inst})
 

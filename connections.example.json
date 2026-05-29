@@ -9,7 +9,9 @@
       "password": "password",
       "endpoint_name": "Default",
       "endpoint_version": "24.200.001",
-      "tenant": "CompanyLogin"
+      "tenant": "CompanyLogin",
+      "branch": "",
+      "allow_publish": false
     },
     "grp-vps": {
       "base_url": "https://your-grp-instance",
@@ -19,7 +21,9 @@
       "password": "password",
       "endpoint_name": "Default",
       "endpoint_version": "24.200.001",
-      "tenant": "CompanyLogin"
+      "tenant": "CompanyLogin",
+      "branch": "",
+      "allow_publish": false
     }
   }
 }
