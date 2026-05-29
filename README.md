@@ -35,29 +35,55 @@ python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -e .
 ```
 
-### 3. Configure
+### 3. Configure (pick one)
 
-Single instance — copy `.env.example` to `.env` and fill it in.
+Credentials are read **once at server startup**, in this priority order:
 
-Multiple instances — copy `connections.example.json` to `connections.json` and
-add named profiles. `connections.json` and `.env` are gitignored.
+1. `GRP_MCP_CONNECTIONS` env var → path to a `connections.json`
+2. `connections.json` in the current working directory
+3. `connections.json` in the repo root
+4. `.env` file in the current working directory
+
+**Option A — `.env` (simplest, single instance):** copy `.env.example` to `.env`
+and fill it in. Only loaded if the server's launch directory is the repo, so it
+works best with a launcher that sets `cwd` (see below).
+
+**Option B — `connections.json` (robust, multi-instance):** copy
+`connections.example.json` to `connections.json`, add one or more named profiles.
+Recommended for distribution because you can point at it with an absolute path
+that does not depend on the launch directory.
+
+Both `.env` and `connections.json` are gitignored — never commit real credentials.
 
 ### 4. Register with Claude
 
-Add to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`):
+**Claude Code (CLI)** — user scope, available in all projects. Point at an
+absolute `connections.json` so launch directory does not matter:
+
+```bash
+claude mcp add grp-mcp -s user \
+  -e GRP_MCP_CONNECTIONS=/abs/path/to/connections.json \
+  -- /abs/path/to/.venv/Scripts/grp-mcp.exe        # use grp-mcp on macOS/Linux
+```
+
+**Claude Desktop** — add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "grp-mcp": {
       "command": "grp-mcp",
-      "cwd": "C:\\Temp\\grp-mcp"
+      "cwd": "C:\\path\\to\\grp-mcp",
+      "env": { "GRP_MCP_CONNECTIONS": "C:\\path\\to\\grp-mcp\\connections.json" }
     }
   }
 }
 ```
 
-(Or `"command": "python", "args": ["-m", "grp_mcp.server"]`.)
+(`cwd` lets `.env` load; the `env` line makes `connections.json` work regardless.
+Use one config method — you don't need both files.)
+
+Restart the client after adding — tools load at startup.
 
 ## Notes
 
