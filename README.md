@@ -115,4 +115,35 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.1 — early. Roadmap: action polling, AFS project setup tools, attachments.
+v0.1 — early. Roadmap: action polling, attachments.
+
+## AFS Financial Report entities (instance-specific)
+
+These custom entities are exposed on the **`Default2025` / `25.200.001`** endpoint
+of the AFS Financial Report customization (`AFSCPFinancialReportv213032026`). They
+are not part of grp-mcp itself — they were added in SM207060 and are reachable
+through the generic tools. Documented here as a usage reference.
+
+| Entity | Key field | Detail collection (use as `expand`) |
+|--------|-----------|-------------------------------------|
+| `FLRTReportDefinition` | `DefinitionCode` | `LineItems` → report line items |
+| `FLRTGIDataSource` | `DataSourceCode` | `GIDataSource` → GI column defs |
+| `FLRTFinancialReport` | `ReportCD` | `DefinitionLinks` → linked definitions |
+| `FLRTPresentationGeneration` | `PresentationCD` | `PresentationDataSourceLink` → linked data sources |
+| `FLRTTenantCredentials` | `CompanyNumber` | — |
+
+Notes:
+- Detail/expand names are **as configured in the endpoint**, which differ from the
+  DAC view names (e.g. `GIDataSource` and `PresentationDataSourceLink` were renamed
+  from `Columns` / `DataSourceLinks`). Pull the live names from
+  `GET {entity_base}/swagger.json` if unsure.
+- Endpoint field names are display-based (`DefinitionCode` not `DefinitionCD`,
+  `VisibleinReport` not `IsVisible`). String-list fields take the **label**
+  (`ReportType` = `"Balance Sheet"`, `"Custom"`).
+- Example: `get_entity("FLRTReportDefinition", filter="DefinitionCode eq 'BALANCE_SHEET'", expand="LineItems")`.
+- Process actions exist on some entities (e.g. `GenerateReport`, `DetectColumns`)
+  — call via `invoke_action`.
+- Security: `FLRTTenantCredentials` may expose secret fields (`ClientSecret`,
+  `Password`) over REST — drop those from the endpoint if not needed.
+- Web Service Endpoints can only be created/edited in the SM207060 UI; there is no
+  REST API to build them.
