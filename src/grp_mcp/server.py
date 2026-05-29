@@ -7,6 +7,7 @@ default instance is used.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -19,7 +20,6 @@ mcp = FastMCP("grp-mcp")
 
 _config: Config | None = None
 _clients: dict[str, AcumaticaClient] = {}
-_cust_clients: dict[str, CustomizationClient] = {}
 
 
 def _cfg() -> Config:
@@ -37,12 +37,19 @@ def _client(instance: str | None) -> AcumaticaClient:
     return _clients[name]
 
 
-def _cust_client(instance: str | None) -> CustomizationClient:
+@asynccontextmanager
+async def _customization(instance: str | None):
+    """Short-lived cookie session for one Customization API operation.
+
+    Not cached: opened per call and logged out on exit so it never holds an API
+    license seat at idle (trial license = only 2 Web Services API Users).
+    """
     cfg = _cfg()
-    name = instance or cfg.default
-    if name not in _cust_clients:
-        _cust_clients[name] = CustomizationClient(cfg.get(name))
-    return _cust_clients[name]
+    client = CustomizationClient(cfg.get(instance or cfg.default))
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 def _require_publish(instance: str | None) -> None:
@@ -177,7 +184,8 @@ async def run_generic_inquiry(
 @mcp.tool()
 async def list_published(instance: str | None = None) -> Any:
     """List customization projects currently published on the instance (read-only)."""
-    return await _cust_client(instance).get_published()
+    async with _customization(instance) as c:
+        return await c.get_published()
 
 
 @mcp.tool()
@@ -196,13 +204,14 @@ async def import_customization(
     """
     _require_publish(instance)
     content = encode_zip(zip_path)
-    return await _cust_client(instance).import_project(
-        project_name,
-        content_base64=content,
-        is_replace_if_exists=is_replace_if_exists,
-        project_level=project_level,
-        project_description=project_description,
-    )
+    async with _customization(instance) as c:
+        return await c.import_project(
+            project_name,
+            content_base64=content,
+            is_replace_if_exists=is_replace_if_exists,
+            project_level=project_level,
+            project_description=project_description,
+        )
 
 
 @mcp.tool()
@@ -221,12 +230,13 @@ async def publish_customization(
     Requires the instance's profile to have "allow_publish": true.
     """
     _require_publish(instance)
-    return await _cust_client(instance).publish(
-        project_names,
-        tenant_mode=tenant_mode,
-        tenant_login_names=tenant_login_names,
-        options=options,
-    )
+    async with _customization(instance) as c:
+        return await c.publish(
+            project_names,
+            tenant_mode=tenant_mode,
+            tenant_login_names=tenant_login_names,
+            options=options,
+        )
 
 
 @mcp.tool()
@@ -240,7 +250,8 @@ async def unpublish_customization(
     tenant_mode: Current | All | List. Requires "allow_publish": true.
     """
     _require_publish(instance)
-    return await _cust_client(instance).unpublish_all(tenant_mode, tenant_login_names)
+    async with _customization(instance) as c:
+        return await c.unpublish_all(tenant_mode, tenant_login_names)
 
 
 def main() -> None:
