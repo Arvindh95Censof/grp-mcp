@@ -6,14 +6,52 @@ base URL + OAuth credentials.
 
 ## Tools
 
+**Discovery / metadata**
+
 | Tool | What it does |
 |------|--------------|
 | `list_instances` | List configured instances (no secrets). |
-| `get_entity` | Get one record or a filtered list of an entity. |
+| `list_endpoints` | List all web service endpoints on the instance (name/version). |
+| `list_entities` | List top-level entities of the configured endpoint (via swagger.json). |
+| `get_entity_schema` | Fields of one entity, split into scalar vs detail (nested). |
+| `list_actions` | Actions invokable on an entity (for `invoke_action`). |
+| `list_generic_inquiries` | Generic Inquiries exposed via OData (name + url). |
+
+**Read**
+
+| Tool | What it does |
+|------|--------------|
+| `get_entity` | Get one record or a filtered list; supports `$filter/$select/$expand/$top/$custom`. |
+| `count_entity` | Count records (client-side; scope with `filter`). |
+| `run_generic_inquiry` | Run a Generic Inquiry via OData. |
+| `get_endpoint_definition` | Read an endpoint's contract (entity tree/props) from SM207060. |
+
+**Write**
+
+| Tool | What it does |
+|------|--------------|
 | `create_or_update_entity` | Create/update a record (PUT, upsert by key). |
+| `load_from_excel` | Bulk upsert an entity from `.xlsx`/`.csv` with column mapping + dry-run. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
-| `run_generic_inquiry` | Run a Generic Inquiry via OData. |
+| `poll_action` | Check a long-running action's status by its `Location`. |
+
+**Contract / config**
+
+| Tool | What it does |
+|------|--------------|
+| `extend_endpoint` | Add entities/fields to a contract via the `WebServiceEndpoints` entity (gated). |
+
+**Safety**
+
+| Tool | What it does |
+|------|--------------|
+| `snapshot_entity` | Dump an entity to JSON before risky changes (rollback aid). |
+
+**Customization Web API**
+
+| Tool | What it does |
+|------|--------------|
 | `list_published` | List published customization projects (read-only). |
 | `import_customization` | Import a customization `.zip` (does not publish). |
 | `publish_customization` | Publish projects (async begin + poll). |
@@ -25,6 +63,33 @@ configured default instance.
 The data tools use the **contract REST API** over OAuth2. The customization tools
 use the **Customization Web API** over a cookie session (it rejects OAuth bearer);
 both reuse the same credentials from your config.
+
+### Bulk loading from Excel/CSV
+
+`load_from_excel` turns a master file (Chart of Accounts, sub-account values,
+trial balance, …) into one call instead of hundreds of `create_or_update_entity`.
+The first row is the header; `column_map` maps a header to an entity field name
+(omit to use headers verbatim, or map to `""` to ignore a column). It defaults to
+`dry_run=true` — it parses, maps, and validates field names against the schema and
+returns a preview **without writing**; re-run with `dry_run=false` to load. Only
+scalar fields are supported (no nested detail rows).
+
+### Extending an endpoint contract
+
+`extend_endpoint` adds top-level entities/fields to an existing endpoint by writing
+to the `WebServiceEndpoints` entity (the SM207060 form projected over REST). This
+is a **website-level contract change** — gated behind `"allow_publish": true`. It
+is experimental: the underlying form is wizard-driven, so not every screen maps
+cleanly in a single PUT. Read first with `get_endpoint_definition`, snapshot, and
+test on a throwaway endpoint — never the one the server is actively using.
+
+### Detail-field guard
+
+A list GET (no `record_id`) cannot return detail/nested collections — Acumatica
+silently omits them. `get_entity` detects when a list query asks for a detail field
+via `expand`/`select` and returns a `_warning` explaining the field is absent and
+how to fetch it (per record, by key). `get_entity_schema` labels which fields are
+detail so you know up front.
 
 ### Publishing customization projects
 
@@ -48,11 +113,15 @@ In Acumatica: **Integration → Connected Applications**. Create one with the
 ### 2. Install
 
 ```bash
-git clone https://github.com/Arvindh95/grp-mcp.git
+git clone https://github.com/Arvindh95Censof/grp-mcp.git
 cd grp-mcp
 python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -e .
 ```
+
+Dependencies install automatically (`mcp`, `httpx`, `pydantic`, `python-dotenv`,
+`openpyxl`). Note: the `.venv` is **not relocatable** — if you move the repo,
+recreate the venv and `pip install -e .` at the new path, then update the launcher.
 
 ### 3. Configure (pick one)
 
@@ -110,12 +179,14 @@ Restart the client after adding — tools load at startup.
 - `endpoint_version` defaults to `24.200.001`; set it to match your instance's
   Default endpoint version (System → Web Service Endpoints).
 - Generic Inquiries are read via OData and need the `tenant` (company login) set.
-- Actions may return `202` + a `Location` header for long-running work; polling
-  that location is not yet automated.
+- Actions may return `202` + a `Location` for long-running work — check it with
+  `poll_action` (204 = finished, 202 = still running).
+- `snapshot_entity` writes to `<connections dir>/snapshots/` by default; that
+  folder is gitignored (it can contain business data).
 
 ## Status
 
-v0.1 — early. Roadmap: action polling, attachments.
+v0.1 — 21 tools. Roadmap: attachments, nested detail rows in `load_from_excel`.
 
 ## AFS Financial Report entities (instance-specific)
 
@@ -145,5 +216,7 @@ Notes:
   — call via `invoke_action`.
 - Security: `FLRTTenantCredentials` may expose secret fields (`ClientSecret`,
   `Password`) over REST — drop those from the endpoint if not needed.
-- Web Service Endpoints can only be created/edited in the SM207060 UI; there is no
-  REST API to build them.
+- Web Service Endpoints are editable in the SM207060 UI and, on newer builds, via
+  the `WebServiceEndpoints` entity (see `extend_endpoint` / `get_endpoint_definition`).
+  The entity is a projection of the wizard-driven form, so complex contracts are
+  still more reliably built in the UI.
