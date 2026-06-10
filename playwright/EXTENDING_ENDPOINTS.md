@@ -162,3 +162,31 @@ node add_endpoint_entity_modern.js --endpoint GRPSetup --version 25.200.001 `
 ```
 Verify with grp-mcp (`instance="local2026r1"`):
 `get_entity_schema("AccountClass", instance="local2026r1", refresh=true)`.
+
+## Adding ACTIONS to an entity (modern UI)
+
+Actions = screen commands (Release, Save, ChangeID, Import…) exposed on the contract,
+invokable via `POST {Endpoint}/{Entity}/{Action}` (grp-mcp `invoke_action`). Inherited
+entities already carry their standard actions; **custom entities have none** until
+added. Use **`add_endpoint_action_modern.js`**.
+
+Flow (KB "To Add an Action to an Entity" + verified modern control map):
+1. Expand the entity node — click its row arrow `tr.tree-row i[ref="arrow"]`.
+2. Select the entity's **Actions** child node (`tr.tree-row` whose text is `Actions`).
+3. `[data-cmd="InsertNew"]` → **Create Action** dialog.
+4. Pick the **Mapped Action** (`edCreateActionView-MappedAction` qp-selector — button →
+   search → dblclick row → green **Select**); the lookup lists that screen's commands.
+5. Fill **Action Name** `edCreateActionView-ActionName` (the API name).
+6. JS-click **OK**. For actions with parameters, `[data-cmd="PopulateParameters"]` then OK.
+7. `[data-cmd="Save"]`.
+
+```powershell
+node add_endpoint_action_modern.js --endpoint GRPSetup --version 25.200.001 `
+     --entity AccountClass --action "Save" --action-name Save
+# --populate-params for actions that take parameters
+```
+Verified: added `Save` to `AccountClass` → `list_actions("AccountClass", instance="local2026r1")` ⇒ `Save`.
+
+> Naming rules: action/parameter names = English letters/digits/underscores, can't start
+> with a digit; action name must be unique among the endpoint's entities+actions.
+> Use grp-mcp's `list_actions` to read and `invoke_action`/`poll_action` to call them.
