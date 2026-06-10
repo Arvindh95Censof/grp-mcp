@@ -7,6 +7,8 @@ default instance is used.
 
 from __future__ import annotations
 
+import json
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -198,6 +200,7 @@ async def get_entity(
     select: str | None = None,
     expand: str | None = None,
     top: int | None = None,
+    custom: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Retrieve one or many records of a top-level entity.
@@ -205,6 +208,8 @@ async def get_entity(
     entity: endpoint entity name, e.g. "Customer", "SalesOrder", "Bill".
     record_id: fetch a single record by its key/id; omit to list.
     filter/select/expand/top: OData-style query options (contract API $filter etc).
+    custom: $custom param to pull fields NOT in the contract (unexposed elements /
+            user-defined fields), format "<View>.<Field>" comma-separated.
     """
     params: dict[str, Any] = {}
     if filter:
@@ -215,6 +220,8 @@ async def get_entity(
         params["$expand"] = expand
     if top:
         params["$top"] = top
+    if custom:
+        params["$custom"] = custom
 
     client = _client(instance)
     result = await client.get_entity(entity, record_id, params)
@@ -335,6 +342,93 @@ async def load_from_excel(
 async def delete_entity(entity: str, record_id: str, instance: str | None = None) -> Any:
     """Delete a record by its id (the record's key GUID or keys path)."""
     return await _client(instance).delete_entity(entity, record_id)
+
+
+@mcp.tool()
+async def count_entity(
+    entity: str,
+    filter: str | None = None,
+    select: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Count records of an entity (optionally scoped by filter).
+
+    NOTE: the contract API has no server-side $count, so this fetches matching
+    rows and counts them. Pass select=<a key field> to shrink the payload, and
+    use filter to scope big tables.
+    """
+    params: dict[str, Any] = {}
+    if filter:
+        params["$filter"] = filter
+    if select:
+        params["$select"] = select
+    res = await _client(instance).get_entity(entity, None, params)
+    n = len(res) if isinstance(res, list) else (0 if res is None else 1)
+    return {"entity": entity, "count": n, "filter": filter or None}
+
+
+@mcp.tool()
+async def list_actions(entity: str, refresh: bool = False, instance: str | None = None) -> Any:
+    """List the actions invokable on an entity via invoke_action (from the contract).
+
+    e.g. SalesOrder -> ["ReopenSalesOrder", ...]. Use before invoke_action to get
+    the exact action name. Set refresh=true to bypass the swagger cache.
+    """
+    return await _client(instance).list_actions(entity, refresh=refresh)
+
+
+@mcp.tool()
+async def poll_action(location: str, instance: str | None = None) -> Any:
+    """Check a long-running action's status by its Location (from invoke_action).
+
+    invoke_action returns 202 + a location for async actions. GET it here:
+    204 = finished, 202 = still running. Re-call until it finishes.
+    """
+    return await _client(instance).get_url(location)
+
+
+@mcp.tool()
+async def snapshot_entity(
+    entity: str,
+    path: str | None = None,
+    filter: str | None = None,
+    expand: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Dump all records of an entity to a JSON file (backup before risky changes).
+
+    Writes to `path`, or by default to <connections dir>/snapshots/<entity>_<instance>.json.
+    Returns the file path + record count. Use before destructive ops (calendar
+    regen, segment restructure, bulk overwrite) so you can roll back.
+    """
+    params: dict[str, Any] = {}
+    if filter:
+        params["$filter"] = filter
+    if expand:
+        params["$expand"] = expand
+    cfg = _cfg()
+    name = instance or cfg.default
+    data = await _client(instance).get_entity(entity, None, params)
+
+    if not path:
+        base = os.path.dirname(os.environ.get("GRP_MCP_CONNECTIONS", "")) or os.getcwd()
+        out_dir = os.path.join(base, "snapshots")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{entity}_{name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    n = len(data) if isinstance(data, list) else (0 if data is None else 1)
+    return {"entity": entity, "instance": name, "count": n, "path": path}
+
+
+@mcp.tool()
+async def list_generic_inquiries(instance: str | None = None) -> Any:
+    """List Generic Inquiries exposed via OData (name + url) on the instance.
+
+    Requires the instance's `tenant` set in config. Use a returned name with
+    run_generic_inquiry.
+    """
+    return await _client(instance).list_generic_inquiries()
 
 
 @mcp.tool()

@@ -17,3 +17,6 @@ connections.json
 .vscode/
 .idea/
 .DS_Store
+
+# Snapshot dumps (business data)
+snapshots/

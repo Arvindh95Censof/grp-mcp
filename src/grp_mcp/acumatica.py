@@ -171,6 +171,20 @@ class AcumaticaClient:
                 tops.add(m.group(1))
         return sorted(tops)
 
+    async def list_actions(self, entity: str, refresh: bool = False) -> list[str]:
+        """Action names invokable on an entity (literal POST sub-paths in contract)."""
+        doc = await self.get_swagger(refresh=refresh)
+        prefix = f"/{entity}/"
+        acts: set[str] = set()
+        for path, ops in (doc.get("paths") or {}).items():
+            if not path.startswith(prefix):
+                continue
+            seg = path[len(prefix):]
+            if seg and "{" not in seg and "/" not in seg:
+                if "post" in {k.lower() for k in ops}:
+                    acts.add(seg)
+        return sorted(acts)
+
     _META_FIELDS = ("id", "rowNumber", "note", "_links", "custom", "files")
 
     async def _merged_props(self, entity: str, refresh: bool = False) -> dict:
@@ -224,8 +238,20 @@ class AcumaticaClient:
                     "record_id (optionally with expand=) one record at a time.",
         }
 
+    async def get_url(self, url: str) -> Any:
+        """GET an absolute or instance-relative URL (e.g. an action's Location)."""
+        if url.startswith("/"):
+            url = f"{self.instance.base_url.rstrip('/')}{url}"
+        return await self._request("GET", url)
+
     # ---- OData (Generic Inquiries) -------------------------------------
 
     async def run_gi(self, name: str, params: dict | None = None) -> Any:
         url = f"{self.instance.odata_base}/{name}"
         return await self._request("GET", url, params=params or {})
+
+    async def list_generic_inquiries(self) -> Any:
+        """OData service document: the Generic Inquiries exposed via OData."""
+        return await self._request(
+            "GET", self.instance.odata_base, params={"$format": "json"}
+        )
