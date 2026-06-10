@@ -93,6 +93,40 @@ def list_instances() -> list[dict]:
 
 
 @mcp.tool()
+async def list_endpoints(instance: str | None = None) -> Any:
+    """List all web service endpoints published on the instance.
+
+    Returns each endpoint's name, version, and href (e.g. Default, GRPSetup,
+    MANUFACTURING). Independent of the instance's configured endpoint.
+    """
+    return await _client(instance).list_endpoints()
+
+
+@mcp.tool()
+async def list_entities(refresh: bool = False, instance: str | None = None) -> Any:
+    """List the top-level entities exposed by the instance's configured endpoint.
+
+    Uses endpoint_name/endpoint_version from connections.json. Source: the
+    endpoint's swagger.json (the metadata-root GET is often proxy-gated 401).
+    Set refresh=true to bypass the per-session cache.
+    """
+    return await _client(instance).list_entities(refresh=refresh)
+
+
+@mcp.tool()
+async def get_entity_schema(
+    entity: str, refresh: bool = False, instance: str | None = None
+) -> Any:
+    """List the fields of one entity in the configured endpoint contract.
+
+    entity: e.g. "Customer", "Project", "SalesOrder". Returns field names +
+    count (from swagger.json). Use before create_or_update_entity to know which
+    fields exist on the screen.
+    """
+    return await _client(instance).get_entity_schema(entity, refresh=refresh)
+
+
+@mcp.tool()
 async def get_entity(
     entity: str,
     record_id: str | None = None,
@@ -117,7 +151,33 @@ async def get_entity(
         params["$expand"] = expand
     if top:
         params["$top"] = top
-    return await _client(instance).get_entity(entity, record_id, params)
+
+    client = _client(instance)
+    result = await client.get_entity(entity, record_id, params)
+
+    # Active guard: a LIST GET (no record_id) cannot return detail/nested fields.
+    # If the caller asked for any via $expand or $select, flag it — the data for
+    # those fields is silently absent and must be fetched per record by key.
+    if record_id is None and (expand or select):
+        details = await client.detail_fields(entity)
+        if details:
+            requested = {p.split("(", 1)[0].strip()
+                         for raw in ((expand or ""), (select or ""))
+                         for p in raw.split(",") if p.strip()}
+            flagged = sorted(requested & details)
+            if flagged:
+                return {
+                    "_warning": (
+                        f"List GET on '{entity}' cannot return detail fields "
+                        f"{flagged} - Acumatica omits nested collections from list "
+                        f"queries. Their values are NOT in this result. To get "
+                        f"them, fetch one record by key: "
+                        f"get_entity('{entity}', record_id=<key>, expand='"
+                        f"{','.join(flagged)}')."
+                    ),
+                    "result": result,
+                }
+    return result
 
 
 @mcp.tool()

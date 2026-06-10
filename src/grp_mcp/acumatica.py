@@ -6,6 +6,7 @@ helpers over the contract-based REST endpoint and OData (Generic Inquiries).
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -28,6 +29,7 @@ class AcumaticaClient:
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._expires_at: float = 0.0
+        self._swagger: dict | None = None
 
     async def aclose(self) -> None:
         await self.logout()
@@ -140,6 +142,87 @@ class AcumaticaClient:
         return await self._request(
             "POST", self._entity_url(entity, action), json=body
         )
+
+    # ---- metadata / discovery ------------------------------------------
+
+    async def list_endpoints(self) -> Any:
+        """All web service endpoints published on the instance (name/version/href)."""
+        url = f"{self.instance.base_url.rstrip('/')}/entity"
+        return await self._request("GET", url)
+
+    async def get_swagger(self, refresh: bool = False) -> dict:
+        """OpenAPI document for the configured endpoint (cached per client).
+
+        The endpoint-root metadata GET ({endpoint}/{version}/) is often proxy-gated
+        (401), so entity/field discovery is sourced from swagger.json instead.
+        """
+        if self._swagger is None or refresh:
+            url = f"{self.instance.entity_base}/swagger.json"
+            self._swagger = await self._request("GET", url)
+        return self._swagger
+
+    async def list_entities(self, refresh: bool = False) -> list[str]:
+        """Top-level entity names exposed by the configured endpoint contract."""
+        doc = await self.get_swagger(refresh=refresh)
+        tops: set[str] = set()
+        for path in doc.get("paths") or {}:
+            m = re.match(r"/([^/{]+)", path)
+            if m:
+                tops.add(m.group(1))
+        return sorted(tops)
+
+    _META_FIELDS = ("id", "rowNumber", "note", "_links", "custom", "files")
+
+    async def _merged_props(self, entity: str, refresh: bool = False) -> dict:
+        """Resolve an entity's properties, merging the allOf base + detail parts."""
+        doc = await self.get_swagger(refresh=refresh)
+        schemas = (doc.get("components") or {}).get("schemas") or {}
+        if entity not in schemas:
+            close = sorted(s for s in schemas if entity.lower() in s.lower())
+            raise AcumaticaError(
+                f"Entity '{entity}' not in contract schemas. Similar: {close[:10]}"
+            )
+        node = schemas[entity]
+        props: dict = dict(node.get("properties") or {})
+        for part in node.get("allOf") or []:
+            if "$ref" not in part:  # skip the shared base Entity ref
+                props.update(part.get("properties") or {})
+        return props
+
+    @staticmethod
+    def _is_detail(spec: Any) -> bool:
+        """A field is detail/nested when it's an array (detail collection)."""
+        return isinstance(spec, dict) and spec.get("type") == "array"
+
+    async def detail_fields(self, entity: str, refresh: bool = False) -> set[str]:
+        """Detail/nested (array) field names — omitted from list GETs by Acumatica."""
+        try:
+            props = await self._merged_props(entity, refresh=refresh)
+        except AcumaticaError:
+            return set()
+        return {n for n, spec in props.items()
+                if self._is_detail(spec) and n not in self._META_FIELDS}
+
+    async def get_entity_schema(self, entity: str, refresh: bool = False) -> dict:
+        """Field names for one entity, split into scalar vs detail (nested) fields.
+
+        detail_fields are the array/nested collections Acumatica OMITS from a list
+        GET — fetch them per record by key (record_id), optionally with expand=.
+        """
+        props = await self._merged_props(entity, refresh=refresh)
+        scalar, detail = [], []
+        for name, spec in props.items():
+            if name in self._META_FIELDS:
+                continue
+            (detail if self._is_detail(spec) else scalar).append(name)
+        return {
+            "entity": entity,
+            "field_count": len(scalar) + len(detail),
+            "scalar_fields": sorted(scalar),
+            "detail_fields": sorted(detail),
+            "note": "detail_fields are omitted from list GETs; retrieve them by "
+                    "record_id (optionally with expand=) one record at a time.",
+        }
 
     # ---- OData (Generic Inquiries) -------------------------------------
 
