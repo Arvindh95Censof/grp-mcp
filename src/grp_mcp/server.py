@@ -157,22 +157,22 @@ async def extend_endpoint(
     extend_current_endpoint: list[dict] | None = None,
     instance: str | None = None,
 ) -> Any:
-    """Add entities/fields to a web service endpoint contract (SM207060) via API.
+    """[DOES NOT WORK over REST — kept for reference] Attempt to add entities to a
+    contract via the WebServiceEndpoints entity.
 
-    Wraps the WebServiceEndpoints entity (PUT). Changing a contract is a
-    WEBSITE-LEVEL change affecting all tenants -> requires "allow_publish": true.
+    Verified on csmdev 2025R1: a PUT here is a NO-OP. WebServiceEndpoints (SM207060)
+    is a STATEFUL WIZARD form, not a CRUD entity -- CreateEntity/EntityProperties are
+    transient working-views (empty on read), the EntityTree encodes internal screen
+    node IDs the form generates, and the create/extend ops (Insert, ExtendEntity,
+    PopulateFields, Save) are container actions whose parameters aren't in the
+    contract and which need live form state that doesn't survive stateless calls.
 
-    create_entities: new top-level entities mapped to screens, e.g.
-        [{"EntityType": "AccountClass", "ScreenName": "GL202000"}]
-    fields: fields to map onto an entity, e.g.
-        [{"EntityID": "AccountClass", "FieldName": "ClassCD",
-          "MappedField": "AccountClassCD"}]
-    entity_properties / extend_current_endpoint: advanced overrides.
+    To actually extend an endpoint, use one of:
+      - Playwright on the SM207060 UI (drives the real wizard), or
+      - a customization project: import_customization + publish_customization.
 
-    EXPERIMENTAL: the underlying form is wizard-driven; not every screen maps
-    cleanly in one PUT. Do NOT run against an endpoint in active use (e.g. the one
-    grp-mcp is configured to use) -- test on a throwaway endpoint first, verify
-    with get_endpoint_definition, and keep a snapshot to roll back.
+    Reading a contract works fine: use get_endpoint_definition.
+    (allow_publish gate retained in case a future build makes this writable.)
     """
     _require_publish(instance)
     body: dict = {

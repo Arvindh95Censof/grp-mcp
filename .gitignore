@@ -20,3 +20,6 @@ connections.json
 
 # Snapshot dumps (business data)
 snapshots/
+
+# Playwright debug screenshots
+playwright/shots/
