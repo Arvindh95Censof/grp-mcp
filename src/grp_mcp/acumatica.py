@@ -244,6 +244,34 @@ class AcumaticaClient:
             url = f"{self.instance.base_url.rstrip('/')}{url}"
         return await self._request("GET", url)
 
+    # ---- file attachments (files:put) ----------------------------------
+
+    async def put_file(
+        self, url: str, content: bytes, content_type: str = "application/octet-stream"
+    ) -> Any:
+        """PUT raw file bytes to a record's files:put URL (absolute or relative).
+
+        The {filename} placeholder must already be substituted in `url`.
+        """
+        if url.startswith("/"):
+            url = f"{self.instance.base_url.rstrip('/')}{url}"
+        return await self._request(
+            "PUT", url, content=content, headers={"Content-Type": content_type}
+        )
+
+    async def record_files_put_url(
+        self, entity: str, record_id: str, filename: str
+    ) -> str:
+        """Resolve the files:put URL for a record by reading its _links."""
+        rec = await self.get_entity(entity, record_id)
+        link = (rec.get("_links") or {}).get("files:put") if isinstance(rec, dict) else None
+        if not link:
+            raise AcumaticaError(
+                f"No files:put link on {entity}/{record_id} - the record may not "
+                f"exist or the entity does not support file attachments."
+            )
+        return link.replace("{filename}", filename)
+
     # ---- OData (Generic Inquiries) -------------------------------------
 
     async def run_gi(self, name: str, params: dict | None = None) -> Any:
