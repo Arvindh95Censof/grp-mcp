@@ -14,7 +14,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .acumatica import AcumaticaClient
+from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, load_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
@@ -68,16 +68,25 @@ def _require_publish(instance: str | None) -> None:
 
 
 def _wrap(value: Any) -> Any:
-    """Convert plain values into Acumatica's {"value": ...} envelope.
+    """Recursively convert plain values into Acumatica's {"value": ...} envelope.
 
-    Dicts are assumed already shaped (linked entity / wrapped field) and pass
-    through; lists are treated as detail rows and wrapped element-wise.
+    - scalar              -> {"value": scalar}
+    - {"value": x}        -> passed through (already a wrapped scalar)
+    - nested/linked dict  -> each field recursively wrapped
+      (e.g. {"MainContact": {"Email": "x", "Address": {"City": "KL"}}})
+    - list of rows        -> each dict row recursively wrapped (detail collection)
+
+    This makes nested objects (vendor/customer address & contact, sub-details)
+    work without the caller hand-wrapping every leaf as {"value": ...}.
     """
     if isinstance(value, dict):
-        return value
+        # an already-wrapped scalar envelope: {"value": ...} (nothing else) -> keep
+        if set(value.keys()) <= {"value"}:
+            return value
+        # a nested / linked object -> recurse into its fields
+        return {k: _wrap(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [{k: _wrap(v) for k, v in row.items()} if isinstance(row, dict) else row
-                for row in value]
+        return [_wrap(row) if isinstance(row, dict) else row for row in value]
     return {"value": value}
 
 
@@ -224,7 +233,43 @@ async def get_entity(
         params["$custom"] = custom
 
     client = _client(instance)
-    result = await client.get_entity(entity, record_id, params)
+    try:
+        result = await client.get_entity(entity, record_id, params)
+    except AcumaticaError as e:
+        # Some entities expose views with BQL delegates (e.g. ImportScenarios,
+        # VendorClass, WebServiceEndpoints). A list GET with $select/$expand on
+        # those 500s with "Optimization cannot be performed" / "key was not
+        # present". Retry once without $select (the usual culprit), then without
+        # $expand, and flag what was dropped instead of failing outright.
+        msg = str(e)
+        retryable = record_id is None and (select or expand) and any(
+            s in msg for s in (
+                "Optimization cannot be performed",
+                "key was not present in the dictionary",
+                "has BQL delegate",
+            )
+        )
+        if not retryable:
+            raise
+        dropped: list[str] = []
+        retry = dict(params)
+        if "$select" in retry:
+            retry.pop("$select"); dropped.append("$select")
+        try:
+            result = await client.get_entity(entity, record_id, retry)
+        except AcumaticaError:
+            if "$expand" in retry:
+                retry.pop("$expand"); dropped.append("$expand")
+            result = await client.get_entity(entity, record_id, retry)
+        return {
+            "_warning": (
+                f"'{entity}' has BQL-delegate views that break optimized list "
+                f"queries; retried after dropping {dropped}. Those options were "
+                f"ignored. Fetch a single record by key to use them. "
+                f"Original error: {msg[:200]}"
+            ),
+            "result": result,
+        }
 
     # Active guard: a LIST GET (no record_id) cannot return detail/nested fields.
     # If the caller asked for any via $expand or $select, flag it — the data for
@@ -265,6 +310,48 @@ async def create_or_update_entity(
                           "Details": [{"InventoryID": "ITEM1", "OrderQty": 2}]}.
     """
     return await _client(instance).put_entity(entity, _wrap_fields(fields))
+
+
+@mcp.tool()
+async def attach_file(
+    entity: str,
+    record_id: str,
+    file_path: str,
+    filename: str | None = None,
+    content_type: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Upload a file and attach it to an existing record (the files:put API).
+
+    entity:    the entity the record belongs to, e.g. "DataProvider", "Vendor".
+    record_id: the record's id/GUID (from a create_or_update_entity / get_entity
+               response `id` or `_links.self`).
+    file_path: local path to the file to upload (CSV, XLSX, PDF, ...).
+    filename:  name to store it as (defaults to the file's basename).
+    content_type: MIME type (auto-guessed from the extension if omitted).
+
+    Use this to put the Pentaho CSV onto a Data Provider, or attach source
+    documents to a record, entirely via API.
+    """
+    import mimetypes
+    from pathlib import Path
+
+    p = Path(file_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"file not found: {file_path}")
+    name = filename or p.name
+    ctype = content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    client = _client(instance)
+    url = await client.record_files_put_url(entity, record_id, name)
+    content = p.read_bytes()
+    await client.put_file(url, content, ctype)
+    return {
+        "attached": name,
+        "bytes": len(content),
+        "content_type": ctype,
+        "entity": entity,
+        "record_id": record_id,
+    }
 
 
 @mcp.tool()
@@ -452,6 +539,72 @@ async def invoke_action(
 
 
 @mcp.tool()
+async def run_import_scenario(
+    scenario_name: str,
+    do_import: bool = False,
+    entity: str = "ImportByScenario",
+    key_field: str = "ScenarioName",
+    prepare_action: str = "prepareIBS",
+    import_action: str = "importIBS",
+    poll_interval: float = 3.0,
+    timeout: float = 300.0,
+    instance: str | None = None,
+) -> Any:
+    """Drive Import-by-Scenario (SM206036) end to end via API.
+
+    Selects the scenario record, runs Prepare (stages rows from the provider),
+    and optionally Import (commits to the target). Returns the record status.
+
+    scenario_name: the scenario's Name (must already exist in SM206025).
+    do_import:     False (default) = prepare only (safe, no commit); True = also import.
+    entity/key_field/prepare_action/import_action: override if your endpoint names
+        them differently (defaults match the GRPSetup setup: ImportByScenario +
+        prepareIBS/importIBS). Find action names with list_actions(entity).
+
+    NOTE: the provider that the scenario uses must already have its file attached
+    (see attach_file). Prepare/Import run on the screen's selected scenario record.
+    """
+    import asyncio
+
+    client = _client(instance)
+    ref = {key_field: scenario_name}
+
+    async def _act(action: str) -> Any:
+        body = {"entity": _wrap_fields(ref), "parameters": _wrap_fields({})}
+        res = await client.invoke_action(entity, action, body)
+        # async action -> {status: 202, location: ...}; poll until 204/done
+        if isinstance(res, dict) and res.get("location"):
+            waited = 0.0
+            while waited < timeout:
+                st = await client.get_url(res["location"])
+                if isinstance(st, dict) and st.get("status") == 204:
+                    return {"action": action, "completed": True}
+                await asyncio.sleep(poll_interval)
+                waited += poll_interval
+            return {"action": action, "completed": False, "timeout": timeout}
+        return {"action": action, "result": res}
+
+    # select the scenario record (upsert by key) so Prepare/Import act on it
+    await client.put_entity(entity, _wrap_fields(ref))
+    out: dict[str, Any] = {"scenario": scenario_name, "prepare": await _act(prepare_action)}
+    if do_import:
+        out["import"] = await _act(import_action)
+    # read back the status/result of the selected record
+    try:
+        rec = await client.get_entity(entity, None, {"$filter": f"{key_field} eq '{scenario_name}'", "$top": 1})
+        if isinstance(rec, list) and rec:
+            rec = rec[0]
+        out["status"] = {
+            k: (rec.get(k) or {}).get("value")
+            for k in ("Status", "Result", "PreparedOn", "CompletedOn", "NumberofRecords")
+            if isinstance(rec, dict)
+        }
+    except Exception:
+        pass
+    return out
+
+
+@mcp.tool()
 async def run_generic_inquiry(
     name: str,
     filter: str | None = None,
@@ -475,6 +628,32 @@ async def list_published(instance: str | None = None) -> Any:
     """List customization projects currently published on the instance (read-only)."""
     async with _customization(instance) as c:
         return await c.get_published()
+
+
+@mcp.tool()
+async def export_customization(
+    project_name: str,
+    out_path: str,
+    instance: str | None = None,
+) -> Any:
+    """Export a customization project to a .zip on disk (Customization getProject).
+
+    Pulls the project content via API and writes it to out_path. This closes the
+    headless edit loop for endpoints: export_customization -> edit project.xml ->
+    import_customization -> publish_customization (no browser export needed).
+    """
+    import base64
+    from pathlib import Path
+
+    async with _customization(instance) as c:
+        res = await c.get_project(project_name)
+    content = res.get("projectContentBase64") if isinstance(res, dict) else None
+    if not content:
+        return {"error": "no projectContentBase64 in response", "project": project_name,
+                "raw": res}
+    data = base64.b64decode(content)
+    Path(out_path).write_bytes(data)
+    return {"project": project_name, "path": out_path, "bytes": len(data)}
 
 
 @mcp.tool()
