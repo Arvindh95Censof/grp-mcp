@@ -103,7 +103,9 @@ const FIELDS=['name','tenant','base_url','endpoint_name','endpoint_version','cli
 async function api(path,opts){const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch{ j={error:t} } if(!r.ok)throw new Error(j.error||r.statusText);return j}
 function showTop(m,bad){const e=$('topmsg');e.textContent=m;e.className='msg '+(bad?'bad':'ok')}
 async function load(){
-  const d=await api('/api/profiles');
+  let d;
+  try{ d=await api('/api/profiles'); }
+  catch(err){ $('src').textContent='failed to load profiles: '+err.message; $('list').innerHTML='<div class="card">Could not read connections.json. '+esc(err.message)+'</div>'; return; }
   $('src').textContent='config: '+(d.source_path||'(none)')+'  ·  active: '+d.active;
   $('list').innerHTML=d.instances.map(p=>{
     const g=(on,l)=>on?'<b>'+l+'</b>':'<span style="opacity:.5">'+l+'</span>';
@@ -126,7 +128,7 @@ $('list').addEventListener('click',async e=>{const b=e.target.closest('button');
   try{
     if(a==='active'){await api('/api/active',{method:'POST',body:JSON.stringify({name:n})});showTop('Active → '+n+'. Restart grp-mcp to apply.');await load()}
     if(a==='remove'){if(!confirm('Remove profile "'+n+'"?'))return;await api('/api/remove',{method:'POST',body:JSON.stringify({name:n})});showTop('Removed '+n);await load()}
-    if(a==='test'){b.textContent='…';const r=await api('/api/test',{method:'POST',body:JSON.stringify({name:n})});b.textContent='Test';showTop(r.ok?('✓ '+n+': '+r.entity_count+' entities':' '):('✗ '+n+': '+r.error),!r.ok)}
+    if(a==='test'){b.textContent='…';const r=await api('/api/test',{method:'POST',body:JSON.stringify({name:n})});b.textContent='Test';showTop(r.ok?('✓ '+n+': '+r.entity_count+' entities'):('✗ '+n+': '+r.error),!r.ok)}
     if(a==='edit'){const p=(window._profiles||[]).find(x=>x.name===n)||{};FIELDS.forEach(f=>$(f).value=p[f]!=null?p[f]:'');$('client_secret').value='';$('password').value='';
       $('allow_write').checked=!!p.allow_write;$('allow_delete').checked=!!p.allow_delete;$('allow_publish').checked=!!p.allow_publish;
       showTop('Editing '+n+' — re-enter secret + password to change them (leave blank to keep).');$('name').scrollIntoView({behavior:'smooth'})}
@@ -197,12 +199,15 @@ class _Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/" or self.path.startswith("/index"):
-            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-        elif self.path == "/api/profiles":
-            self._json(_profiles_payload(load_config()))
-        else:
-            self._json({"error": "not found"}, 404)
+        try:
+            if self.path == "/" or self.path.startswith("/index"):
+                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif self.path == "/api/profiles":
+                self._json(_profiles_payload(load_config()))
+            else:
+                self._json({"error": "not found"}, 404)
+        except Exception as e:  # noqa: BLE001 - surface config errors as JSON
+            self._json({"error": str(e)[:400]}, 500)
 
     def do_POST(self) -> None:  # noqa: N802
         try:
