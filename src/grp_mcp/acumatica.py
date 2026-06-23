@@ -99,19 +99,28 @@ class AcumaticaClient:
 
     # ---- request plumbing ----------------------------------------------
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+    async def _request_raw(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Issue an authenticated request and return the raw httpx.Response.
+
+        Used for binary payloads (file downloads, report PDFs) and when the caller
+        needs response headers (e.g. the Location of an async report). Refreshes the
+        token once on 401 and raises AcumaticaError on >=400.
+        """
         headers = await self._auth_header()
         headers.update(kwargs.pop("headers", {}))
-        headers.setdefault("Accept", "application/json")
         resp = await self._http.request(method, url, headers=headers, **kwargs)
-
         if resp.status_code == 401:  # token rejected; force one refresh + retry
             self._access_token = None
             headers.update(await self._auth_header())
             resp = await self._http.request(method, url, headers=headers, **kwargs)
-
         if resp.status_code >= 400:
             raise AcumaticaError(f"{method} {url} -> {resp.status_code}: {resp.text}")
+        return resp
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        headers = {"Accept": "application/json"}
+        headers.update(kwargs.pop("headers", {}))
+        resp = await self._request_raw(method, url, headers=headers, **kwargs)
 
         if resp.status_code == 204 or not resp.content:
             location = resp.headers.get("Location")
@@ -243,6 +252,97 @@ class AcumaticaClient:
         if url.startswith("/"):
             url = f"{self.instance.base_url.rstrip('/')}{url}"
         return await self._request("GET", url)
+
+    async def get_bytes(self, url: str) -> bytes:
+        """GET raw bytes from an absolute or instance-relative URL (file download)."""
+        if url.startswith("/"):
+            url = f"{self.instance.base_url.rstrip('/')}{url}"
+        resp = await self._request_raw("GET", url)
+        return resp.content
+
+    async def get_all(
+        self, entity: str, params: dict | None = None, page_size: int = 1000,
+        max_records: int | None = None,
+    ) -> list:
+        """Retrieve every matching record by paging with $top/$skip.
+
+        The contract API caps a single list GET (server RowsToFetch / proxy limits),
+        so large tables need paging. Issues GETs with increasing $skip until a short
+        (or empty) page comes back. Honors any caller $top as the page size and any
+        $filter/$select/$expand passed in params.
+        """
+        base = dict(params or {})
+        size = int(base.pop("$top", page_size) or page_size)
+        out: list = []
+        skip = 0
+        while True:
+            page = dict(base)
+            page["$top"] = size
+            page["$skip"] = skip
+            chunk = await self.get_entity(entity, None, page)
+            if not isinstance(chunk, list):
+                # single object or unexpected shape -> return as-is wrapped
+                return [chunk] if chunk is not None else out
+            out.extend(chunk)
+            if max_records is not None and len(out) >= max_records:
+                return out[:max_records]
+            if len(chunk) < size:  # short page = last page
+                break
+            skip += size
+        return out
+
+    # ---- DAC-based OData v4 (raw data access classes) ------------------
+
+    async def list_dacs(self) -> Any:
+        """OData service document: every DAC exposed via the DAC-based OData interface."""
+        return await self._request(
+            "GET", self.instance.dac_odata_base, params={"$format": "json"}
+        )
+
+    async def run_dac(self, dac: str, params: dict | None = None) -> Any:
+        """Query one DAC through the DAC-based OData v4 interface (<dac base>/<DAC>)."""
+        url = f"{self.instance.dac_odata_base}/{dac}"
+        p = {"$format": "json"}
+        p.update(params or {})
+        return await self._request("GET", url, params=p)
+
+    # ---- report entities (contract API, async) -------------------------
+
+    async def run_report(
+        self, entity: str, body: dict, poll_interval: float = 2.0, timeout: float = 180.0
+    ) -> bytes:
+        """Run a Report-type entity and return the rendered file bytes (usually PDF).
+
+        Contract flow: PUT the report entity with its parameters -> 202 + Location ->
+        poll the Location (202 while rendering) -> 200 returns the binary file.
+        `body` is the already-wrapped request body, e.g.
+        {"parameters": {"OrgBAccountID": {"value": "MPM"}}}.
+        """
+        import asyncio
+
+        resp = await self._request_raw(
+            "PUT", self._entity_url(entity), json=body,
+            headers={"Accept": "application/pdf, application/json"},
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+        location = resp.headers.get("Location")
+        if not location:
+            raise AcumaticaError(
+                f"report '{entity}' returned {resp.status_code} with no Location to poll"
+            )
+        if location.startswith("/"):
+            location = f"{self.instance.base_url.rstrip('/')}{location}"
+        waited = 0.0
+        while waited < timeout:
+            r = await self._request_raw(
+                "GET", location, headers={"Accept": "application/pdf, application/json"}
+            )
+            if r.status_code == 200 and r.content:
+                return r.content
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+        raise AcumaticaError(f"report '{entity}' did not finish within {timeout}s")
 
     # ---- file attachments (files:put) ----------------------------------
 

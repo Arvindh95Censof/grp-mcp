@@ -50,6 +50,12 @@ class Instance(BaseModel):
         root = self.base_url.rstrip("/")
         return f"{root}/odata/{self.tenant}" if self.tenant else f"{root}/odata"
 
+    @property
+    def dac_odata_base(self) -> str:
+        """Base URL for the DAC-based OData v4 interface (<base>/t/<Tenant>/api/odata/dac)."""
+        root = self.base_url.rstrip("/")
+        return f"{root}/t/{self.tenant}/api/odata/dac" if self.tenant else f"{root}/api/odata/dac"
+
 
 class Config(BaseModel):
     default: str

@@ -209,6 +209,7 @@ async def get_entity(
     select: str | None = None,
     expand: str | None = None,
     top: int | None = None,
+    skip: int | None = None,
     custom: str | None = None,
     instance: str | None = None,
 ) -> Any:
@@ -216,9 +217,12 @@ async def get_entity(
 
     entity: endpoint entity name, e.g. "Customer", "SalesOrder", "Bill".
     record_id: fetch a single record by its key/id; omit to list.
-    filter/select/expand/top: OData-style query options (contract API $filter etc).
+    filter/select/expand/top/skip: OData-style query options (contract API $filter,
+            $skip for paging the next page of a large list, etc).
     custom: $custom param to pull fields NOT in the contract (unexposed elements /
             user-defined fields), format "<View>.<Field>" comma-separated.
+
+    For pulling an ENTIRE large table, prefer fetch_all_entities (auto-pages).
     """
     params: dict[str, Any] = {}
     if filter:
@@ -229,6 +233,8 @@ async def get_entity(
         params["$expand"] = expand
     if top:
         params["$top"] = top
+    if skip:
+        params["$skip"] = skip
     if custom:
         params["$custom"] = custom
 
@@ -294,6 +300,38 @@ async def get_entity(
                     "result": result,
                 }
     return result
+
+
+@mcp.tool()
+async def fetch_all_entities(
+    entity: str,
+    filter: str | None = None,
+    select: str | None = None,
+    expand: str | None = None,
+    page_size: int = 1000,
+    max_records: int | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Retrieve ALL records of an entity, auto-paging with $top/$skip.
+
+    The contract API caps a single list GET, so a plain get_entity can silently
+    return only the first page of a big table. This loops $skip until the last
+    (short) page, concatenating results.
+
+    page_size: rows per request ($top). max_records: hard cap to stop early
+    (None = no cap). Use filter/select to scope/shrink. Returns {count, records}.
+    """
+    params: dict[str, Any] = {}
+    if filter:
+        params["$filter"] = filter
+    if select:
+        params["$select"] = select
+    if expand:
+        params["$expand"] = expand
+    rows = await _client(instance).get_all(
+        entity, params, page_size=page_size, max_records=max_records
+    )
+    return {"entity": entity, "count": len(rows), "records": rows}
 
 
 @mcp.tool()
@@ -441,17 +479,16 @@ async def count_entity(
     """Count records of an entity (optionally scoped by filter).
 
     NOTE: the contract API has no server-side $count, so this fetches matching
-    rows and counts them. Pass select=<a key field> to shrink the payload, and
-    use filter to scope big tables.
+    rows (auto-paging with $skip so big tables aren't under-counted) and counts
+    them. Pass select=<a key field> to shrink the payload, and use filter to scope.
     """
     params: dict[str, Any] = {}
     if filter:
         params["$filter"] = filter
     if select:
         params["$select"] = select
-    res = await _client(instance).get_entity(entity, None, params)
-    n = len(res) if isinstance(res, list) else (0 if res is None else 1)
-    return {"entity": entity, "count": n, "filter": filter or None}
+    rows = await _client(instance).get_all(entity, params)
+    return {"entity": entity, "count": len(rows), "filter": filter or None}
 
 
 @mcp.tool()
@@ -487,6 +524,8 @@ async def snapshot_entity(
     Writes to `path`, or by default to <connections dir>/snapshots/<entity>_<instance>.json.
     Returns the file path + record count. Use before destructive ops (calendar
     regen, segment restructure, bulk overwrite) so you can roll back.
+
+    Auto-pages with $skip so the snapshot captures the FULL table, not just page 1.
     """
     params: dict[str, Any] = {}
     if filter:
@@ -495,7 +534,7 @@ async def snapshot_entity(
         params["$expand"] = expand
     cfg = _cfg()
     name = instance or cfg.default
-    data = await _client(instance).get_entity(entity, None, params)
+    data = await _client(instance).get_all(entity, params)
 
     if not path:
         base = os.path.dirname(os.environ.get("GRP_MCP_CONNECTIONS", "")) or os.getcwd()
@@ -621,6 +660,174 @@ async def run_generic_inquiry(
     if top:
         params["$top"] = top
     return await _client(instance).run_gi(name, params)
+
+
+@mcp.tool()
+async def list_dacs(instance: str | None = None) -> Any:
+    """List every DAC (data access class) exposed via the DAC-based OData v4 interface.
+
+    Returns the OData service document (each DAC's name + url). This reaches data
+    DIRECTLY from DACs (e.g. PX.Objects.GL.GLTran) WITHOUT needing the screen on a
+    web service endpoint — the complement to the contract API's endpoint-bound view.
+    Requires the instance's `tenant` to be set in config. Query one with run_dac_odata.
+    """
+    return await _client(instance).list_dacs()
+
+
+@mcp.tool()
+async def run_dac_odata(
+    dac: str,
+    filter: str | None = None,
+    select: str | None = None,
+    expand: str | None = None,
+    top: int | None = None,
+    skip: int | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Query a single DAC through the DAC-based OData v4 interface.
+
+    dac: the DAC OData name from list_dacs (e.g. "PX_Objects_GL_GLTran", "Account").
+    filter/select/expand/top/skip: OData v4 query options ($filter, $select, ...).
+    Read-only. Use this to read tables/screens NOT exposed on the contract endpoint
+    (the contract API only sees entities added to the endpoint). Requires `tenant`.
+    """
+    params: dict[str, Any] = {}
+    if filter:
+        params["$filter"] = filter
+    if select:
+        params["$select"] = select
+    if expand:
+        params["$expand"] = expand
+    if top:
+        params["$top"] = top
+    if skip:
+        params["$skip"] = skip
+    return await _client(instance).run_dac(dac, params)
+
+
+@mcp.tool()
+async def list_attachments(
+    entity: str, record_id: str, instance: str | None = None
+) -> Any:
+    """List the files attached to a record (name + download href).
+
+    Reads the record's `files` collection. Use a returned `id`/`filename` with
+    download_file. (To ADD a file, use attach_file.)
+    """
+    rec = await _client(instance).get_entity(entity, record_id)
+    files = (rec.get("files") if isinstance(rec, dict) else None) or []
+    out = [
+        {
+            "id": f.get("id"),
+            "filename": f.get("filename"),
+            "href": (f.get("href") or (f.get("_links") or {}).get("self")),
+        }
+        for f in files
+        if isinstance(f, dict)
+    ]
+    return {"entity": entity, "record_id": record_id, "count": len(out), "files": out}
+
+
+@mcp.tool()
+async def download_file(
+    entity: str,
+    record_id: str,
+    out_path: str,
+    filename: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Download a file attached to a record to disk.
+
+    entity/record_id: the record. filename: which attached file to pull (defaults
+    to the record's first/only attachment). out_path: where to write the bytes.
+    Resolves the file's href from the record's `files` collection, then GETs the
+    raw bytes. (List a record's files first with list_attachments.)
+    """
+    from pathlib import Path
+
+    client = _client(instance)
+    rec = await client.get_entity(entity, record_id)
+    files = (rec.get("files") if isinstance(rec, dict) else None) or []
+    if not files:
+        raise AcumaticaError(f"no files attached to {entity}/{record_id}")
+    chosen = None
+    if filename:
+        chosen = next(
+            (f for f in files if isinstance(f, dict) and f.get("filename") == filename),
+            None,
+        )
+        if chosen is None:
+            names = [f.get("filename") for f in files if isinstance(f, dict)]
+            raise AcumaticaError(f"'{filename}' not attached. Available: {names}")
+    else:
+        chosen = files[0]
+    href = chosen.get("href") or (chosen.get("_links") or {}).get("self")
+    if not href:
+        raise AcumaticaError(f"attachment has no download href: {chosen}")
+    data = await client.get_bytes(href)
+    Path(out_path).write_bytes(data)
+    return {
+        "entity": entity,
+        "record_id": record_id,
+        "filename": chosen.get("filename"),
+        "bytes": len(data),
+        "path": out_path,
+    }
+
+
+@mcp.tool()
+async def run_report(
+    report_entity: str,
+    out_path: str,
+    parameters: dict | None = None,
+    poll_interval: float = 2.0,
+    timeout: float = 180.0,
+    instance: str | None = None,
+) -> Any:
+    """Run a Report-type endpoint entity and save the rendered file (PDF) to disk.
+
+    report_entity: the report entity's name on the configured endpoint (a Report
+        entity must be added to the endpoint first — list_entities to see them).
+    parameters: the report's parameters as a plain map, auto-wrapped, e.g.
+        {"LedgerID": "ACTUAL", "FromPeriod": "012026", "ToPeriod": "122026"}.
+    out_path: where to write the report bytes.
+
+    Contract flow: PUT report + params -> 202 + Location -> poll until 200 -> bytes.
+    """
+    from pathlib import Path
+
+    body: dict[str, Any] = {}
+    if parameters:
+        body["parameters"] = _wrap_fields(parameters)
+    data = await _client(instance).run_report(
+        report_entity, body, poll_interval=poll_interval, timeout=timeout
+    )
+    Path(out_path).write_bytes(data)
+    return {
+        "report": report_entity,
+        "bytes": len(data),
+        "path": out_path,
+        "parameters": parameters or {},
+    }
+
+
+@mcp.tool()
+async def set_note(
+    entity: str, record_id: str, note: str, instance: str | None = None
+) -> Any:
+    """Set (or clear) the Note text on a record.
+
+    The contract API exposes a record's note as the `note` field. Pass note="" to
+    clear it. record_id identifies the target record (key/GUID).
+    """
+    client = _client(instance)
+    rec = await client.get_entity(entity, record_id)
+    body: dict[str, Any] = {"note": _wrap(note)}
+    # carry the record's id so the PUT targets the same record (id is top-level,
+    # NOT wrapped in a {"value": ...} envelope)
+    if isinstance(rec, dict) and rec.get("id"):
+        body["id"] = rec["id"]
+    return await client.put_entity(entity, body)
 
 
 @mcp.tool()

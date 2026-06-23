@@ -16,14 +16,19 @@ base URL + OAuth credentials.
 | `get_entity_schema` | Fields of one entity, split into scalar vs detail (nested). |
 | `list_actions` | Actions invokable on an entity (for `invoke_action`). |
 | `list_generic_inquiries` | Generic Inquiries exposed via OData (name + url). |
+| `list_dacs` | List every DAC exposed via the DAC-based OData v4 interface. |
 
 **Read**
 
 | Tool | What it does |
 |------|--------------|
-| `get_entity` | Get one record or a filtered list; supports `$filter/$select/$expand/$top/$custom`. |
-| `count_entity` | Count records (client-side; scope with `filter`). |
+| `get_entity` | Get one record or a filtered list; supports `$filter/$select/$expand/$top/$skip/$custom`. |
+| `fetch_all_entities` | Retrieve **all** records of an entity, auto-paging with `$top/$skip`. |
+| `count_entity` | Count records (client-side, auto-paged; scope with `filter`). |
 | `run_generic_inquiry` | Run a Generic Inquiry via OData. |
+| `run_dac_odata` | Query a single DAC via OData v4 (reaches tables **not** on the endpoint). |
+| `list_attachments` | List files attached to a record (name + download href). |
+| `download_file` | Download a record's attached file to disk. |
 | `get_endpoint_definition` | Read an endpoint's contract (entity tree/props) from SM207060. |
 
 **Write**
@@ -32,8 +37,12 @@ base URL + OAuth credentials.
 |------|--------------|
 | `create_or_update_entity` | Create/update a record (PUT, upsert by key). |
 | `load_from_excel` | Bulk upsert an entity from `.xlsx`/`.csv` with column mapping + dry-run. |
+| `attach_file` | Upload a file and attach it to a record (`files:put`). |
+| `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
+| `run_import_scenario` | Drive Import-by-Scenario (SM206036): prepare (+ optional import). |
+| `run_report` | Run a Report-type entity and save the rendered file (PDF) to disk. |
 | `poll_action` | Check a long-running action's status by its `Location`. |
 
 **Contract / config**
@@ -53,6 +62,7 @@ base URL + OAuth credentials.
 | Tool | What it does |
 |------|--------------|
 | `list_published` | List published customization projects (read-only). |
+| `export_customization` | Export a project to a `.zip` on disk (headless edit loop). |
 | `import_customization` | Import a customization `.zip` (does not publish). |
 | `publish_customization` | Publish projects (async begin + poll). |
 | `unpublish_customization` | Unpublish all customization projects (rollback). |
@@ -82,6 +92,37 @@ is a **website-level contract change** — gated behind `"allow_publish": true`.
 is experimental: the underlying form is wizard-driven, so not every screen maps
 cleanly in a single PUT. Read first with `get_endpoint_definition`, snapshot, and
 test on a throwaway endpoint — never the one the server is actively using.
+
+### Paging large tables
+
+The contract API caps a single list GET, so a plain `get_entity` (no `record_id`)
+can silently return **only the first page** of a big table. Two fixes:
+
+- `get_entity` accepts `$skip` (the `skip` arg) to grab the next page manually.
+- `fetch_all_entities` loops `$top`/`$skip` until the last (short) page and returns
+  `{count, records}` — use it whenever you need the **whole** table (full Chart of
+  Accounts, all vendors, …). `page_size` sets rows per request; `max_records` caps
+  early. `count_entity` and `snapshot_entity` auto-page too, so counts and snapshots
+  cover the full table rather than page 1.
+
+### DAC-based OData (data not on the endpoint)
+
+The contract API only sees entities that were added to the endpoint in SM207060.
+`list_dacs` + `run_dac_odata` reach data **directly from DACs** through the
+DAC-based OData v4 interface (`<base>/t/<Tenant>/api/odata/dac/<DAC>`), bypassing
+the endpoint entirely — handy for reading a screen/table you haven't exposed.
+Read-only, and it needs the `tenant` (company login) set in config. `run_dac_odata`
+supports `$filter/$select/$expand/$top/$skip`. Note `list_dacs` can return thousands
+of DACs; it's best browsed with a known DAC name in hand.
+
+### Attachments and reports
+
+- `attach_file` uploads a file onto a record (`files:put`); `list_attachments`
+  lists what's attached (name + href); `download_file` pulls an attachment to disk.
+- `run_report` runs a **Report-type** endpoint entity: it PUTs the report with its
+  parameters, polls the returned `Location` until the render completes, and writes
+  the file (usually PDF) to disk. The report must first be added to the endpoint as
+  a Report entity (see it in `list_entities`).
 
 ### Detail-field guard
 
@@ -186,7 +227,11 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.1 — 21 tools. Roadmap: attachments, nested detail rows in `load_from_excel`.
+v0.2 — 31 tools. Covers the contract REST API (CRUD, actions, `$skip` paging,
+attachments up/down, notes, reports), DAC + GI OData, import scenarios, and the
+Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
+wizard — do those via the SM207060 UI / playwright or a customization project, not
+REST. Roadmap: nested detail rows in `load_from_excel`.
 
 ## AFS Financial Report entities (instance-specific)
 
