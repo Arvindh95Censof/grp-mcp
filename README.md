@@ -115,8 +115,10 @@ It binds to `127.0.0.1` only (it edits credentials) and **never sends secrets to
 browser** —
 the profile list only reports whether a secret/password is set. Leave the secret and
 password blank when editing to keep the existing values. Because the MCP server reads
-config at startup, **restart it** to apply add/active changes to the live connector
-(Test works immediately — it opens its own session).
+config at startup. To apply add/active changes to the live connector **without a
+restart**, run the `reload_config` tool in Claude (it re-reads connections.json and
+frees old sessions). Restarting the MCP also works. (Test works immediately — it opens
+its own session.)
 
 The header shows a build marker (e.g. `build 2`); if you don't see it after editing,
 you're on a cached page or an old server process. Responses send `Cache-Control:

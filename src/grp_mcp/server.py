@@ -347,6 +347,27 @@ async def test_connection(instance: str | None = None) -> dict:
 
 
 @mcp.tool()
+async def reload_config(instance: str | None = None) -> dict:
+    """Reload connections.json from disk WITHOUT restarting the server.
+
+    Use this after editing profiles in the config UI (grp-mcp-ui) or the file by
+    hand — the server normally reads config only at startup, so this applies the
+    changes (new/edited profiles, active selection, gates) to the live connector.
+    Closes all cached API sessions first (frees license seats); they re-auth on
+    next use. Returns the refreshed active profile + list.
+    """
+    global _config
+    for c in list(_clients.values()):
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+    _clients.clear()
+    _config = load_config()
+    return list_instances()
+
+
+@mcp.tool()
 async def list_endpoints(instance: str | None = None) -> Any:
     """List all web service endpoints published on the instance.
 

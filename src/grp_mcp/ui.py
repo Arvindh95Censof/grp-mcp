@@ -80,9 +80,9 @@ PAGE = """<!DOCTYPE html>
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 3</span></h1>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 4</span></h1>
 <p class="sub" id="src">loading…</p>
-<div class="banner">Editing here writes <code>connections.json</code>. Restart the grp-mcp server to apply add / active changes to the live connector.</div>
+<div class="banner">Editing here writes <code>connections.json</code>. To apply changes to the live connector, run <code>reload_config</code> in Claude (no restart needed) — or restart the grp-mcp server.</div>
 <div id="list"></div>
 
 <form id="form" autocomplete="off">
