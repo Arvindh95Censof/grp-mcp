@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 grp-mcp = "grp_mcp.server:main"
+grp-mcp-ui = "grp_mcp.ui:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -98,6 +98,23 @@ SSRF guard pins the OAuth token to each profile's own origin, you cannot reach a
 that isn't a configured profile — add it first. connections.json is gitignored, so
 saved secrets never leave the machine.
 
+### Config UI (localhost)
+
+Prefer a page over JSON/tools? Run the bundled config UI:
+
+```bash
+grp-mcp-ui            # or: python -m grp_mcp.ui
+# -> http://127.0.0.1:8765
+```
+
+A single-file, dependency-free (stdlib `http.server`) page to **list / add / edit /
+set-active / remove / test** profiles, writing the same connections.json. It binds to
+`127.0.0.1` only (it edits credentials) and **never sends secrets to the browser** —
+the profile list only reports whether a secret/password is set. Leave the secret and
+password blank when editing to keep the existing values. Because the MCP server reads
+config at startup, **restart it** to apply add/active changes to the live connector
+(Test works immediately — it opens its own session).
+
 ### Bulk loading from Excel/CSV
 
 `load_from_excel` turns a master file (Chart of Accounts, sub-account values,
