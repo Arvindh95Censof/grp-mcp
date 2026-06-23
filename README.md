@@ -10,7 +10,11 @@ base URL + OAuth credentials.
 
 | Tool | What it does |
 |------|--------------|
-| `list_instances` | List configured instances (no secrets). |
+| `list_instances` | List configured profiles + which is active (no secrets). |
+| `add_instance` | Add/replace a connection profile and save it to connections.json. |
+| `set_active_instance` | Choose the default profile (session, or persisted). |
+| `remove_instance` | Remove a profile (and drop its cached session). |
+| `test_connection` | Verify a profile's credentials (token + contract read). |
 | `list_endpoints` | List all web service endpoints on the instance (name/version). |
 | `list_entities` | List top-level entities of the configured endpoint (via swagger.json). |
 | `get_entity_schema` | Fields of one entity, split into scalar vs detail (nested). |
@@ -73,6 +77,26 @@ configured default instance.
 The data tools use the **contract REST API** over OAuth2. The customization tools
 use the **Customization Web API** over a cookie session (it rejects OAuth bearer);
 both reuse the same credentials from your config.
+
+### Managing profiles at runtime
+
+Every tool takes an optional `instance` arg to pick a profile; without it, the
+**active** profile is used. You can manage profiles without hand-editing the file:
+
+- `list_instances` — see all profiles, their endpoint/tenant/gates, and which is active.
+- `add_instance(name, base_url, client_id, client_secret, username, password, …)` —
+  register a new profile (e.g. a second Acumatica site) and save it to
+  connections.json. Gates default to read-only; pass `set_active=true` to switch to it.
+- `set_active_instance(name)` — change the default profile for subsequent calls
+  (`persist=true` also writes it as `default` in the file so it survives a restart).
+- `remove_instance(name)` — drop a profile and its cached session.
+- `test_connection(instance)` — confirm a profile's OAuth creds actually work.
+
+Each profile needs its **own** Connected Application registered on **that** instance
+(Integration → Connected Applications, Resource-Owner-Password flow). Because the
+SSRF guard pins the OAuth token to each profile's own origin, you cannot reach a host
+that isn't a configured profile — add it first. connections.json is gitignored, so
+saved secrets never leave the machine.
 
 ### Bulk loading from Excel/CSV
 
@@ -251,7 +275,7 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.2 — 31 tools. Covers the contract REST API (CRUD, actions, `$skip` paging,
+v0.2 — 35 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData, import scenarios, and the
 Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
 wizard — do those via the SM207060 UI / playwright or a customization project, not

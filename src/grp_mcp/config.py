@@ -75,6 +75,7 @@ class Instance(BaseModel):
 class Config(BaseModel):
     default: str
     instances: dict[str, Instance]
+    source_path: str | None = None  # file this config was loaded from (None = env)
 
     def get(self, name: str | None) -> Instance:
         key = name or self.default
@@ -83,6 +84,27 @@ class Config(BaseModel):
                 f"Unknown instance '{key}'. Configured: {', '.join(self.instances)}"
             )
         return self.instances[key]
+
+
+def save_config(cfg: Config, path: str | None = None) -> str:
+    """Persist a Config (default + instances, with secrets) back to a JSON file.
+
+    Writes to `path`, else the file the config came from, else
+    $GRP_MCP_CONNECTIONS, else ./connections.json. Returns the path written.
+    Updates cfg.source_path so later saves target the same file.
+    """
+    target = path or cfg.source_path or os.getenv("GRP_MCP_CONNECTIONS") or str(
+        Path.cwd() / "connections.json"
+    )
+    data = {
+        "default": cfg.default,
+        "instances": {n: i.model_dump() for n, i in cfg.instances.items()},
+    }
+    Path(target).write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    cfg.source_path = target
+    return target
 
 
 def _from_env() -> Config | None:
@@ -110,7 +132,7 @@ def _from_file(path: Path) -> Config:
     data = json.loads(path.read_text(encoding="utf-8"))
     instances = {k: Instance(**v) for k, v in data["instances"].items()}
     default = data.get("default") or next(iter(instances))
-    return Config(default=default, instances=instances)
+    return Config(default=default, instances=instances, source_path=str(path))
 
 
 def load_config() -> Config:

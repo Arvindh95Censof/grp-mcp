@@ -15,7 +15,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .acumatica import AcumaticaClient, AcumaticaError
-from .config import Config, load_config
+from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
 
@@ -197,13 +197,153 @@ def _wrap_fields(fields: dict) -> dict:
 
 
 @mcp.tool()
-def list_instances() -> list[dict]:
-    """List configured Acumatica instances (names + base URLs, no secrets)."""
+def list_instances() -> dict:
+    """List configured Acumatica profiles (no secrets) + which one is active.
+
+    The active profile is used by any tool called without an `instance` arg.
+    Switch it with set_active_instance; add/remove with add_instance/remove_instance.
+    """
     cfg = _cfg()
-    return [
-        {"name": n, "base_url": i.base_url, "default": n == cfg.default}
-        for n, i in cfg.instances.items()
-    ]
+    return {
+        "active": cfg.default,
+        "source_path": cfg.source_path,
+        "instances": [
+            {
+                "name": n,
+                "base_url": i.base_url,
+                "endpoint": f"{i.endpoint_name}/{i.endpoint_version}",
+                "tenant": i.tenant,
+                "active": n == cfg.default,
+                "gates": {
+                    "write": i.allow_write,
+                    "delete": i.allow_delete,
+                    "publish": i.allow_publish,
+                },
+            }
+            for n, i in cfg.instances.items()
+        ],
+    }
+
+
+@mcp.tool()
+def add_instance(
+    name: str,
+    base_url: str,
+    client_id: str,
+    client_secret: str,
+    username: str,
+    password: str,
+    endpoint_name: str = "Default",
+    endpoint_version: str = "24.200.001",
+    tenant: str = "",
+    branch: str = "",
+    allow_write: bool = False,
+    allow_delete: bool = False,
+    allow_publish: bool = False,
+    read_roots: list[str] | None = None,
+    write_roots: list[str] | None = None,
+    set_active: bool = False,
+    persist: bool = True,
+) -> dict:
+    """Add (or replace) a connection profile and save it to connections.json.
+
+    name: the profile key you'll pass as `instance` (e.g. "financenew").
+    base_url + OAuth (client_id/client_secret/username/password): the target
+        instance and a Connected Application registered there.
+    Gates default to read-only (allow_write/allow_delete/allow_publish off) and the
+    filesystem sandbox (read_roots/write_roots) is unset (unrestricted) unless given.
+    set_active=true makes it the default profile. persist=true writes connections.json
+    (the file is gitignored). Returns the updated profile list (no secrets).
+
+    Needs a registered Connected Application on the target instance (Integration ->
+    Connected Applications, Resource Owner Password Credentials flow).
+    """
+    cfg = _cfg()
+    inst = Instance(
+        base_url=base_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        username=username,
+        password=password,
+        endpoint_name=endpoint_name,
+        endpoint_version=endpoint_version,
+        tenant=tenant,
+        branch=branch,
+        allow_write=allow_write,
+        allow_delete=allow_delete,
+        allow_publish=allow_publish,
+        read_roots=read_roots or [],
+        write_roots=write_roots or [],
+    )
+    existed = name in cfg.instances
+    cfg.instances[name] = inst
+    _clients.pop(name, None)  # drop any stale cached client for this name
+    if set_active or len(cfg.instances) == 1:
+        cfg.default = name
+    saved = save_config(cfg) if persist else None
+    return {
+        "added": name,
+        "replaced": existed,
+        "active": cfg.default,
+        "persisted_to": saved,
+        "instances": list_instances()["instances"],
+    }
+
+
+@mcp.tool()
+def set_active_instance(name: str, persist: bool = False) -> dict:
+    """Select which profile tools use by default (when called without `instance`).
+
+    persist=true also writes the choice as "default" in connections.json so it
+    survives a restart; otherwise it's a session-only switch.
+    """
+    cfg = _cfg()
+    if name not in cfg.instances:
+        raise KeyError(f"Unknown profile '{name}'. Configured: {', '.join(cfg.instances)}")
+    cfg.default = name
+    saved = save_config(cfg) if persist else None
+    return {"active": name, "persisted": bool(saved), "persisted_to": saved}
+
+
+@mcp.tool()
+def remove_instance(name: str, persist: bool = True) -> dict:
+    """Remove a connection profile (and drop its cached session).
+
+    If it was the active profile, the active switches to another remaining profile.
+    persist=true updates connections.json. Refuses to remove the last profile.
+    """
+    cfg = _cfg()
+    if name not in cfg.instances:
+        raise KeyError(f"Unknown profile '{name}'. Configured: {', '.join(cfg.instances)}")
+    if len(cfg.instances) == 1:
+        raise ValueError("refusing to remove the only configured profile.")
+    del cfg.instances[name]
+    _clients.pop(name, None)
+    if cfg.default == name:
+        cfg.default = next(iter(cfg.instances))
+    saved = save_config(cfg) if persist else None
+    return {
+        "removed": name,
+        "active": cfg.default,
+        "persisted_to": saved,
+        "instances": list(cfg.instances),
+    }
+
+
+@mcp.tool()
+async def test_connection(instance: str | None = None) -> dict:
+    """Verify a profile's credentials: fetch an OAuth token and read the contract.
+
+    Returns ok=true + the entity count on success, or ok=false + the error. Use
+    after add_instance to confirm the profile works before relying on it.
+    """
+    cfg = _cfg()
+    name = instance or cfg.default
+    try:
+        ents = await _client(instance).list_entities()
+        return {"instance": name, "ok": True, "entity_count": len(ents)}
+    except Exception as e:
+        return {"instance": name, "ok": False, "error": str(e)[:400]}
 
 
 @mcp.tool()
