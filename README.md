@@ -115,6 +115,16 @@ password blank when editing to keep the existing values. Because the MCP server 
 config at startup, **restart it** to apply add/active changes to the live connector
 (Test works immediately — it opens its own session).
 
+The header shows a build marker (e.g. `build 2`); if you don't see it after editing,
+you're on a cached page or an old server process. Responses send `Cache-Control:
+no-store`, so a hard refresh (Ctrl+Shift+R) is enough. If the page is blank or the
+port won't bind, a previous instance is still holding it — find and stop it:
+
+```bash
+# Windows:  netstat -ano | findstr :8765   then   taskkill /F /PID <pid>
+# macOS/Linux:  lsof -ti:8765 | xargs kill
+```
+
 ### Bulk loading from Excel/CSV
 
 `load_from_excel` turns a master file (Chart of Accounts, sub-account values,
