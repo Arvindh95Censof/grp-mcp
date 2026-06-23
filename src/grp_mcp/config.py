@@ -32,11 +32,26 @@ class Instance(BaseModel):
     endpoint_version: str = "24.200.001"
     tenant: str = ""  # company login name, needed for OData / GI calls
     branch: str = ""  # optional login branch
+    # --- write gates (default read-only; opt in per instance) ---
+    allow_write: bool = False  # gate create/update, load, action, import-scenario, note, attach
+    allow_delete: bool = False  # gate record deletes (stricter than write)
     allow_publish: bool = False  # gate for Customization API write ops (publish/import/unpublish)
+    # --- filesystem sandbox (empty list = unrestricted; set to enforce) ---
+    read_roots: list[str] = Field(default_factory=list)  # dirs attach_file may read from
+    write_roots: list[str] = Field(default_factory=list)  # dirs download/report/snapshot may write to
+    max_file_bytes: int = 50_000_000  # cap on read/download size (bytes)
 
     @property
     def token_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/identity/connect/token"
+
+    @property
+    def origin(self) -> str:
+        """scheme://host[:port] of the instance — the only origin we send the token to."""
+        from urllib.parse import urlparse
+
+        u = urlparse(self.base_url)
+        return f"{u.scheme}://{u.netloc}".lower()
 
     @property
     def entity_base(self) -> str:
@@ -84,6 +99,8 @@ def _from_env() -> Config | None:
         endpoint_version=os.getenv("GRP_MCP_ENDPOINT_VERSION", "24.200.001"),
         tenant=os.getenv("GRP_MCP_TENANT", ""),
         branch=os.getenv("GRP_MCP_BRANCH", ""),
+        allow_write=os.getenv("GRP_MCP_ALLOW_WRITE", "").lower() in ("1", "true", "yes"),
+        allow_delete=os.getenv("GRP_MCP_ALLOW_DELETE", "").lower() in ("1", "true", "yes"),
         allow_publish=os.getenv("GRP_MCP_ALLOW_PUBLISH", "").lower() in ("1", "true", "yes"),
     )
     return Config(default="default", instances={"default": inst})

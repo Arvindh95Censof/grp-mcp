@@ -11,7 +11,12 @@
       "endpoint_version": "24.200.001",
       "tenant": "CompanyLogin",
       "branch": "",
-      "allow_publish": false
+      "allow_publish": false,
+      "allow_write": false,
+      "allow_delete": false,
+      "read_roots": ["C:\\path\\to\\data"],
+      "write_roots": ["C:\\path\\to\\out"],
+      "max_file_bytes": 50000000
     },
     "grp-vps": {
       "base_url": "https://your-grp-instance",

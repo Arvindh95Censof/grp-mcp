@@ -92,7 +92,19 @@ async function pickSelector(frame, pg, containerId, search, optionText) {
   }, ENTITY);
   if (!found) throw new Error(`entity "${ENTITY}" not found in tree`);
   await sleep(pg, 2000);
-  await frame.evaluate(() => { const tr = [...document.querySelectorAll('tr.tree-row')].find(r => (r.textContent || '').trim() === 'Actions' && r.getBoundingClientRect().width > 0); if (tr) ['mousedown', 'mouseup', 'click'].forEach(ev => tr.querySelector('td').dispatchEvent(new MouseEvent(ev, { bubbles: true }))); });
+  // Select the "Actions" row that belongs to ENTITY: locate the entity's row, then
+  // the first visible "Actions" tree-row AFTER it (its child) — not the first global
+  // "Actions" row, which could belong to a different entity.
+  const picked = await frame.evaluate((n) => {
+    const rows = [...document.querySelectorAll('tr.tree-row')].filter(r => r.getBoundingClientRect().width > 0);
+    const ei = rows.findIndex(r => (r.textContent || '').trim() === n || (r.textContent || '').trim().startsWith(n));
+    if (ei === -1) return false;
+    const a = rows.slice(ei + 1).find(r => (r.textContent || '').trim() === 'Actions');
+    if (!a) return false;
+    ['mousedown', 'mouseup', 'click'].forEach(ev => a.querySelector('td').dispatchEvent(new MouseEvent(ev, { bubbles: true })));
+    return true;
+  }, ENTITY);
+  if (!picked) throw new Error(`Actions node not found under "${ENTITY}"`);
   await sleep(pg, 1500);
 
   // Insert -> Create Action dialog

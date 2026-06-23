@@ -6,9 +6,11 @@ helpers over the contract-based REST endpoint and OData (Generic Inquiries).
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -30,28 +32,36 @@ class AcumaticaClient:
         self._refresh_token: str | None = None
         self._expires_at: float = 0.0
         self._swagger: dict | None = None
+        self._token_lock = asyncio.Lock()  # serialize token fetch -> one session, not N
 
     async def aclose(self) -> None:
         await self.logout()
-        await self._http.aclose()
+        try:
+            await self._http.aclose()
+        except Exception:
+            pass
 
     async def logout(self) -> None:
         """Close the API session to free the license seat (trial = 2 seats).
 
         Acumatica counts each unclosed sign-in against the Max Web Services API
-        Users limit, so callers must release the session when done.
+        Users limit, so callers must release the session when done. Uses a fresh,
+        short-lived httpx client so it works even from a shutdown handler running
+        on a different event loop than the one self._http was created on.
         """
-        if not self._access_token:
-            return
-        try:
-            await self._http.post(
-                f"{self.instance.base_url.rstrip('/')}/entity/auth/logout",
-                headers={"Authorization": f"Bearer {self._access_token}"},
-            )
-        except Exception:
-            pass
+        token = self._access_token
         self._access_token = None
         self._expires_at = 0.0
+        if not token:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as h:
+                await h.post(
+                    f"{self.instance.base_url.rstrip('/')}/entity/auth/logout",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+        except Exception:
+            pass
 
     # ---- auth -----------------------------------------------------------
 
@@ -94,8 +104,24 @@ class AcumaticaClient:
 
     async def _auth_header(self) -> dict[str, str]:
         if not self._access_token or time.monotonic() >= self._expires_at - _EXPIRY_SKEW:
-            await self._fetch_token()
+            # serialize concurrent refreshes; re-check inside the lock so only the
+            # first waiter actually logs in (avoids duplicate Acumatica sessions /
+            # seat exhaustion when many tool calls fire at once)
+            async with self._token_lock:
+                if not self._access_token or time.monotonic() >= self._expires_at - _EXPIRY_SKEW:
+                    await self._fetch_token()
         return {"Authorization": f"Bearer {self._access_token}"}
+
+    def _assert_same_origin(self, url: str) -> None:
+        """Refuse to attach the ERP bearer token to any non-configured origin (SSRF)."""
+        u = urlparse(url)
+        origin = f"{u.scheme}://{u.netloc}".lower()
+        if origin != self.instance.origin:
+            raise AcumaticaError(
+                f"Refusing authenticated request to '{origin}': only the configured "
+                f"Acumatica origin '{self.instance.origin}' is allowed. (Blocked to "
+                f"prevent leaking the OAuth token to an arbitrary URL.)"
+            )
 
     # ---- request plumbing ----------------------------------------------
 
@@ -104,8 +130,10 @@ class AcumaticaClient:
 
         Used for binary payloads (file downloads, report PDFs) and when the caller
         needs response headers (e.g. the Location of an async report). Refreshes the
-        token once on 401 and raises AcumaticaError on >=400.
+        token once on 401 and raises AcumaticaError on >=400. Rejects any URL whose
+        origin is not the configured instance (so the bearer token never leaves it).
         """
+        self._assert_same_origin(url)
         headers = await self._auth_header()
         headers.update(kwargs.pop("headers", {}))
         resp = await self._http.request(method, url, headers=headers, **kwargs)
@@ -273,6 +301,9 @@ class AcumaticaClient:
         """
         base = dict(params or {})
         size = int(base.pop("$top", page_size) or page_size)
+        if size <= 0:
+            raise AcumaticaError(f"page_size must be >= 1 (got {size})")
+        size = min(size, 10000)  # guard against absurd page sizes
         out: list = []
         skip = 0
         while True:
@@ -318,7 +349,8 @@ class AcumaticaClient:
         `body` is the already-wrapped request body, e.g.
         {"parameters": {"OrgBAccountID": {"value": "MPM"}}}.
         """
-        import asyncio
+        poll_interval = max(0.2, float(poll_interval))  # never 0 -> tight spin
+        timeout = max(poll_interval, float(timeout))
 
         resp = await self._request_raw(
             "PUT", self._entity_url(entity), json=body,

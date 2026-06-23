@@ -67,6 +67,108 @@ def _require_publish(instance: str | None) -> None:
         )
 
 
+def _require_write(instance: str | None) -> None:
+    """Block record-mutating tools unless the instance opted in (allow_write)."""
+    cfg = _cfg()
+    name = instance or cfg.default
+    if not cfg.get(name).allow_write:
+        raise PermissionError(
+            f"Writes are disabled for instance '{name}'. Set \"allow_write\": true in "
+            f"its connections.json profile to permit create/update, load, actions, "
+            f"import-scenario, notes, and attachments. (Default is read-only.)"
+        )
+
+
+def _require_delete(instance: str | None) -> None:
+    """Block record deletes unless the instance opted in (allow_delete)."""
+    cfg = _cfg()
+    name = instance or cfg.default
+    if not cfg.get(name).allow_delete:
+        raise PermissionError(
+            f"Deletes are disabled for instance '{name}'. Set \"allow_delete\": true "
+            f"in its connections.json profile to permit delete_entity."
+        )
+
+
+def _require_range(name: str, value: Any, lo: float, hi: float) -> None:
+    """Validate a numeric argument is within [lo, hi]; raise ValueError otherwise."""
+    if value is None:
+        return
+    if not isinstance(value, (int, float)) or value < lo or value > hi:
+        raise ValueError(f"{name} must be a number in [{lo}, {hi}] (got {value!r})")
+
+
+def _resolve_roots(roots: list[str]) -> list:
+    from pathlib import Path
+
+    return [Path(r).expanduser().resolve() for r in roots]
+
+
+def _within(path, roots: list) -> bool:
+    return any(path == r or r in path.parents for r in roots)
+
+
+def _check_read_path(path: str, instance: str | None):
+    """Validate a file to be READ: inside read_roots (if set) and under the size cap."""
+    from pathlib import Path
+
+    cfg = _cfg()
+    inst = cfg.get(instance or cfg.default)
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"file not found: {path}")
+    roots = _resolve_roots(inst.read_roots)
+    if roots and not _within(p, roots):
+        raise PermissionError(
+            f"Reading '{p}' is not allowed. Permitted read_roots: {[str(r) for r in roots]}."
+        )
+    size = p.stat().st_size
+    if inst.max_file_bytes and size > inst.max_file_bytes:
+        raise PermissionError(
+            f"file is {size} bytes, exceeds max_file_bytes={inst.max_file_bytes}."
+        )
+    return p
+
+
+def _check_write_path(path: str, instance: str | None):
+    """Validate a path to be WRITTEN: its parent is inside write_roots (if set)."""
+    from pathlib import Path
+
+    cfg = _cfg()
+    inst = cfg.get(instance or cfg.default)
+    p = Path(path).expanduser().resolve()
+    roots = _resolve_roots(inst.write_roots)
+    if roots and not _within(p.parent, roots) and not _within(p, roots):
+        raise PermissionError(
+            f"Writing to '{p}' is not allowed. Permitted write_roots: {[str(r) for r in roots]}."
+        )
+    return p
+
+
+def _shutdown_clients() -> None:
+    """Best-effort: log out cached API sessions on process exit to free seats.
+
+    Runs on a fresh event loop (the server's is gone by atexit); logout() uses its
+    own short-lived httpx client so it works there. Guarded so exit never crashes.
+    """
+    if not _clients:
+        return
+
+    async def _close_all() -> None:
+        for c in list(_clients.values()):
+            try:
+                await c.aclose()
+            except Exception:
+                pass
+
+    try:
+        import asyncio
+
+        asyncio.run(_close_all())
+    except Exception:
+        pass
+
+
 def _wrap(value: Any) -> Any:
     """Recursively convert plain values into Acumatica's {"value": ...} envelope.
 
@@ -224,6 +326,8 @@ async def get_entity(
 
     For pulling an ENTIRE large table, prefer fetch_all_entities (auto-pages).
     """
+    _require_range("top", top, 1, 100000)
+    _require_range("skip", skip, 0, 100000000)
     params: dict[str, Any] = {}
     if filter:
         params["$filter"] = filter
@@ -267,11 +371,30 @@ async def get_entity(
             if "$expand" in retry:
                 retry.pop("$expand"); dropped.append("$expand")
             result = await client.get_entity(entity, record_id, retry)
+        # Fail closed on the dropped $select: the server returned every field, but
+        # the caller asked for a narrower projection. Re-apply it locally so fields
+        # the caller deliberately excluded are NOT handed back.
+        projected = False
+        if "$select" in dropped and select:
+            keep = {c.split("(", 1)[0].strip() for c in select.split(",") if c.strip()}
+            keep |= {"id", "rowNumber"}  # keep record identity
+
+            def _proj(rec: Any) -> Any:
+                if not isinstance(rec, dict):
+                    return rec
+                return {k: v for k, v in rec.items() if k in keep}
+
+            result = [_proj(r) for r in result] if isinstance(result, list) else _proj(result)
+            projected = True
         return {
             "_warning": (
                 f"'{entity}' has BQL-delegate views that break optimized list "
-                f"queries; retried after dropping {dropped}. Those options were "
-                f"ignored. Fetch a single record by key to use them. "
+                f"queries; retried after dropping {dropped}. "
+                + ("$select was re-applied locally so excluded fields are not returned; "
+                   if projected else "")
+                + ("$expand could not be honored (nested data absent). "
+                   if "$expand" in dropped else "")
+                + f"Fetch a single record by key for full options. "
                 f"Original error: {msg[:200]}"
             ),
             "result": result,
@@ -321,6 +444,8 @@ async def fetch_all_entities(
     page_size: rows per request ($top). max_records: hard cap to stop early
     (None = no cap). Use filter/select to scope/shrink. Returns {count, records}.
     """
+    _require_range("page_size", page_size, 1, 10000)
+    _require_range("max_records", max_records, 1, 100000000)
     params: dict[str, Any] = {}
     if filter:
         params["$filter"] = filter
@@ -346,7 +471,10 @@ async def create_or_update_entity(
     fields: plain field->value map; scalars are auto-wrapped. Detail lines go in
             a list, e.g. {"OrderType": "SO", "CustomerID": "ABC",
                           "Details": [{"InventoryID": "ITEM1", "OrderQty": 2}]}.
+
+    Requires the instance's "allow_write": true (default is read-only).
     """
+    _require_write(instance)
     return await _client(instance).put_entity(entity, _wrap_fields(fields))
 
 
@@ -370,13 +498,14 @@ async def attach_file(
 
     Use this to put the Pentaho CSV onto a Data Provider, or attach source
     documents to a record, entirely via API.
+
+    Requires "allow_write": true. The file must be within the instance's read_roots
+    (if configured) and under max_file_bytes.
     """
     import mimetypes
-    from pathlib import Path
 
-    p = Path(file_path)
-    if not p.is_file():
-        raise FileNotFoundError(f"file not found: {file_path}")
+    _require_write(instance)
+    p = _check_read_path(file_path, instance)
     name = filename or p.name
     ctype = content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
     client = _client(instance)
@@ -417,6 +546,10 @@ async def load_from_excel(
     limit caps rows processed; stop_on_error aborts on the first failed row.
     Tip: run get_entity_schema(entity) first to get exact field names.
     """
+    _require_range("limit", limit, 1, 1000000)
+    _check_read_path(path, instance)  # sandbox + size cap (read-side guard)
+    if not dry_run:
+        _require_write(instance)
     headers, rows = read_rows(path, sheet)
     if limit:
         rows = rows[:limit]
@@ -426,22 +559,31 @@ async def load_from_excel(
 
     if dry_run:
         unknown: list[str] = []
+        schema_error: str | None = None
         try:
             sch = await client.get_entity_schema(entity)
             valid = set(sch["scalar_fields"]) | set(sch["detail_fields"])
             used = {k for m in mapped for k in m}
             unknown = sorted(used - valid)
-        except Exception:
-            pass
+        except Exception as e:
+            # fail closed: do NOT report unknown_fields=[] as if validation passed
+            schema_error = str(e)[:300]
         return {
             "dry_run": True,
             "entity": entity,
             "file_headers": headers,
             "row_count": len(mapped),
-            "unknown_fields": unknown,
+            "validated": schema_error is None,
+            "unknown_fields": unknown if schema_error is None else None,
+            "schema_error": schema_error,
             "sample": mapped[:5],
-            "note": ("No data written. Resolve unknown_fields (fix column_map), "
-                     "then re-run with dry_run=false."),
+            "note": (
+                "Schema validation FAILED — could not confirm field names; fix the "
+                "error and re-run before loading. No data written."
+                if schema_error
+                else "No data written. Resolve unknown_fields (fix column_map), "
+                "then re-run with dry_run=false."
+            ),
         }
 
     created, errors = 0, []
@@ -465,7 +607,11 @@ async def load_from_excel(
 
 @mcp.tool()
 async def delete_entity(entity: str, record_id: str, instance: str | None = None) -> Any:
-    """Delete a record by its id (the record's key GUID or keys path)."""
+    """Delete a record by its id (the record's key GUID or keys path).
+
+    Requires the instance's "allow_delete": true (default off, stricter than write).
+    """
+    _require_delete(instance)
     return await _client(instance).delete_entity(entity, record_id)
 
 
@@ -526,6 +672,7 @@ async def snapshot_entity(
     regen, segment restructure, bulk overwrite) so you can roll back.
 
     Auto-pages with $skip so the snapshot captures the FULL table, not just page 1.
+    A caller-supplied `path` must be inside the instance's write_roots (if configured).
     """
     params: dict[str, Any] = {}
     if filter:
@@ -534,6 +681,8 @@ async def snapshot_entity(
         params["$expand"] = expand
     cfg = _cfg()
     name = instance or cfg.default
+    if path:
+        _check_write_path(path, instance)
     data = await _client(instance).get_all(entity, params)
 
     if not path:
@@ -572,7 +721,10 @@ async def invoke_action(
     entity_ref: identifies the target record, e.g. {"OrderType": "SO", "OrderNbr": "000123"}.
     parameters: optional action parameters.
     Returns 202 + a Location to poll for long-running actions.
+
+    Requires the instance's "allow_write": true (actions mutate ERP state).
     """
+    _require_write(instance)
     body = {"entity": _wrap_fields(entity_ref), "parameters": _wrap_fields(parameters or {})}
     return await _client(instance).invoke_action(entity, action, body)
 
@@ -602,9 +754,14 @@ async def run_import_scenario(
 
     NOTE: the provider that the scenario uses must already have its file attached
     (see attach_file). Prepare/Import run on the screen's selected scenario record.
+
+    Requires the instance's "allow_write": true (it stages/commits records).
     """
     import asyncio
 
+    _require_write(instance)
+    _require_range("poll_interval", poll_interval, 0.2, 60)
+    _require_range("timeout", timeout, 1, 3600)
     client = _client(instance)
     ref = {key_field: scenario_name}
 
@@ -742,9 +899,12 @@ async def download_file(
     to the record's first/only attachment). out_path: where to write the bytes.
     Resolves the file's href from the record's `files` collection, then GETs the
     raw bytes. (List a record's files first with list_attachments.)
+
+    out_path must be within the instance's write_roots (if configured).
     """
     from pathlib import Path
 
+    dest = _check_write_path(out_path, instance)
     client = _client(instance)
     rec = await client.get_entity(entity, record_id)
     files = (rec.get("files") if isinstance(rec, dict) else None) or []
@@ -765,7 +925,7 @@ async def download_file(
     if not href:
         raise AcumaticaError(f"attachment has no download href: {chosen}")
     data = await client.get_bytes(href)
-    Path(out_path).write_bytes(data)
+    dest.write_bytes(data)
     return {
         "entity": entity,
         "record_id": record_id,
@@ -793,16 +953,18 @@ async def run_report(
     out_path: where to write the report bytes.
 
     Contract flow: PUT report + params -> 202 + Location -> poll until 200 -> bytes.
+    out_path must be within the instance's write_roots (if configured).
     """
-    from pathlib import Path
-
+    _require_range("poll_interval", poll_interval, 0.2, 60)
+    _require_range("timeout", timeout, 1, 3600)
+    dest = _check_write_path(out_path, instance)
     body: dict[str, Any] = {}
     if parameters:
         body["parameters"] = _wrap_fields(parameters)
     data = await _client(instance).run_report(
         report_entity, body, poll_interval=poll_interval, timeout=timeout
     )
-    Path(out_path).write_bytes(data)
+    dest.write_bytes(data)
     return {
         "report": report_entity,
         "bytes": len(data),
@@ -819,7 +981,10 @@ async def set_note(
 
     The contract API exposes a record's note as the `note` field. Pass note="" to
     clear it. record_id identifies the target record (key/GUID).
+
+    Requires the instance's "allow_write": true.
     """
+    _require_write(instance)
     client = _client(instance)
     rec = await client.get_entity(entity, record_id)
     body: dict[str, Any] = {"note": _wrap(note)}
@@ -848,10 +1013,11 @@ async def export_customization(
     Pulls the project content via API and writes it to out_path. This closes the
     headless edit loop for endpoints: export_customization -> edit project.xml ->
     import_customization -> publish_customization (no browser export needed).
+    out_path must be within the instance's write_roots (if configured).
     """
     import base64
-    from pathlib import Path
 
+    dest = _check_write_path(out_path, instance)
     async with _customization(instance) as c:
         res = await c.get_project(project_name)
     content = res.get("projectContentBase64") if isinstance(res, dict) else None
@@ -859,7 +1025,7 @@ async def export_customization(
         return {"error": "no projectContentBase64 in response", "project": project_name,
                 "raw": res}
     data = base64.b64decode(content)
-    Path(out_path).write_bytes(data)
+    dest.write_bytes(data)
     return {"project": project_name, "path": out_path, "bytes": len(data)}
 
 
@@ -878,6 +1044,7 @@ async def import_customization(
     profile to have "allow_publish": true.
     """
     _require_publish(instance)
+    _check_read_path(zip_path, instance)  # sandbox + size cap
     content = encode_zip(zip_path)
     async with _customization(instance) as c:
         return await c.import_project(
@@ -930,7 +1097,13 @@ async def unpublish_customization(
 
 
 def main() -> None:
-    mcp.run()
+    import atexit
+
+    atexit.register(_shutdown_clients)  # free API license seats on exit
+    try:
+        mcp.run()
+    finally:
+        _shutdown_clients()
 
 
 if __name__ == "__main__":

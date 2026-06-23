@@ -49,7 +49,7 @@ base URL + OAuth credentials.
 
 | Tool | What it does |
 |------|--------------|
-| `extend_endpoint` | Add entities/fields to a contract via the `WebServiceEndpoints` entity (gated). |
+| `extend_endpoint` | **Verified no-op over REST** — kept for reference; extend endpoints via the SM207060 UI / playwright or a customization project instead. |
 
 **Safety**
 
@@ -86,12 +86,36 @@ scalar fields are supported (no nested detail rows).
 
 ### Extending an endpoint contract
 
-`extend_endpoint` adds top-level entities/fields to an existing endpoint by writing
-to the `WebServiceEndpoints` entity (the SM207060 form projected over REST). This
-is a **website-level contract change** — gated behind `"allow_publish": true`. It
-is experimental: the underlying form is wizard-driven, so not every screen maps
-cleanly in a single PUT. Read first with `get_endpoint_definition`, snapshot, and
-test on a throwaway endpoint — never the one the server is actively using.
+`extend_endpoint` is a **verified no-op over REST** and is kept only for reference.
+`WebServiceEndpoints` (SM207060) is a stateful wizard form — its create/extend views
+are transient and a PUT does nothing. To actually add entities/fields/actions to an
+endpoint, use the **SM207060 UI** (drive it with the playwright scripts in
+`playwright/`) or a **customization project** (`export_customization` → edit
+`project.xml` → `import_customization` → `publish_customization`). Reading a contract
+works fine via `get_endpoint_definition`.
+
+### Security model
+
+This server holds ERP credentials and runs with the host user's privileges, so the
+tools are sandboxed:
+
+- **Token never leaves the instance.** Every authenticated request is checked
+  against the configured origin (`scheme://host`); a `poll_action`/download URL on
+  any other host is refused (prevents OAuth-token exfiltration / SSRF).
+- **Writes are opt-in.** Record mutations (`create_or_update_entity`,
+  `load_from_excel`, `invoke_action`, `run_import_scenario`, `set_note`,
+  `attach_file`) require `"allow_write": true`; `delete_entity` requires the stricter
+  `"allow_delete": true`; customization publish/import/unpublish require
+  `"allow_publish": true`. **Default is read-only.**
+- **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
+  `load_from_excel`) or write (`download_file`, `run_report`, `snapshot_entity`,
+  `export_customization`) a local path enforce `read_roots` / `write_roots` (a path
+  must sit inside an allowed dir if the list is set) and a `max_file_bytes` size cap
+  on reads. Leave the root lists empty only on a trusted single-user host.
+- **Bounded loops.** Pagination and polling arguments are range-checked, so a
+  `page_size`/`poll_interval` of 0 can't spin forever.
+- **Sessions released.** Token refreshes are serialized (one login, not N), and API
+  sessions are logged out on shutdown to free license seats.
 
 ### Paging large tables
 

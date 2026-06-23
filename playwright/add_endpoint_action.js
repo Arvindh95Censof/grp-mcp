@@ -50,11 +50,23 @@ const sleep=(pg,ms)=>pg.waitForTimeout(ms);
 const frм=(pg)=>pg.frames().find(f=>f.name()==='main')||pg.frames().find(f=>/SM207060\.aspx/.test(f.url()));
 const fire=(frame,sel)=>frame.evaluate(s=>{const x=document.querySelector(s); if(x)['mousedown','mouseup','click'].forEach(e=>x.dispatchEvent(new MouseEvent(e,{bubbles:true}))); return !!x;},sel);
 const fireText=(frame,txt)=>frame.evaluate(t=>{const x=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&(e.textContent||'').trim()===t&&e.offsetParent!==null); if(x)['mousedown','mouseup','click'].forEach(e=>x.dispatchEvent(new MouseEvent(e,{bubbles:true}))); return !!x;},txt);
+// Click the "Actions" node that belongs to ENTITY: find the entity's leaf, then the
+// first visible "Actions" leaf that appears AFTER it in document order (its child),
+// instead of the first global "Actions" (which may belong to another entity).
+const fireActionsUnder=(frame,entity)=>frame.evaluate(en=>{
+  const leaves=[...document.querySelectorAll('*')].filter(e=>e.children.length===0&&e.offsetParent!==null);
+  const ei=leaves.findIndex(e=>(e.textContent||'').trim()===en);
+  if(ei===-1) return false;
+  const a=leaves.slice(ei+1).find(e=>(e.textContent||'').trim()==='Actions');
+  if(!a) return false;
+  ['mousedown','mouseup','click'].forEach(ev=>a.dispatchEvent(new MouseEvent(ev,{bubbles:true})));
+  return true;
+},entity);
 
 (async()=>{
   const b=await chromium.launch({headless:true});
   const pg=await (await b.newContext({viewport:{width:1600,height:900}})).newPage();
-  pg.on('dialog',d=>d.accept().catch(()=>{}));   // auto-accept stray alerts
+  pg.on('dialog',d=>{ log('DIALOG ('+d.type()+'):', JSON.stringify(d.message())); d.accept().catch(()=>{}); });   // log before accepting
   const shot=(n)=>DEBUG&&pg.screenshot({path:`shots/${n}.png`}).catch(()=>{});
   await pg.goto(BASE,{waitUntil:'domcontentloaded',timeout:60000});
   await pg.locator("input[type='text']:visible, input:not([type]):visible").first().fill(USER);
@@ -77,8 +89,8 @@ const fireText=(frame,txt)=>frame.evaluate(t=>{const x=[...document.querySelecto
   const done=[];
   for(const {mapped,name} of WORK){
     frame=frм(pg);
-    // select Actions child of THIS entity
-    if(!await fireText(frame,'Actions')){ log('Actions node not found - re-expanding'); await frame.evaluate(n=>{const x=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&(e.textContent||'').trim()===n); if(x)['mousedown','mouseup','click','dblclick'].forEach(ev=>x.dispatchEvent(new MouseEvent(ev,{bubbles:true})));},ENTITY); await sleep(pg,2000); await fireText(frame,'Actions'); }
+    // select the Actions child of THIS entity (scoped, not the first global match)
+    if(!await fireActionsUnder(frame,ENTITY)){ log('Actions node not found under',ENTITY,'- re-expanding'); await frame.evaluate(n=>{const x=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&(e.textContent||'').trim()===n); if(x)['mousedown','mouseup','click','dblclick'].forEach(ev=>x.dispatchEvent(new MouseEvent(ev,{bubbles:true})));},ENTITY); await sleep(pg,2000); if(!await fireActionsUnder(frame,ENTITY)){ log('still no Actions node under',ENTITY,'- skipping',name); continue; } }
     await sleep(pg,1200);
     // Insert (tree toolbar)
     await frame.evaluate(()=>{const t=document.querySelector('#ctl00_phG_splitFields_entityTree_tlb'); const ins=t&&[...t.querySelectorAll('*')].find(e=>(e.textContent||'').trim()==='Insert'); if(ins)['mousedown','mouseup','click'].forEach(e=>ins.dispatchEvent(new MouseEvent(e,{bubbles:true})));});
