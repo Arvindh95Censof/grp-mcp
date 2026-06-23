@@ -108,8 +108,11 @@ grp-mcp-ui            # or: python -m grp_mcp.ui
 ```
 
 A single-file, dependency-free (stdlib `http.server`) page to **list / add / edit /
-set-active / remove / test** profiles, writing the same connections.json. It binds to
-`127.0.0.1` only (it edits credentials) and **never sends secrets to the browser** —
+set-active / remove / test** profiles, writing the same connections.json. **First run
+needs no config file** — on a fresh machine the page opens with an empty list; add your
+first profile in the browser and it creates connections.json for you (no JSON editing).
+It binds to `127.0.0.1` only (it edits credentials) and **never sends secrets to the
+browser** —
 the profile list only reports whether a secret/password is set. Leave the secret and
 password blank when editing to keep the existing values. Because the MCP server reads
 config at startup, **restart it** to apply add/active changes to the live connector

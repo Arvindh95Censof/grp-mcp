@@ -21,10 +21,23 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .acumatica import AcumaticaClient
-from .config import Instance, load_config, save_config
+from .config import Config, Instance, load_config, save_config
 
 HOST = "127.0.0.1"
 PORT = 8765
+
+
+def _load() -> Config:
+    """Load the config, or return an empty one so a brand-new user can bootstrap.
+
+    On a fresh machine there is no connections.json and no env vars, so
+    load_config() raises. The UI treats that as "no profiles yet" and lets the
+    user add the first profile in the browser (save_config writes a new file).
+    """
+    try:
+        return load_config()
+    except Exception:  # noqa: BLE001 - no config yet -> start empty
+        return Config(default="", instances={}, source_path=None)
 
 PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -67,7 +80,7 @@ PAGE = """<!DOCTYPE html>
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 2</span></h1>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 3</span></h1>
 <p class="sub" id="src">loading…</p>
 <div class="banner">Editing here writes <code>connections.json</code>. Restart the grp-mcp server to apply add / active changes to the live connector.</div>
 <div id="list"></div>
@@ -204,7 +217,7 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path == "/" or self.path.startswith("/index"):
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif self.path == "/api/profiles":
-                self._json(_profiles_payload(load_config()))
+                self._json(_profiles_payload(_load()))
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001 - surface config errors as JSON
@@ -227,7 +240,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)[:400]}, 400)
 
     def _save_profile(self, b: dict) -> None:
-        cfg = load_config()
+        cfg = _load()
         name = (b.get("name") or "").strip()
         if not name:
             raise ValueError("name is required")
@@ -261,7 +274,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json({"name": name, "active": cfg.default})
 
     def _set_active(self, b: dict) -> None:
-        cfg = load_config()
+        cfg = _load()
         name = b.get("name")
         if name not in cfg.instances:
             raise ValueError(f"unknown profile '{name}'")
@@ -270,7 +283,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json({"active": name})
 
     def _remove(self, b: dict) -> None:
-        cfg = load_config()
+        cfg = _load()
         name = b.get("name")
         if name not in cfg.instances:
             raise ValueError(f"unknown profile '{name}'")
@@ -283,7 +296,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json({"removed": name, "active": cfg.default})
 
     def _do_test(self, b: dict) -> None:
-        cfg = load_config()
+        cfg = _load()
         name = b.get("name")
         if name not in cfg.instances:
             raise ValueError(f"unknown profile '{name}'")
