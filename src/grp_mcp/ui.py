@@ -67,8 +67,8 @@ PAGE = """<!DOCTYPE html>
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles</h1>
-<p class="sub" id="src"></p>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 2</span></h1>
+<p class="sub" id="src">loading…</p>
 <div class="banner">Editing here writes <code>connections.json</code>. Restart the grp-mcp server to apply add / active changes to the live connector.</div>
 <div id="list"></div>
 
@@ -186,6 +186,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
