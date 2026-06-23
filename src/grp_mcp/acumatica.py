@@ -275,17 +275,29 @@ class AcumaticaClient:
                     "record_id (optionally with expand=) one record at a time.",
         }
 
+    def _abs(self, url: str) -> str:
+        """Resolve a server-returned relative URL to an absolute one.
+
+        Acumatica's _links/files:put/Location values are SITE-absolute — they already
+        include the instance virtual directory (e.g. "/2025R1Setup/entity/..."). Those
+        must be joined to the ORIGIN (scheme://host), not base_url, or the site segment
+        doubles ("/2025R1Setup/2025R1Setup/...") and 401s. A link WITHOUT the site
+        segment is joined to base_url. Absolute http(s) URLs pass through.
+        """
+        if url.startswith("http"):
+            return url
+        site = urlparse(self.instance.base_url).path.rstrip("/")  # e.g. "/2025R1Setup"
+        if site and url.startswith(site + "/"):
+            return f"{self.instance.origin}{url}"
+        return f"{self.instance.base_url.rstrip('/')}{url}"
+
     async def get_url(self, url: str) -> Any:
         """GET an absolute or instance-relative URL (e.g. an action's Location)."""
-        if url.startswith("/"):
-            url = f"{self.instance.base_url.rstrip('/')}{url}"
-        return await self._request("GET", url)
+        return await self._request("GET", self._abs(url))
 
     async def get_bytes(self, url: str) -> bytes:
         """GET raw bytes from an absolute or instance-relative URL (file download)."""
-        if url.startswith("/"):
-            url = f"{self.instance.base_url.rstrip('/')}{url}"
-        resp = await self._request_raw("GET", url)
+        resp = await self._request_raw("GET", self._abs(url))
         return resp.content
 
     async def get_all(
@@ -385,10 +397,8 @@ class AcumaticaClient:
 
         The {filename} placeholder must already be substituted in `url`.
         """
-        if url.startswith("/"):
-            url = f"{self.instance.base_url.rstrip('/')}{url}"
         return await self._request(
-            "PUT", url, content=content, headers={"Content-Type": content_type}
+            "PUT", self._abs(url), content=content, headers={"Content-Type": content_type}
         )
 
     async def record_files_put_url(

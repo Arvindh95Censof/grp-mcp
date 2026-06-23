@@ -185,8 +185,10 @@ def _wrap(value: Any) -> Any:
         # an already-wrapped scalar envelope: {"value": ...} (nothing else) -> keep
         if set(value.keys()) <= {"value"}:
             return value
-        # a nested / linked object -> recurse into its fields
-        return {k: _wrap(v) for k, v in value.items()}
+        # a nested / linked object or detail row -> recurse into its fields, but keep
+        # `id` UNWRAPPED (it's the row/record identifier, not a {"value": ...} field;
+        # wrapping it makes Acumatica reject the body / fail to match the row to update)
+        return {k: (v if k == "id" else _wrap(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [_wrap(row) if isinstance(row, dict) else row for row in value]
     return {"value": value}
