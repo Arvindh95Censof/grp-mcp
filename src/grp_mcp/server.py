@@ -769,6 +769,83 @@ async def load_from_excel(
 
 
 @mcp.tool()
+async def setup_data_provider(
+    name: str,
+    file_path: str,
+    provider_type: str = "PX.DataSync.ExcelSYProvider",
+    object_name: str = "Template",
+    key_columns: list[str] | None = None,
+    upload_file: bool = True,
+    sheet: str | None = None,
+    instance: str | None = None,
+) -> dict:
+    """Create AND fully configure a Data Provider (SM206015) from a data file — via API.
+
+    Reads the file's header columns and writes the provider's schema object + field
+    rows DIRECTLY, sidestepping the stateful `fillSchemaFields` screen action (which
+    can't run over stateless REST because it needs a UI-selected object row). Then,
+    by default, uploads the file so an import run can read it.
+
+    name:          provider name (its key).
+    file_path:     the .xlsx/.csv source (must be within the instance's read_roots).
+    provider_type: the plugin class (default = Excel provider).
+    object_name:   schema object/sheet name (default "Template" — the Excel provider's).
+    key_columns:   header columns that are keys (default: the first column).
+    upload_file:   also attach the file via files:put so prepare/import can read it.
+    sheet:         worksheet name for .xlsx (default: first sheet).
+
+    Requires "allow_write": true. Returns the provider id + the columns written.
+    """
+    import mimetypes
+
+    _require_write(instance)
+    p = _check_read_path(file_path, instance)
+    headers, _ = read_rows(file_path, sheet)
+    headers = [h for h in headers if h and str(h).strip()]
+    if not headers:
+        raise ValueError(f"no header columns found in {file_path}")
+    keys = set(key_columns or [headers[0]])
+    unknown_keys = keys - set(headers)
+    if unknown_keys:
+        raise ValueError(f"key_columns not in the file header: {sorted(unknown_keys)}")
+
+    client = _client(instance)
+    # 1) create the provider header
+    rec = await client.put_entity(
+        "DataProvider",
+        _wrap_fields({"Name": name, "ProviderType": provider_type, "Active": True}),
+    )
+    rid = rec.get("id") if isinstance(rec, dict) else None
+    # 2) write the schema object + field rows directly (no stateful action needed)
+    field_rows = [
+        {"ObjectName": object_name, "Field": h, "DataType": "String",
+         "Key": h in keys, "Active": True}
+        for h in headers
+    ]
+    await client.put_entity("DataProvider", _wrap_fields({
+        "Name": name,
+        "SchemaSourceObjects": [{"Object": object_name, "Active": True, "LineNbr": 1}],
+        "SchemaSourceFields": field_rows,
+    }))
+    out: dict[str, Any] = {
+        "provider": name,
+        "id": rid,
+        "object": object_name,
+        "columns": headers,
+        "key_columns": sorted(keys),
+        "file_uploaded": False,
+    }
+    # 3) optionally upload the source file so an import run can read it
+    if upload_file and rid:
+        url = await client.record_files_put_url("DataProvider", rid, p.name)
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        await client.put_file(url, p.read_bytes(), ctype)
+        out["file_uploaded"] = True
+        out["filename"] = p.name
+    return out
+
+
+@mcp.tool()
 async def delete_entity(entity: str, record_id: str, instance: str | None = None) -> Any:
     """Delete a record by its id (the record's key GUID or keys path).
 

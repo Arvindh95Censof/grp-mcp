@@ -41,6 +41,7 @@ base URL + OAuth credentials.
 |------|--------------|
 | `create_or_update_entity` | Create/update a record (PUT, upsert by key). |
 | `load_from_excel` | Bulk upsert an entity from `.xlsx`/`.csv` with column mapping + dry-run. |
+| `setup_data_provider` | Create + fully configure a Data Provider (SM206015) from a data file (schema written directly from its header; optional file upload). |
 | `attach_file` | Upload a file and attach it to a record (`files:put`). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
@@ -307,7 +308,7 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.2 — 35 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
+v0.2 — 37 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData, import scenarios, and the
 Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
 wizard — do those via the SM207060 UI / playwright or a customization project, not
