@@ -1,0 +1,2 @@
+PS C:\Users\CSM-Arvindh\OneDrive - Censof Holdings\Desktop\OPEX\grp-mcp> grp-mcp-ui
+grp-mcp config UI -> http://127.0.0.1:8765  (Ctrl+C to stop)
