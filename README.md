@@ -21,6 +21,7 @@ base URL + OAuth credentials.
 | `list_actions` | Actions invokable on an entity (for `invoke_action`). |
 | `list_generic_inquiries` | Generic Inquiries exposed via OData (name + url). |
 | `list_dacs` | List every DAC exposed via the DAC-based OData v4 interface. |
+| `get_dac_metadata` | Read a DAC's field definitions from the OData CSDL ($metadata) incl. mandatory flags (`Nullable=false`/key). Covers single-row config DACs `run_dac_odata` can't. |
 
 **Read**
 
@@ -196,6 +197,23 @@ Read-only, and it needs the `tenant` (company login) set in config. `run_dac_oda
 supports `$filter/$select/$expand/$top/$skip`. Note `list_dacs` can return thousands
 of DACs; it's best browsed with a known DAC name in hand.
 
+**Mandatory-field discovery — `get_dac_metadata`.** `run_dac_odata` only reads DACs
+exposed as OData *collections*; single-row config DACs (e.g. `GLSetup` = GL
+Preferences, `FinYearSetup` = Financial Year) serve no collection route and 404.
+`get_dac_metadata` reads the DAC OData CSDL (`<dac base>/$metadata`) instead, which
+describes **every** DAC's fields — name, type, key, and `Nullable` flag. A field with
+`Nullable="false"` (or a key field) is **mandatory** at the DB level. Args: `dac`
+(filter to one entity type, case-insensitive; omit for all), `mandatory_only` (return
+only required fields), `raw` (return the CSDL XML verbatim). The parser matches CSDL
+tags by local name, so it's namespace/OData-version-proof.
+
+Two gotchas it works around: this platform's OData layer **500s on JSON metadata**
+("only supported at platform implementing .NETStandard 2.0") and ignores `$format`, so
+the tool requests `Accept: application/xml`. And `Nullable=false` is the **DB-enforced**
+required set — graph-validated business-required fields (e.g. GL Preferences' Retained
+Earnings / YTD Net Income accounts) are `Nullable=true` here and won't show; cross-check
+the screen's KB form reference for those.
+
 ### Attachments and reports
 
 - `attach_file` uploads a file onto a record (`files:put`); `list_attachments`
@@ -308,8 +326,9 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.2 — 37 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
-attachments up/down, notes, reports), DAC + GI OData, import scenarios, and the
+v0.2 — 38 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
+attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
+discovery), import scenarios, and the
 Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
 wizard — do those via the SM207060 UI / playwright or a customization project, not
 REST. Roadmap: nested detail rows in `load_from_excel`.
