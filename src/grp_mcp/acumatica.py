@@ -349,6 +349,19 @@ class AcumaticaClient:
         p.update(params or {})
         return await self._request("GET", url, params=p)
 
+    async def dac_metadata(self) -> str:
+        """Fetch the DAC-based OData CSDL ($metadata) as XML text.
+
+        Returns the EDMX/CSDL document describing every exposed DAC: its
+        properties, types, key, and Nullable flag (Nullable="false" = mandatory).
+        Requested as XML on purpose — this platform's OData layer raises 500 on
+        JSON metadata ("only supported at platform implementing .NETStandard 2.0"),
+        and does NOT take $format. This is the only reliable mandatory-field source
+        for DACs (incl. single-row config DACs like GLSetup that serve no collection).
+        """
+        url = f"{self.instance.dac_odata_base}/$metadata"
+        return await self._request("GET", url, headers={"Accept": "application/xml"})
+
     # ---- report entities (contract API, async) -------------------------
 
     async def run_report(

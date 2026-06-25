@@ -1103,6 +1103,78 @@ async def run_dac_odata(
 
 
 @mcp.tool()
+async def get_dac_metadata(
+    dac: str | None = None,
+    mandatory_only: bool = False,
+    raw: bool = False,
+    instance: str | None = None,
+) -> Any:
+    """Read DAC field definitions from the OData CSDL ($metadata) — incl. mandatory flags.
+
+    The authoritative source for which fields a DAC requires. Each property carries a
+    Nullable flag: Nullable="false" (or a key field) = MANDATORY. Works for DACs that
+    run_dac_odata cannot read, including single-row config DACs (e.g. GLSetup, the GL
+    Preferences table; FinancialYear) that serve no OData collection route.
+
+    dac: entity-type name to filter to (e.g. "Organization", "Branch", "GLSetup").
+         Case-insensitive; omit to return every DAC.
+    mandatory_only: if True, return only the mandatory fields (Nullable=false or key).
+    raw: if True, return the raw CSDL XML text instead of the parsed map.
+
+    Returns (parsed) {dacName: [{name, type, nullable, key, maxLength}, ...]}.
+    Requires the instance's `tenant` to be set in config.
+    """
+    import xml.etree.ElementTree as ET
+
+    xml_text = await _client(instance).dac_metadata()
+    if raw:
+        return xml_text
+
+    root = ET.fromstring(xml_text)
+    # CSDL namespaces vary by version; match by local tag name to stay version-proof.
+    def _local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    want = dac.lower() if dac else None
+    out: dict[str, list[dict[str, Any]]] = {}
+    for et in root.iter():
+        if _local(et.tag) != "EntityType":
+            continue
+        name = et.get("Name") or ""
+        if want and name.lower() != want:
+            continue
+        keys: set[str | None] = set()
+        for k in et:
+            if _local(k.tag) != "Key":
+                continue
+            for pr in k:
+                if _local(pr.tag) == "PropertyRef":
+                    keys.add(pr.get("Name"))
+        fields: list[dict[str, Any]] = []
+        for prop in et:
+            if _local(prop.tag) != "Property":
+                continue
+            pname = prop.get("Name")
+            is_key = pname in keys
+            # OData default Nullable is true; key fields are implicitly mandatory.
+            nullable = prop.get("Nullable", "true").lower() != "false"
+            mandatory = is_key or not nullable
+            if mandatory_only and not mandatory:
+                continue
+            fields.append({
+                "name": pname,
+                "type": prop.get("Type"),
+                "nullable": nullable,
+                "key": is_key,
+                "maxLength": prop.get("MaxLength"),
+            })
+        out[name] = fields
+    if want and not out:
+        return {"error": f"DAC '{dac}' not found in metadata", "available_count": "use dac=None to list all"}
+    return out
+
+
+@mcp.tool()
 async def list_attachments(
     entity: str, record_id: str, instance: str | None = None
 ) -> Any:
