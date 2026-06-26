@@ -186,9 +186,12 @@ def _wrap(value: Any) -> Any:
         if set(value.keys()) <= {"value"}:
             return value
         # a nested / linked object or detail row -> recurse into its fields, but keep
-        # `id` UNWRAPPED (it's the row/record identifier, not a {"value": ...} field;
-        # wrapping it makes Acumatica reject the body / fail to match the row to update)
-        return {k: (v if k == "id" else _wrap(v)) for k, v in value.items()}
+        # `id` and `delete` UNWRAPPED. `id` is the row/record identifier (wrapping it
+        # makes Acumatica reject the body / fail to match the row). `delete` is the
+        # row-level delete flag on a detail line ({"NoteID": "...", "delete": true});
+        # it must stay a bare boolean, not {"value": true}, or the row isn't removed.
+        return {k: (v if k in ("id", "delete") else _wrap(v))
+                for k, v in value.items()}
     if isinstance(value, list):
         return [_wrap(row) if isinstance(row, dict) else row for row in value]
     return {"value": value}
