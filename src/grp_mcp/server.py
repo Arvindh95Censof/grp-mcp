@@ -392,15 +392,26 @@ async def list_entities(refresh: bool = False, instance: str | None = None) -> A
 
 @mcp.tool()
 async def get_entity_schema(
-    entity: str, refresh: bool = False, instance: str | None = None
+    entity: str,
+    refresh: bool = False,
+    deep: bool = False,
+    instance: str | None = None,
 ) -> Any:
     """List the fields of one entity in the configured endpoint contract.
 
     entity: e.g. "Customer", "Project", "SalesOrder". Returns field names +
     count (from swagger.json). Use before create_or_update_entity to know which
     fields exist on the screen.
+
+    deep=true returns the FULL tree: scalars + every detail collection (tab)
+    expanded to its own nested fields, recursively (cycle-guarded). Use this to
+    see every field inputtable via the API, including detail/tab fields, in one
+    call. Pass these nested arrays back to create_or_update_entity to set details.
     """
-    return await _client(instance).get_entity_schema(entity, refresh=refresh)
+    client = _client(instance)
+    if deep:
+        return await client.get_entity_schema_deep(entity, refresh=refresh)
+    return await client.get_entity_schema(entity, refresh=refresh)
 
 
 @mcp.tool()

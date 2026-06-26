@@ -245,6 +245,15 @@ class AcumaticaClient:
         """A field is detail/nested when it's an array (detail collection)."""
         return isinstance(spec, dict) and spec.get("type") == "array"
 
+    @staticmethod
+    def _detail_ref(spec: Any) -> str | None:
+        """Schema name referenced by a detail (array) field's items, if any."""
+        if isinstance(spec, dict) and spec.get("type") == "array":
+            ref = (spec.get("items") or {}).get("$ref")
+            if ref:
+                return ref.split("/")[-1]
+        return None
+
     async def detail_fields(self, entity: str, refresh: bool = False) -> set[str]:
         """Detail/nested (array) field names — omitted from list GETs by Acumatica."""
         try:
@@ -274,6 +283,62 @@ class AcumaticaClient:
             "note": "detail_fields are omitted from list GETs; retrieve them by "
                     "record_id (optionally with expand=) one record at a time.",
         }
+
+    async def get_entity_schema_deep(
+        self, entity: str, refresh: bool = False, max_depth: int = 3
+    ) -> dict:
+        """Full field tree: scalars + every detail collection expanded to ITS OWN
+        scalar/detail fields, recursively (cycle-guarded, depth-capped).
+
+        Covers what get_entity_schema only names: each detail tab's nested fields.
+        Returns {entity, field_count, scalar_fields, detail_fields: {name: {item,
+        scalar_fields, detail_fields}}}.
+        """
+        doc = await self.get_swagger(refresh=refresh)
+        schemas = (doc.get("components") or {}).get("schemas") or {}
+        if entity not in schemas:
+            close = sorted(s for s in schemas if entity.lower() in s.lower())
+            raise AcumaticaError(
+                f"Entity '{entity}' not in contract schemas. Similar: {close[:10]}"
+            )
+
+        def merged(name: str) -> dict:
+            node = schemas.get(name) or {}
+            props: dict = dict(node.get("properties") or {})
+            for part in node.get("allOf") or []:
+                if "$ref" in part:
+                    ref = part["$ref"].split("/")[-1]
+                    if ref != "Entity":
+                        props.update(merged(ref))
+                else:
+                    props.update(part.get("properties") or {})
+            return props
+
+        counter = {"n": 0}
+
+        def build(name: str, depth: int, seen: frozenset) -> dict:
+            scalar: list[str] = []
+            details: dict = {}
+            for fn, spec in merged(name).items():
+                if fn in self._META_FIELDS or fn == "_workflowActions":
+                    continue
+                counter["n"] += 1
+                if self._is_detail(spec):
+                    ref = self._detail_ref(spec)
+                    if ref and ref not in seen and depth < max_depth:
+                        details[fn] = {"item": ref,
+                                       **build(ref, depth + 1, seen | {ref})}
+                    else:
+                        details[fn] = {"item": ref, "scalar_fields": [],
+                                       "detail_fields": {},
+                                       "note": "not expanded (cycle or max_depth)"}
+                else:
+                    scalar.append(fn)
+            return {"scalar_fields": sorted(scalar), "detail_fields": details}
+
+        tree = build(entity, 0, frozenset({entity}))
+        return {"entity": entity, "deep": True,
+                "field_count": counter["n"], **tree}
 
     def _abs(self, url: str) -> str:
         """Resolve a server-returned relative URL to an absolute one.

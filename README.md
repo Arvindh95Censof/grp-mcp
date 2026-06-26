@@ -17,7 +17,7 @@ base URL + OAuth credentials.
 | `test_connection` | Verify a profile's credentials (token + contract read). |
 | `list_endpoints` | List all web service endpoints on the instance (name/version). |
 | `list_entities` | List top-level entities of the configured endpoint (via swagger.json). |
-| `get_entity_schema` | Fields of one entity, split into scalar vs detail (nested). |
+| `get_entity_schema` | Fields of one entity, split into scalar vs detail (nested). `deep=true` returns the full tree with every detail tab expanded to its nested fields. |
 | `list_actions` | Actions invokable on an entity (for `invoke_action`). |
 | `list_generic_inquiries` | Generic Inquiries exposed via OData (name + url). |
 | `list_dacs` | List every DAC exposed via the DAC-based OData v4 interface. |
