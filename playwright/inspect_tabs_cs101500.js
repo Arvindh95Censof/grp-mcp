@@ -6,7 +6,8 @@
  */
 const { chromium } = require('playwright');
 const BASE=(process.env.GRP_BASE||'').replace(/\/+$/,'')+'/', USER=process.env.GRP_USER, PASS=process.env.GRP_PASS;
-const SCREEN='CS101500';
+function arg(n,d){ const i=process.argv.indexOf('--'+n); if(i===-1) return d; const v=process.argv[i+1]; return (!v||v.startsWith('--'))?true:v; }
+const SCREEN=arg('screen','CS101500');
 const sleep=(pg,ms)=>pg.waitForTimeout(ms);
 const cmd=(frame,c)=>frame.evaluate(c=>{const x=document.querySelector(`[data-cmd="${c}"]`); if(x){['mousedown','mouseup','click'].forEach(e=>x.dispatchEvent(new MouseEvent(e,{bubbles:true})));return true;} return false;},c);
 
