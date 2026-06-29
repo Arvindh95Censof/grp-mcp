@@ -26,6 +26,81 @@ contract; writing requires driving the UI. This script does that.
 > Endpoint edits **go live immediately on Save** — no customization publish/recompile
 > needed (unlike a customization project, which is website-level).
 
+---
+
+# Alternative: Customization Project (pure grp-mcp, NO browser)
+
+The Playwright path bootstraps an endpoint by driving the wizard. Once an endpoint
+exists, the **version-controlled, browser-free** way to carry it (and to clone it to
+new instances, or hand-add more entities) is a **customization project** whose
+`project.xml` holds an `<EntityEndpoint>` block. grp-mcp deploys it end-to-end:
+
+```
+export_customization(project) -> edit project.xml -> import_customization -> publish_customization
+```
+
+All three are grp-mcp tools — no UI, no Playwright. Requires the instance profile to
+set `"allow_publish": true` (publishing is website-level — recompiles the site for ALL
+tenants). **Verified on localhost/2026R1**: the `WebServiceEndpoints` project publishes
+the `GRPSetup/24.200.001` endpoint (extends `Default/24.200.001`) carrying 9 screen
+APIs (AccountClass, Branch, Company, NumberingSequence, SegmentedKey, DataProvider,
+ImportByScenario, ImportScenarios, WebServiceEndpoints).
+
+## project.xml shape (verified, contract v4 / 5.31 schema)
+
+A customization adds an endpoint via one `<EntityEndpoint>` → `<Endpoint>` block. Each
+screen API is a `<TopLevelEntity>` with `<Fields>` (the API field names + types) and
+`<Mappings>` (each API field → its screen data-view field). Detail tabs nest as child
+`<Entity>` blocks under the top-level entity.
+
+```xml
+<Customization level="" description="GRPSetup endpoint" product-version="26.100">
+  <EntityEndpoint>
+    <Endpoint name="GRPSetup" version="24.200.001" systemContractVersion="4"
+              xmlns="http://www.acumatica.com/entity/maintenance/5.31">
+      <ExtendsEndpoint name="Default" version="24.200.001" />
+      <TopLevelEntity name="AccountClass" screen="GL202000">
+        <Fields>
+          <Field name="AccountClassID" type="StringValue" />
+          <Field name="Description"    type="StringValue" />
+          <Field name="Type"           type="StringValue" />
+        </Fields>
+        <Mappings>
+          <Mapping field="AccountClassID"><To object="AccountClassRecords" field="AccountClassID" /></Mapping>
+          <Mapping field="Description">   <To object="AccountClassRecords" field="Descr" /></Mapping>
+          <Mapping field="Type">          <To object="AccountClassRecords" field="Type" /></Mapping>
+        </Mappings>
+      </TopLevelEntity>
+      <!-- repeat <TopLevelEntity> per screen API -->
+    </Endpoint>
+  </EntityEndpoint>
+</Customization>
+```
+
+Notes:
+- `screen` = the `GLxxxxxx`/`CSxxxxxx` form ID (not the title). `object` in a mapping =
+  the screen's PXGraph data view (e.g. `AccountClassRecords`); `field` on the `<To>` is
+  the **DAC field** (`Descr`), which can differ from the public API field (`Description`).
+- `type` values: `StringValue`, `BooleanValue`, `IntValue`, `DecimalValue`, `DateTimeValue`,
+  `GuidValue`. Use a nested `<Entity>` (same shape) for detail collections.
+- `<ExtendsEndpoint>` makes it an extension of the stock `Default` endpoint (inherits all
+  its entities); omit it for a fully custom endpoint.
+
+## To add a new screen API to an existing project (headless)
+
+```
+1. export_customization("WebServiceEndpoints", out_path=".../proj.zip")   # within write_roots
+2. unzip, add a <TopLevelEntity> to project.xml (clone the block above)
+3. re-zip, then import_customization(proj.zip) and publish_customization(["WebServiceEndpoints"])
+4. verify:  list_entities(refresh=true)  /  get_entity_schema("<NewEntity>", refresh=true)
+```
+
+Field/mapping names: read them off the screen with the Playwright `inspect_*` scripts,
+or copy from an existing entity on the same screen. To discover a DAC's real field names
+without a browser, use grp-mcp `get_dac_metadata("<DAC>")`.
+
+---
+
 ## The click-path (what the script automates)
 
 1. Login, open `Main?ScreenId=SM207060`.

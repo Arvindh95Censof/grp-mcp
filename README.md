@@ -146,11 +146,19 @@ scalar fields are supported (no nested detail rows).
 
 `extend_endpoint` is a **verified no-op over REST** and is kept only for reference.
 `WebServiceEndpoints` (SM207060) is a stateful wizard form — its create/extend views
-are transient and a PUT does nothing. To actually add entities/fields/actions to an
-endpoint, use the **SM207060 UI** (drive it with the playwright scripts in
-`playwright/`) or a **customization project** (`export_customization` → edit
-`project.xml` → `import_customization` → `publish_customization`). Reading a contract
-works fine via `get_endpoint_definition`.
+are transient and a PUT does nothing. Reading a contract works fine via
+`get_endpoint_definition`. Two working ways to actually add entities/fields/actions:
+
+- **Customization project (headless, no browser).** An endpoint can live in a
+  customization project as an `<EntityEndpoint>` block in `project.xml`; grp-mcp
+  deploys it end-to-end with `export_customization` → edit `project.xml` →
+  `import_customization` → `publish_customization` (needs `"allow_publish": true`).
+  This is the version-controlled path and the way to clone an endpoint to other
+  instances. Verified round-trip + the exact `project.xml` shape (each screen API =
+  one `<TopLevelEntity>` with `<Fields>` + `<Mappings>`) are documented in
+  [`playwright/EXTENDING_ENDPOINTS.md`](playwright/EXTENDING_ENDPOINTS.md).
+- **SM207060 UI** — first-time bootstrap when no project exists yet; drive it with the
+  Playwright scripts in `playwright/` (classic `.aspx` and modern `.html` both covered).
 
 ### Security model
 
@@ -253,15 +261,14 @@ In Acumatica: **Integration → Connected Applications**. Create one with the
 ### 2. Install
 
 ```bash
-git clone https://github.com/Arvindh95Censof/grp-mcp.git
-cd grp-mcp
-python -m venv .venv && .venv\Scripts\activate   # Windows
-pip install -e .
+pip install grp-mcp
 ```
 
-Dependencies install automatically (`mcp`, `httpx`, `pydantic`, `python-dotenv`,
-`openpyxl`). Note: the `.venv` is **not relocatable** — if you move the repo,
-recreate the venv and `pip install -e .` at the new path, then update the launcher.
+To upgrade later:
+
+```bash
+pip install --upgrade grp-mcp
+```
 
 ### 3. Configure (pick one)
 
@@ -333,35 +340,3 @@ Customization Web API. By-design gap: endpoint **writes** (SM207060) are a state
 wizard — do those via the SM207060 UI / playwright or a customization project, not
 REST. Roadmap: nested detail rows in `load_from_excel`.
 
-## AFS Financial Report entities (instance-specific)
-
-These custom entities are exposed on the **`Default2025` / `25.200.001`** endpoint
-of the AFS Financial Report customization (`AFSCPFinancialReportv213032026`). They
-are not part of grp-mcp itself — they were added in SM207060 and are reachable
-through the generic tools. Documented here as a usage reference.
-
-| Entity | Key field | Detail collection (use as `expand`) |
-|--------|-----------|-------------------------------------|
-| `FLRTReportDefinition` | `DefinitionCode` | `LineItems` → report line items |
-| `FLRTGIDataSource` | `DataSourceCode` | `GIDataSource` → GI column defs |
-| `FLRTFinancialReport` | `ReportCD` | `DefinitionLinks` → linked definitions |
-| `FLRTPresentationGeneration` | `PresentationCD` | `PresentationDataSourceLink` → linked data sources |
-| `FLRTTenantCredentials` | `CompanyNumber` | — |
-
-Notes:
-- Detail/expand names are **as configured in the endpoint**, which differ from the
-  DAC view names (e.g. `GIDataSource` and `PresentationDataSourceLink` were renamed
-  from `Columns` / `DataSourceLinks`). Pull the live names from
-  `GET {entity_base}/swagger.json` if unsure.
-- Endpoint field names are display-based (`DefinitionCode` not `DefinitionCD`,
-  `VisibleinReport` not `IsVisible`). String-list fields take the **label**
-  (`ReportType` = `"Balance Sheet"`, `"Custom"`).
-- Example: `get_entity("FLRTReportDefinition", filter="DefinitionCode eq 'BALANCE_SHEET'", expand="LineItems")`.
-- Process actions exist on some entities (e.g. `GenerateReport`, `DetectColumns`)
-  — call via `invoke_action`.
-- Security: `FLRTTenantCredentials` may expose secret fields (`ClientSecret`,
-  `Password`) over REST — drop those from the endpoint if not needed.
-- Web Service Endpoints are editable in the SM207060 UI and, on newer builds, via
-  the `WebServiceEndpoints` entity (see `extend_endpoint` / `get_endpoint_definition`).
-  The entity is a projection of the wizard-driven form, so complex contracts are
-  still more reliably built in the UI.
