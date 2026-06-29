@@ -35,6 +35,7 @@ base URL + OAuth credentials.
 | `list_attachments` | List files attached to a record (name + download href). |
 | `download_file` | Download a record's attached file to disk. |
 | `get_endpoint_definition` | Read an endpoint's contract (entity tree/props) from SM207060. |
+| `setup_readiness` | Report instance setup state: enabled features (FeaturesSet) + per-module config gaps (ledger, CoA, customer/vendor class, …) vs the implementation checklist. |
 
 **Write**
 
@@ -333,9 +334,10 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.2 — 38 tools (incl. runtime profile management). Covers the contract REST API (CRUD, actions, `$skip` paging,
+v0.3 — 39 tools (incl. runtime profile management + `setup_readiness`). Covers the
+contract REST API (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
-discovery), import scenarios, and the
+discovery), import scenarios, setup-readiness introspection, and the
 Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
 wizard — do those via the SM207060 UI / playwright or a customization project, not
 REST. Roadmap: nested detail rows in `load_from_excel`.

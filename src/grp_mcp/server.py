@@ -1188,6 +1188,117 @@ async def get_dac_metadata(
     return out
 
 
+# Headline module switches surfaced by setup_readiness (subset of FeaturesSet columns).
+_MODULE_FLAGS = [
+    "FinancialModule", "FinancialStandard", "FinancialAdvanced", "MultiCompany",
+    "SubAccount", "Multicurrency", "MultipleBaseCurrencies", "ProjectModule",
+    "ProjectAccounting", "DistributionModule", "Inventory", "Manufacturing",
+    "CustomerModule", "ServiceManagementModule", "PayrollModule", "PlatformModule",
+]
+
+# Per-module setup checklist keyed to the Acumatica implementation guide. Each step
+# is (label, DAC collection, key field) — existence is probed via DAC OData. The DAC
+# names are best-effort; a name not exposed as a collection yields "exists": null.
+_SETUP_CHECKLIST = [
+    ("Company structure", "OrganizationModule", [
+        ("Branch defined (CS102000)", "Branch", "BranchCD"),
+    ]),
+    ("General Ledger", "FinancialModule", [
+        ("Actual ledger created (GL201500)", "Ledger", "LedgerCD"),
+        ("Chart of Accounts (GL202500)", "Account", "AccountCD"),
+    ]),
+    ("Accounts Receivable", "FinancialStandard", [
+        ("Customer class (AR201000)", "CustomerClass", "CustomerClassID"),
+    ]),
+    ("Accounts Payable", "FinancialStandard", [
+        ("Vendor class (AP201000)", "VendorClass", "VendorClassID"),
+    ]),
+    ("Cash Management", "FinancialStandard", [
+        ("Payment methods (CA204000)", "PaymentMethod", "PaymentMethodID"),
+        ("Cash accounts (CA202000)", "CashAccount", "CashAccountCD"),
+    ]),
+    ("Inventory", "Inventory", [
+        ("Item classes (IN201000)", "INItemClass", "ItemClassCD"),
+    ]),
+    ("Project Accounting", "ProjectModule", [
+        ("Project created (PM301000)", "PMProject", "ContractCD"),
+    ]),
+]
+
+
+async def _probe_exists(client, dac: str, key: str):
+    """Best-effort existence check: does the DAC collection have >= 1 row?
+
+    Returns True/False, or None when the DAC isn't readable as a collection
+    (single-row config DACs and unknown names degrade to "unknown" rather than error).
+    """
+    try:
+        res = await client.run_dac(dac, {"$top": 1, "$select": key})
+        vals = res.get("value") if isinstance(res, dict) else None
+        if vals is None:
+            return None
+        return len(vals) > 0
+    except Exception:
+        return None
+
+
+@mcp.tool()
+async def setup_readiness(instance: str | None = None) -> Any:
+    """Report an instance's setup state: enabled features + per-module config gaps.
+
+    Reads the FeaturesSet config DAC (which modules/features are switched on) and runs
+    best-effort existence probes for the prerequisite records each financial module
+    needs (ledger, chart of accounts, customer/vendor classes, ...), then cross-checks
+    the Acumatica implementation checklist to flag what's still missing.
+
+    Read-only. The engine for guided/no-knowledge setup: call it to learn "where is this
+    instance now, and what's the next step." Probes degrade to `exists: null` (unknown)
+    for any DAC not exposed as a collection. Requires the instance's `tenant` to be set.
+
+    NOT checked here (no REST surface — see EXTENDING_ENDPOINTS.md): the wizard actions
+    (enable features CS100000, activate license SM201510, financial calendar GL101000)
+    and preference VALUES (GLSetup/ARSetup/APSetup serve no readable collection route).
+    """
+    client = _client(instance)
+    feats_raw = await client.run_dac("FeaturesSet", {"$top": 1})
+    rows = feats_raw.get("value") if isinstance(feats_raw, dict) else None
+    feats = rows[0] if rows else {}
+
+    modules = {f: bool(feats.get(f)) for f in _MODULE_FLAGS if f in feats}
+    enabled_features = sorted(k for k, v in feats.items() if v is True)
+
+    checklist: list[dict[str, Any]] = []
+    for module, flag, steps in _SETUP_CHECKLIST:
+        feature_on = bool(feats.get(flag))
+        step_out = []
+        for label, dac, key in steps:
+            exists = await _probe_exists(client, dac, key) if feature_on else None
+            step_out.append({"step": label, "exists": exists})
+        complete = feature_on and all(s["exists"] is True for s in step_out)
+        checklist.append({
+            "module": module,
+            "feature_flag": flag,
+            "feature_enabled": feature_on,
+            "complete": complete,
+            "steps": step_out,
+        })
+
+    gaps = [
+        f"{c['module']}: {s['step']}"
+        for c in checklist if c["feature_enabled"]
+        for s in c["steps"] if s["exists"] is False
+    ]
+    return {
+        "instance": instance or _cfg().default,
+        "modules": modules,
+        "enabled_features": enabled_features,
+        "checklist": checklist,
+        "gaps": gaps,
+        "note": "Probes are best-effort (exists: null = unknown DAC/route). Wizard steps "
+                "(features/license/calendar) and preference values are not checked.",
+    }
+
+
 @mcp.tool()
 async def list_attachments(
     entity: str, record_id: str, instance: str | None = None
