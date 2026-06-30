@@ -1022,7 +1022,7 @@ async def whoami(instance: str | None = None) -> Any:
 
 @mcp.tool()
 async def enable_features(
-    features: list[str], instance: str | None = None
+    features: list[str], activate: bool = False, instance: str | None = None
 ) -> Any:
     """Set feature flags on the Enable/Disable Features screen (CS100000).
 
@@ -1030,16 +1030,67 @@ async def enable_features(
     (e.g. "Subaccounts", "Inventory", "InventorySubitems"). Sets each ON and
     Saves. Returns the screen_submit result.
 
-    NOTE: Save STAGES the change (FeaturesSet gets a working row); the live
-    feature INSTALL (recompile) is a website-level "Modify" action NOT exposed to
-    the API — so this flips the flag but a full install may still need the UI.
+    Save STAGES the change (FeaturesSet gets a working row; ActivationStatus =
+    "Pending Activation"). To ACTIVATE/INSTALL the staged set, call
+    activate_features (the "Enable" button = the RequestValidation action), which
+    recompiles the site. Set activate=True here to do both in one call.
+
     Read current states with run_dac_odata('FeaturesSet'). Requires allow_write.
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     cmds = [{"set": f, "to": "True"} for f in features] + [{"action": "Save"}]
     async with ScreenClient(inst, "CS100000") as s:
-        return await s.submit(cmds)
+        staged = await s.submit(cmds)
+    if not activate:
+        return staged
+    activated = await activate_features(instance)
+    return {"staged": staged, "activated": activated}
+
+
+@mcp.tool()
+async def activate_features(instance: str | None = None) -> Any:
+    """Activate/install the staged feature set on CS100000 (the "Enable" button).
+
+    This is the apply step that enable_features (Save) does NOT do on its own: it
+    invokes the screen's RequestValidation action — the SOAP equivalent of the
+    "Enable" toolbar button — which validates the license, activates the selected
+    features, and RECOMPILES the site. ActivationStatus goes "Pending Activation"
+    -> "Validated".
+
+    IMPORTANT: the recompile briefly restarts the site (~1-3 min; in-flight requests
+    may 500 during it), so this tool fires the action best-effort and does NOT block
+    on completion. AFTER calling it, verify with
+    screen_get('CS100000', ['GeneralSettings.ActivationStatus']) — "Validated" means
+    the install finished. It activates whatever is currently staged, so make sure the
+    intended flags are set (enable_features) first. Requires allow_write.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    requested, note = True, "Activation requested; recompile in progress (~1-3 min)."
+    try:
+        # generous timeout, but the recompile may still kill the in-flight request —
+        # that's expected; treat a timeout/5xx as "submitted, verify separately".
+        async with ScreenClient(inst, "CS100000", timeout=240.0) as s:
+            r = await s.submit([{"action": "RequestValidation"}], auto_answer="Yes")
+            note = "Activation submitted."
+    except Exception as e:  # noqa: BLE001 — recompile commonly drops the connection
+        r = {"ok": None, "transport": str(e)[:160]}
+    # best-effort single status read (may itself fail while the site restarts)
+    status = None
+    try:
+        async with ScreenClient(inst, "CS100000", timeout=30.0) as s:
+            rows = (await s.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
+            status = rows[0].get("Status") if rows else None
+    except Exception:  # noqa: BLE001
+        status = "unknown (site recompiling)"
+    return {
+        "requested": requested,
+        "activation_status": status,
+        "result": r,
+        "note": note,
+        "verify": "screen_get('CS100000', ['GeneralSettings.ActivationStatus']) should read 'Validated'.",
+    }
 
 
 @mcp.tool()

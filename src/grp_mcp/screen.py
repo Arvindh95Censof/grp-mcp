@@ -55,10 +55,10 @@ class ScreenClient:
     {base_url}/Soap/{screen_id}.asmx and Login/Logout are session-wide.
     """
 
-    def __init__(self, instance: Instance, screen_id: str) -> None:
+    def __init__(self, instance: Instance, screen_id: str, timeout: float = 120.0) -> None:
         self.instance = instance
         self.screen_id = screen_id.upper()
-        self._http = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+        self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._logged_in = False
         self._tree: ET.Element | None = None
 
