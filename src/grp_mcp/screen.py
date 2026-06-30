@@ -38,6 +38,11 @@ _ENV_OPEN = (
 )
 _ENV_CLOSE = "</soap:Body></soap:Envelope>"
 
+# A persisted Submit returns a tiny empty <SubmitResult/> (~335 bytes); a body
+# larger than this is the screen echoing its full content = the commands did not
+# bind (no-bind). Used to flag suspected silent no-persist on an HTTP-200 result.
+_NOBIND_LEN = 1500
+
 
 class ScreenError(RuntimeError):
     pass
@@ -379,7 +384,7 @@ class ScreenClient:
                             f"<tns:Submit><tns:commands>{ai}</tns:commands></tns:Submit>",
                         )
                         errs = self._parse_field_errors(ax)
-                        return {
+                        ar = {
                             "screen_id": self.screen_id,
                             "ok": not errs,
                             "answered": auto_answer,
@@ -387,6 +392,16 @@ class ScreenClient:
                             "field_errors": errs,
                             "raw_len": len(ax),
                         }
+                        # answering a dialog and getting a big content echo is the
+                        # classic false-positive (looks ok, persists nothing).
+                        if not errs and len(ax) > _NOBIND_LEN:
+                            ar["nobind_suspected"] = True
+                            ar["warning"] = (
+                                "Dialog answered but Submit returned a full-content "
+                                "echo, not the small empty result of a persisted "
+                                "write — likely nothing bound. Read the record back."
+                            )
+                        return ar
                     except ScreenError as e2:
                         e = e2  # fall through to diagnostics with the post-answer fault
             # A fatal action (Save/Delete/AutoFill) faulted — the SOAP fault only
@@ -413,7 +428,7 @@ class ScreenClient:
                 "messages": [f["message"] for f in field_errors],
             }
         errors = self._parse_field_errors(xml)
-        return {
+        result = {
             "screen_id": self.screen_id,
             "ok": not errors,
             "dry_run": dry_run,
@@ -421,6 +436,21 @@ class ScreenClient:
             "field_errors": errors,
             "raw_len": len(xml),
         }
+        # No-bind guard: a persisted Submit returns a tiny empty <SubmitResult/>
+        # (~335 bytes). A multi-KB body is the screen re-rendering its full
+        # content because the commands did NOT bind (e.g. a row that silently
+        # failed to commit, or navigation that didn't take) — the API still
+        # reports HTTP 200 / no field error, so without this the caller would
+        # read it as success. Flag it; the caller should read back to confirm.
+        if not errors and not dry_run and len(xml) > _NOBIND_LEN:
+            result["nobind_suspected"] = True
+            result["warning"] = (
+                "Submit returned a full-content echo (not the small empty result a "
+                "persisted write returns) — the commands may not have bound. Verify "
+                "by reading the record back; check that navigation selected the "
+                "intended record."
+            )
+        return result
 
     async def insert_rows(
         self,

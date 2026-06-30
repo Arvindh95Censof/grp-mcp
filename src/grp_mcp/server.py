@@ -1123,6 +1123,54 @@ async def chart_of_accounts(
 
 
 @mcp.tool()
+async def set_segment_value(
+    segmented_key_id: str,
+    value: str,
+    description: str | None = None,
+    segment_id: str = "1",
+    active: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Add a value to a segment on Segment Values (CS203000) — the one that works.
+
+    CS203000 IS writable via the screen-based SOAP engine. The trick is NAVIGATION:
+    select the segment with a descriptor `set` on the header key (which replays the
+    LinkedCommand chain), NOT a flat key command — a flat key leaves the screen on
+    its default segment and the value lands in the WRONG segment. This recipe does
+    it correctly: set SegmentedKeyID (+ SegmentID) -> NewRow -> set Value/Description
+    /Active -> Save.
+
+    segmented_key_id: the dimension, e.g. "ACCOUNT", "MLISTCD", "SALESPER" (the keys
+                      listed on CS203000; find them with run_dac_odata('Segment')).
+    value:            the segment value — must fit the segment's defined Length/mask
+                      (run_dac_odata('Segment', filter="DimensionID eq '<id>'") shows
+                      Length/EditMask). Too long/ill-formatted -> "failed to commit".
+    segment_id:       segment number within the key (default "1"; multi-segment keys
+                      like a subaccount have 2, 3, …).
+    description/active: the row's label and Active flag.
+
+    Verify with run_dac_odata('SegmentValue', filter="DimensionID eq '<id>'"). A
+    persisted write returns a small response; a large `raw_len` + `nobind_suspected`
+    means it didn't bind (check the value fits the segment). Requires allow_write.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    cmds: list[dict] = [
+        {"set": "SegmentSummary.SegmentedKeyID", "to": segmented_key_id},
+    ]
+    if segment_id:
+        cmds.append({"set": "SegmentSummary.SegmentID", "to": str(segment_id)})
+    cmds.append({"new_row": "PossibleValues"})
+    cmds.append({"set": "PossibleValues.Value", "to": value})
+    if description is not None:
+        cmds.append({"set": "PossibleValues.Description", "to": description})
+    cmds.append({"set": "PossibleValues.Active", "to": "True" if active else "False"})
+    cmds.append({"action": "Save"})
+    async with ScreenClient(inst, "CS203000") as s:
+        return await s.submit(cmds)
+
+
+@mcp.tool()
 async def screen_preflight(
     dac: str,
     provided: list[str],

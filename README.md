@@ -75,6 +75,7 @@ almost anything:
 | `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
+| `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
@@ -304,6 +305,16 @@ SOAP operations themselves work).
   - `screen_submit(..., auto_answer="Yes")` — retry once with a confirmation dialog
     answered when a Save/Release raises an "Are you sure?" pop-up (only containers
     that actually expose a dialog get one).
+  - **No-bind guard** — a persisted Submit returns a tiny (~335-byte) empty result;
+    if it instead returns a multi-KB full-content echo (commands didn't bind — e.g.
+    navigation didn't select the intended record), the result carries
+    `nobind_suspected: true` + a `warning`. `ok` alone is not proof of a write —
+    read the record back to confirm.
+  - **Navigating to a record**: select it with a descriptor `{"set": "<key>", "to":
+    v}` (replays the field's LinkedCommand chain, actually loading the record) — NOT
+    a flat `{"key": ...}`, which often leaves the screen on its default record so
+    writes land in the wrong place. `set_segment_value` (CS203000) is the worked
+    example: `set SegmentedKeyID → NewRow → set Value → Save`.
   - `screen_preflight(dac, provided)` — the screen-based SOAP plane returns **no
     field-state** (no combo option-lists, no required flags — `Submit` echoes an
     empty result), so required-field checking comes from the OData CSDL instead:
