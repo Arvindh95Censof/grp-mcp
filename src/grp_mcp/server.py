@@ -1019,29 +1019,33 @@ async def enable_features(
 
 @mcp.tool()
 async def create_financial_calendar(
-    first_year: str, instance: str | None = None
+    first_year: str, starts_on: str | None = None, instance: str | None = None
 ) -> Any:
-    """Create the financial calendar (GL101000): set the first year, AutoFill, Save.
+    """Create the financial calendar (GL101000): first year, AutoFill, start, Save.
 
     first_year: e.g. "2026". Generates the period rows (monthly by default) and
     saves — the prerequisite for the GL ledger.
+    starts_on: optional year start date, M/D/YYYY (e.g. "1/1/2026"). Omit to use
+    the screen's default start (≈ business date).
 
-    LIMITATION: the start date (FinancialYearStartsOn) can't be set via the API
-    (insert validation rejects it) — the calendar uses the screen's DEFAULT start
-    (≈ business date). For a specific 1-Jan start, just TYPE the date into the
-    GL101000 "Financial Year Starts On" field in the UI (MONTH/DAY/YEAR; no picker
-    needed), then Create Periods + Save. Requires allow_write. Verify with
+    The start date IS settable via the screen-based SOAP API, but ORDER MATTERS:
+    set FirstFinancialYear -> AutoFill -> set FinancialYearStartsOn (AFTER AutoFill)
+    -> Save, and answer the confirmation dialog (auto_answer). Setting the start
+    BEFORE AutoFill faults; AutoFill regenerates from the start so it must run
+    first. Requires allow_write. Verify with
     screen_get('GL101000', ['Periods.PeriodNbr','Periods.StartDate']).
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
-    cmds = [
+    cmds: list[dict] = [
         {"set": "FirstFinancialYear", "to": str(first_year)},
         {"action": "AutoFill"},
-        {"action": "Save"},
     ]
+    if starts_on:
+        cmds.append({"set": "FinancialYearStartsOn", "to": str(starts_on)})
+    cmds.append({"action": "Save"})
     async with ScreenClient(inst, "GL101000") as s:
-        return await s.submit(cmds)
+        return await s.submit(cmds, auto_answer="Yes")
 
 
 @mcp.tool()

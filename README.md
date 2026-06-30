@@ -72,7 +72,7 @@ almost anything:
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
 | `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (recipe over screen_submit). |
-| `create_financial_calendar` | Create the financial calendar (GL101000): set first year → AutoFill → Save. |
+| `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
 | `set_note` | Set/clear a record's Note text. |
