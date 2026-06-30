@@ -72,12 +72,13 @@ almost anything:
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
 | `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (stages them). Pass `activate=True` to also install them. |
-| `activate_features` | Activate/install the staged feature set (CS100000 RequestValidation = the "Enable" button) — recompiles the site; fire-and-verify (ActivationStatus → Validated). |
+| `activate_features` | Activate/install the staged feature set (CS100000 RequestValidation = the "Enable" button) — recompiles the site, then polls ActivationStatus until "Validated" (returns activated=true/false). |
 | `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
 | `create_segmented_key` | Create a segmented key + its segments on Segment Keys (CS202000) — the prerequisite for `set_segment_value`. |
 | `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. Requires the key to exist on CS202000 first. |
+| `delete_segmented_key` | Tear down a segmented key in the correct children-first order (values → segment → master); recovers orphaned keys by recreating the master. Single-segment keys only (multi-segment reported for UI). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |

@@ -7,6 +7,7 @@ default instance is used.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -1044,12 +1045,12 @@ async def enable_features(
         staged = await s.submit(cmds)
     if not activate:
         return staged
-    activated = await activate_features(instance)
+    activated = await activate_features(instance=instance)
     return {"staged": staged, "activated": activated}
 
 
 @mcp.tool()
-async def activate_features(instance: str | None = None) -> Any:
+async def activate_features(timeout_s: float = 180.0, instance: str | None = None) -> Any:
     """Activate/install the staged feature set on CS100000 (the "Enable" button).
 
     This is the apply step that enable_features (Save) does NOT do on its own: it
@@ -1058,38 +1059,52 @@ async def activate_features(instance: str | None = None) -> Any:
     features, and RECOMPILES the site. ActivationStatus goes "Pending Activation"
     -> "Validated".
 
-    IMPORTANT: the recompile briefly restarts the site (~1-3 min; in-flight requests
-    may 500 during it), so this tool fires the action best-effort and does NOT block
-    on completion. AFTER calling it, verify with
-    screen_get('CS100000', ['GeneralSettings.ActivationStatus']) — "Validated" means
-    the install finished. It activates whatever is currently staged, so make sure the
-    intended flags are set (enable_features) first. Requires allow_write.
+    The recompile briefly restarts the site (~1-3 min; in-flight requests 500
+    during it). This tool fires RequestValidation, then POLLS ActivationStatus
+    until it reads "Validated" (tolerating the restart errors) or `timeout_s`
+    elapses — so it returns a definitive activated=true/false, not just "submitted".
+    It activates whatever is currently staged, so set the intended flags
+    (enable_features) first. Requires allow_write.
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
-    requested, note = True, "Activation requested; recompile in progress (~1-3 min)."
+    poll_interval, deadline = 10.0, max(30.0, float(timeout_s))
+    fire = {"ok": None}
     try:
-        # generous timeout, but the recompile may still kill the in-flight request —
-        # that's expected; treat a timeout/5xx as "submitted, verify separately".
-        async with ScreenClient(inst, "CS100000", timeout=240.0) as s:
-            r = await s.submit([{"action": "RequestValidation"}], auto_answer="Yes")
-            note = "Activation submitted."
+        # the recompile may kill this in-flight request — expected; the poll below
+        # is the source of truth, not this call's return.
+        async with ScreenClient(inst, "CS100000", timeout=poll_interval + 5) as s:
+            fire = await s.submit([{"action": "RequestValidation"}], auto_answer="Yes")
     except Exception as e:  # noqa: BLE001 — recompile commonly drops the connection
-        r = {"ok": None, "transport": str(e)[:160]}
-    # best-effort single status read (may itself fail while the site restarts)
-    status = None
-    try:
-        async with ScreenClient(inst, "CS100000", timeout=30.0) as s:
-            rows = (await s.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
+        fire = {"ok": None, "transport": str(e)[:160]}
+
+    status, elapsed = None, 0.0
+    while elapsed < deadline:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            async with ScreenClient(inst, "CS100000", timeout=poll_interval) as s:
+                rows = (await s.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
             status = rows[0].get("Status") if rows else None
-    except Exception:  # noqa: BLE001
-        status = "unknown (site recompiling)"
+            if status == "Validated":
+                return {
+                    "activated": True,
+                    "activation_status": status,
+                    "waited_s": round(elapsed, 1),
+                    "fire_result": fire,
+                }
+        except Exception:  # noqa: BLE001 — site still recompiling; keep polling
+            status = "unknown (site recompiling)"
     return {
-        "requested": requested,
+        "activated": status == "Validated",
         "activation_status": status,
-        "result": r,
-        "note": note,
-        "verify": "screen_get('CS100000', ['GeneralSettings.ActivationStatus']) should read 'Validated'.",
+        "waited_s": round(elapsed, 1),
+        "fire_result": fire,
+        "note": (
+            "Did not observe 'Validated' within timeout_s — the recompile may still "
+            "be finishing. Re-check screen_get('CS100000', ['GeneralSettings."
+            "ActivationStatus']); raise timeout_s for big feature sets."
+        ),
     }
 
 
@@ -1330,6 +1345,95 @@ async def set_segment_value(
     cmds.append({"action": "Save"})
     async with ScreenClient(inst, "CS203000") as s:
         return await s.submit(cmds)
+
+
+@mcp.tool()
+async def delete_segmented_key(key_id: str, instance: str | None = None) -> Any:
+    """Delete a segmented key with the correct children-first teardown.
+
+    Deleting the CS202000 master row alone ORPHANS its Segment/SegmentValue
+    children (they then can't be navigated/removed). This does it in the order the
+    framework requires:
+      1. (orphan recovery) if the key has children but no `Dimension` master,
+         recreate the master so the screens can navigate it again;
+      2. delete every segment VALUE on CS203000;
+      3. delete the SEGMENTS on CS202000;
+      4. delete the master row.
+
+    Verifies via the Dimension/Segment/SegmentValue DACs and returns the final
+    state. Requires allow_write.
+
+    LIMIT: the typed screen API can't reliably select a non-first segment row, so a
+    key with MULTIPLE segments can't be fully torn down here (the last-segment-first
+    rule can't be satisfied) — single-segment keys and orphan cleanup work; multi-
+    segment keys are reported as partially handled (delete the extra segments in the
+    CS202000 UI).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    client = _client(instance)
+
+    async def _rows(dac: str) -> list[dict]:
+        r = await client.run_dac(dac, {"$filter": f"DimensionID eq '{key_id}'"})
+        return r.get("value", []) if isinstance(r, dict) else []
+
+    steps: list[str] = []
+    dims = await _rows("Dimension")
+    segs = await _rows("Segment")
+    vals = await _rows("SegmentValue")
+    if not dims and not segs and not vals:
+        return {"key_id": key_id, "ok": True, "note": "nothing to delete (key absent)"}
+
+    # 1. orphan recovery — recreate the master so CS203000/CS202000 can navigate it
+    if not dims and (segs or vals):
+        async with ScreenClient(inst, "CS202000") as s:
+            await s.submit([{"set": "SegmentedKeyDefinition.SegmentedKeyID", "to": key_id},
+                            {"set": "SegmentedKeyDefinition.Description", "to": "(cleanup)"},
+                            {"action": "Save"}], auto_answer="Yes")
+        steps.append("recreated orphan master")
+
+    # 2. delete all segment values (CS203000)
+    if vals:
+        async with ScreenClient(inst, "CS203000") as s:
+            for v in vals:
+                await s.submit([{"set": "SegmentSummary.SegmentedKeyID", "to": key_id},
+                                {"key": "PossibleValues.Value", "to": v.get("Value")},
+                                {"delete_row": "PossibleValues"}, {"action": "Save"}],
+                               auto_answer="Yes")
+        steps.append(f"deleted {len(vals)} value(s)")
+
+    # 3 + 4. delete the segment + master (CS202000) — ONLY for single-segment keys.
+    # A multi-segment key can't have its non-first segments removed via SOAP, and the
+    # last-segment-first rule blocks deleting the master too; deleting the master
+    # alone would re-orphan the children, so for multi-segment we STOP here (leaving
+    # the key intact + navigable) and report it for UI teardown.
+    res = None
+    if len(segs) <= 1:
+        async with ScreenClient(inst, "CS202000") as s:
+            res = await s.submit(
+                [{"set": "SegmentedKeyDefinition.SegmentedKeyID", "to": key_id},
+                 {"delete_row": "SegmentDefinition"},
+                 {"delete_row": "SegmentedKeyDefinition"}, {"action": "Save"}],
+                auto_answer="Yes")
+        steps.append("deleted segment + master")
+    else:
+        steps.append(f"left intact: {len(segs)} segments (multi-segment teardown not "
+                     "supported via SOAP)")
+
+    after = {"Dimension": len(await _rows("Dimension")),
+             "Segment": len(await _rows("Segment")),
+             "SegmentValue": len(await _rows("SegmentValue"))}
+    fully = after == {"Dimension": 0, "Segment": 0, "SegmentValue": 0}
+    return {
+        "key_id": key_id,
+        "ok": fully,
+        "steps": steps,
+        "remaining": after,
+        "last_result": res,
+        **({"warning": f"multi-segment key ({len(segs)} segments): cannot be deleted "
+            "via SOAP (can't select a non-first segment row). Left intact and "
+            "navigable — delete it in the CS202000 UI."} if len(segs) > 1 else {}),
+    }
 
 
 @mcp.tool()

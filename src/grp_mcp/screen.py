@@ -88,6 +88,20 @@ class ScreenClient:
         if "<soap:Fault>" in text or "<faultstring>" in text:
             m = re.search(r"<faultstring>(.*?)</faultstring>", text, re.S)
             msg = re.sub(r"\s+", " ", m.group(1)).strip() if m else text[:400]
+            # A PXSetupNotEnteredException means the screen's MODULE isn't configured
+            # yet — GetSchema/Submit 500 until the named *Preferences/Setup* form is
+            # filled in. Surface that as actionable guidance (a prerequisite to set up
+            # first), not an opaque 500. The exception names the setup graph
+            # (e.g. ...[PX.Objects.AR.ARSetup]) and the form ("...Preferences form").
+            if "PXSetupNotEnteredException" in msg:
+                setup = re.search(r"\[([\w.]+)\]", msg)
+                detail = re.search(r"Error:\s*(.*?)(?: at |---|$)", msg)
+                raise ScreenError(
+                    f"{op} on {self.screen_id}: PREREQUISITE NOT MET — "
+                    f"{(detail.group(1).strip() if detail else msg)} "
+                    f"(setup graph: {setup.group(1) if setup else '?'}). "
+                    f"Configure that Preferences/Setup form first, then retry."
+                )
             # surface the real PX inner exception, not the SOAP wrapper boilerplate
             inner = re.search(r"PX\.\w[\w.]*Exception: ([^\n]+?)(?: at |---)", msg)
             raise ScreenError(
@@ -298,6 +312,11 @@ class ScreenClient:
             return self._wrap(self._find_field(c["set"]), "Value", c.get("to"))
         if "action" in c:
             return self._wrap(self._find_field(c["action"]), "Action", None)
+        if "row" in c:
+            # select the Nth (1-based) row of a grid container so a following
+            # set/delete_row targets THAT row — without it, delete_row/sets hit the
+            # current (usually first) row. Uses the RowNumber service command.
+            return self._wrap(self._service(c["row"], "RowNumber"), "RowNumber", c.get("to"))
         if "new_row" in c:
             return self._wrap(self._service(c["new_row"], "NewRow"), "NewRow", None)
         if "delete_row" in c:
