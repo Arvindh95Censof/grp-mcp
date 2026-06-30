@@ -20,7 +20,27 @@ from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
 from .screen import ScreenClient, ScreenError
 
-mcp = FastMCP("grp-mcp")
+_KB_FIRST_POLICY = (
+    "KB-FIRST CRUD POLICY (mandatory). Before ANY create/update/delete on an "
+    "Acumatica screen or entity with this server — i.e. before calling "
+    "create_or_update_entity, delete_entity, load_from_excel, invoke_action, "
+    "attach_file, set_note, screen_submit, screen_insert_rows, screen_record, "
+    "set_segment_value, create_segmented_key, create_ledger, chart_of_accounts, "
+    "create_financial_calendar, enable_features, run_import_scenario, or any other "
+    "write — FIRST consult the Acumatica knowledge base (the kb-mcp server: "
+    "search_kb, then read_kb_file) for that screen/entity and the specific action. "
+    "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
+    "and ordering constraints; verify each prerequisite exists in the instance "
+    "(run_dac_odata / screen_get / get_entity / setup_readiness) and set up any "
+    "missing one first (recursively). Do not drive a screen cold. Reads "
+    "(get_entity, screen_get, run_*, list_*, count_entity) are exempt. This exists "
+    "because Acumatica screens have hard dependencies the screen won't surface "
+    "until a write fails with a generic/misleading error (e.g. CS203000 Segment "
+    "Values requires the key to exist on CS202000 with a Validate=ON segment, and "
+    "a segmented key must be torn down children-first or it orphans)."
+)
+
+mcp = FastMCP("grp-mcp", instructions=_KB_FIRST_POLICY)
 
 _config: Config | None = None
 _clients: dict[str, AcumaticaClient] = {}
@@ -768,6 +788,11 @@ async def screen_submit(
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the screen-based SOAP API — writes screens REST can't.
+
+    PRECONDITION (KB-first policy): before this write, consult kb-mcp (search_kb /
+    read_kb_file) for this screen's prerequisites, dependent screens, and validation
+    rules, and verify each prerequisite exists — Acumatica screens have hard
+    dependencies they won't surface until a write fails. See the server instructions.
 
     dry_run=True previews: it drops the committing commands (button actions like
     Save + row deletes) so the field SETs run but nothing persists, and still

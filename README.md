@@ -256,6 +256,22 @@ required set — graph-validated business-required fields (e.g. GL Preferences' 
 Earnings / YTD Net Income accounts) are `Nullable=true` here and won't show; cross-check
 the screen's KB form reference for those.
 
+### KB-first CRUD policy
+
+Before **any** create/update/delete (on a screen or an entity), consult the Acumatica
+knowledge base (the **kb-mcp** server: `search_kb`, then `read_kb_file`) for that
+screen/entity and the specific action — read its prerequisites, dependent screens,
+required fields, validation rules, and ordering constraints, then verify each
+prerequisite exists in the instance before writing. Pure reads are exempt.
+
+This is stated in the server's MCP `instructions` (so any client is told to do it) and
+echoed as a `PRECONDITION` on the write tools. It exists because Acumatica screens have
+hard dependencies the screen won't surface until a write fails with a generic, misleading
+error — e.g. *Segment Values* (CS203000) requires the key to exist on *Segment Keys*
+(CS202000) with a `Validate=ON` segment, and a segmented key must be torn down
+children-first (values → segments last-first → master) or it orphans. Driving a screen
+cold wastes effort and produces false "this screen is broken" conclusions.
+
 ### Writing screens the REST API can't (screen-based SOAP)
 
 The contract REST API addresses records by key and can't write **context screens**
