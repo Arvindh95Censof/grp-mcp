@@ -763,9 +763,14 @@ async def screen_get_schema(screen_id: str, instance: str | None = None) -> Any:
 async def screen_submit(
     screen_id: str,
     commands: list[dict],
+    dry_run: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the screen-based SOAP API — writes screens REST can't.
+
+    dry_run=True previews: it drops the committing commands (button actions like
+    Save + row deletes) so the field SETs run but nothing persists, and still
+    returns any field-level errors. Use it to validate a sequence before writing.
 
     Replays a UI command sequence *as a user*, so it works on context screens
     the contract REST API refuses (insert enabled only with a parent loaded).
@@ -795,7 +800,7 @@ async def screen_submit(
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        return await s.submit(commands)
+        return await s.submit(commands, dry_run=dry_run)
 
 
 @mcp.tool()
@@ -803,6 +808,7 @@ async def screen_get(
     screen_id: str,
     fields: list[str],
     top: int = 10,
+    filters: list[dict] | None = None,
     instance: str | None = None,
 ) -> Any:
     """Read current values from a screen via the screen-based SOAP Export op.
@@ -822,7 +828,7 @@ async def screen_get(
     _require_range("top", top, 1, 5000)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        return await s.export(fields, top=int(top))
+        return await s.export(fields, top=int(top), filters=filters)
 
 
 @mcp.tool()
@@ -848,6 +854,136 @@ async def release_sessions(instance: str | None = None) -> Any:
                 pass
             released.append(name)
     return {"released": released, "remaining_cached": list(_clients.keys())}
+
+
+@mcp.tool()
+async def list_screens(query: str, top: int = 50, instance: str | None = None) -> Any:
+    """Find a screen's ID by title — search the site map (for screen_get/submit).
+
+    query: case-insensitive substring of the screen Title (e.g. "segment values",
+    "financial year", "ledger"). Returns [{ScreenID, Title}] so you can feed the
+    ScreenID to screen_get_schema / screen_get / screen_submit. Read-only.
+    """
+    _require_range("top", top, 1, 1000)
+    client = _client(instance)
+    res = await client.run_dac("SiteMap", {"$select": "ScreenID,Title", "$top": 5000})
+    rows = res.get("value", []) if isinstance(res, dict) else []
+    q = query.lower()
+    hits = [
+        {"ScreenID": r.get("ScreenID"), "Title": r.get("Title")}
+        for r in rows
+        if q in (r.get("Title") or "").lower()
+    ]
+    hits.sort(key=lambda h: (len(h["Title"] or ""), h["Title"] or ""))
+    return {"query": query, "count": len(hits), "screens": hits[: int(top)]}
+
+
+@mcp.tool()
+async def whoami(instance: str | None = None) -> Any:
+    """Report the active connection identity + reachability (and seat guidance).
+
+    Returns the configured username/tenant/endpoint, whether the token + contract
+    read succeed, and the count of cached sessions holding API seats. Acumatica
+    exposes no clean per-seat usage over REST, so to free seats use
+    release_sessions (trial = 2 seats). Read-only.
+    """
+    cfg = _cfg()
+    name = instance or cfg.default
+    inst = cfg.get(name)
+    ok, detail, entity_count = True, None, None
+    try:
+        client = _client(instance)
+        rec = await client.get_swagger()
+        entity_count = len((rec.get("paths") or {})) if isinstance(rec, dict) else None
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, str(e)[:200]
+    return {
+        "instance": name,
+        "username": inst.username,
+        "login_name_screen_api": f"{inst.username}@{inst.tenant}" if inst.tenant else inst.username,
+        "tenant": inst.tenant,
+        "base_url": inst.base_url,
+        "endpoint": f"{inst.endpoint_name}/{inst.endpoint_version}",
+        "reachable": ok,
+        "error": detail,
+        "cached_sessions_holding_seats": list(_clients.keys()),
+        "note": "Free seats with release_sessions (trial = 2 Web Services API Users).",
+    }
+
+
+@mcp.tool()
+async def enable_features(
+    features: list[str], instance: str | None = None
+) -> Any:
+    """Set feature flags on the Enable/Disable Features screen (CS100000).
+
+    features: schema friendly field names from screen_get_schema('CS100000')
+    (e.g. "Subaccounts", "Inventory", "InventorySubitems"). Sets each ON and
+    Saves. Returns the screen_submit result.
+
+    NOTE: Save STAGES the change (FeaturesSet gets a working row); the live
+    feature INSTALL (recompile) is a website-level "Modify" action NOT exposed to
+    the API — so this flips the flag but a full install may still need the UI.
+    Read current states with run_dac_odata('FeaturesSet'). Requires allow_write.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    cmds = [{"set": f, "to": "True"} for f in features] + [{"action": "Save"}]
+    async with ScreenClient(inst, "CS100000") as s:
+        return await s.submit(cmds)
+
+
+@mcp.tool()
+async def create_financial_calendar(
+    first_year: str, instance: str | None = None
+) -> Any:
+    """Create the financial calendar (GL101000): set the first year, AutoFill, Save.
+
+    first_year: e.g. "2026". Generates the period rows (monthly by default) and
+    saves — the prerequisite for the GL ledger.
+
+    LIMITATION: the start date (FinancialYearStartsOn) can't be set via the API
+    (masked field; insert validation rejects it) — the calendar uses the screen's
+    DEFAULT start (≈ business date). For a specific 1-Jan start, set the date in
+    the GL101000 UI date-picker. Requires allow_write. Verify with
+    screen_get('GL101000', ['Periods.PeriodNbr','Periods.StartDate']).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    cmds = [
+        {"set": "FirstFinancialYear", "to": str(first_year)},
+        {"action": "AutoFill"},
+        {"action": "Save"},
+    ]
+    async with ScreenClient(inst, "GL101000") as s:
+        return await s.submit(cmds)
+
+
+@mcp.tool()
+async def create_ledger(
+    ledger_id: str,
+    description: str,
+    ledger_type: str = "Actual",
+    currency: str = "USD",
+    instance: str | None = None,
+) -> Any:
+    """Create a GL ledger (GL201500): LedgerID, Description, Type, Currency, Save.
+
+    ledger_type: "Actual" | "Reporting" | "Statistical" | "Budget". Requires a
+    financial calendar to exist first (create_financial_calendar). Requires
+    allow_write. Verify with screen_get('GL201500', ['LedgerRecords.LedgerID']).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    cmds = [
+        {"set": "LedgerID", "to": ledger_id},
+        {"set": "Description", "to": description},
+        {"set": "Type", "to": ledger_type},
+        {"set": "Currency", "to": currency},
+        {"action": "Save"},
+    ]
+    async with ScreenClient(inst, "GL201500") as s:
+        return await s.submit(cmds)
 
 
 @mcp.tool()

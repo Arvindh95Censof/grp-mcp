@@ -270,7 +270,7 @@ class ScreenClient:
             )
         raise ScreenError(f"unrecognized command spec: {c!r}")
 
-    async def submit(self, commands: list[dict]) -> dict:
+    async def submit(self, commands: list[dict], dry_run: bool = False) -> dict:
         """Submit an ergonomic command sequence; return parsed result.
 
         Commands reference the schema's friendly field/action names (from
@@ -280,6 +280,10 @@ class ScreenClient:
         Spec shapes (see _spec_to_command): {"set","to"}, {"action"},
         {"new_row"}, {"delete_row"}, {"answer","to"}.
 
+        dry_run=True drops the committing commands (button actions + row deletes)
+        so the field SETs run but nothing persists — a safe preview that still
+        surfaces field-level errors.
+
         Recipe — update a record: set the key field, set other fields, Save:
             [{"set":"CustomerID","to":"ABARTENDE"},
              {"set":"AccountName","to":"New Name"},
@@ -288,6 +292,10 @@ class ScreenClient:
         set the row's fields, Save.
         """
         await self._ensure_tree()
+        if dry_run:
+            # preview: drop the committing commands (button actions + row deletes)
+            # so the field SETs run but nothing persists; surfaces field errors.
+            commands = [c for c in commands if not ("action" in c or "delete_row" in c)]
         inner = "".join(self._spec_to_command(c) for c in commands)
         try:
             xml = await self._call(
@@ -321,6 +329,7 @@ class ScreenClient:
         return {
             "screen_id": self.screen_id,
             "ok": not errors,
+            "dry_run": dry_run,
             "messages": [e["message"] for e in errors],
             "field_errors": errors,
             "raw_len": len(xml),
@@ -355,11 +364,16 @@ class ScreenClient:
                 })
         return out
 
-    async def export(self, fields: list[str], top: int = 10) -> dict:
+    async def export(
+        self, fields: list[str], top: int = 10, filters: list[dict] | None = None
+    ) -> dict:
         """Read current values from a screen via the Export SOAP operation.
 
         fields: schema friendly field names (qualify Container.Field if ambiguous)
                 — the columns to return. top: max rows.
+        filters: optional row filters, each {"field": "<Friendly>", "value": ...,
+                "condition": "Equals"|"Contain"|"StartsWith"|"Greater"|... (default
+                Equals)} — e.g. read one record by its key field.
         Returns {fields, headers, rows} where rows is a list of {header: value}.
         This is the read counterpart to submit(): the screen-based API's Export
         returns the live grid/record data (Submit alone doesn't echo it).
@@ -378,9 +392,29 @@ class ScreenClient:
                 f"<FieldName>{escape(fld)}</FieldName>"
                 f"<ObjectName>{escape(obj)}</ObjectName></Command>"
             )
+        fxml = ""
+        for flt in filters or []:
+            el = self._find_field(flt["field"])
+            fld = el.findtext("FieldName") or ""
+            obj = el.findtext("ObjectName") or ""
+            cond = flt.get("condition", "Equals")
+            val = escape(str(flt.get("value", "")))
+            # Filter.Value is anyType — it MUST carry an explicit xsi:type or the
+            # server fails to cast it (XmlNode[] -> String). Strings cover the
+            # common key/field-match case.
+            fxml += (
+                f'<Filter xmlns="{_TNS}" xmlns:xsi="{_XSI}" '
+                f'xmlns:xsd="http://www.w3.org/2001/XMLSchema">'
+                f'<Field xsi:type="Field"><FieldName>{escape(fld)}</FieldName>'
+                f"<ObjectName>{escape(obj)}</ObjectName></Field>"
+                f'<Condition>{escape(cond)}</Condition>'
+                f'<Value xsi:type="xsd:string">{val}</Value>'
+                f"<OpenBrackets>0</OpenBrackets><CloseBrackets>0</CloseBrackets>"
+                f"<Operator>And</Operator></Filter>"
+            )
         inner = (
             f"<tns:Export><tns:commands>{''.join(cols)}</tns:commands>"
-            f"<tns:filters></tns:filters><tns:topCount>{int(top)}</tns:topCount>"
+            f"<tns:filters>{fxml}</tns:filters><tns:topCount>{int(top)}</tns:topCount>"
             f"<tns:includeHeaders>true</tns:includeHeaders>"
             f"<tns:breakOnError>false</tns:breakOnError></tns:Export>"
         )

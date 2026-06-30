@@ -50,6 +50,11 @@ base URL + OAuth credentials.
 | `screen_get` | Read current values from a screen via the SOAP Export op (the read counterpart to screen_submit; reaches config singletons/context grids with no DAC route). |
 | `screen_submit` | Drive a screen via the screen-based SOAP API — writes screens the contract REST API can't (context/master-detail). Ergonomic set/key/action/new_row specs resolved against the schema (replays the LinkedCommand navigation chains). Surfaces per-field errors. |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
+| `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
+| `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
+| `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (recipe over screen_submit). |
+| `create_financial_calendar` | Create the financial calendar (GL101000): set first year → AutoFill → Save. |
+| `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
@@ -264,7 +269,11 @@ SOAP operations themselves work).
   calendar periods: `screen_get("GL101000", ["Periods.PeriodNbr","Periods.StartDate","Periods.Description"])`.
   `screen_submit` returns per-field errors in `field_errors` (the API reports
   field problems inside an HTTP 200, and on a fatal action it re-reads the field
-  state to surface why).
+  state to surface why); pass `dry_run=true` to preview (drops the Save/Delete so
+  nothing persists). `screen_get` takes `filters` (e.g. `[{"field":"CustomerSummary.CustomerID","value":"ABARTENDE"}]`)
+  to read one record. Find ScreenIDs with `list_screens("financial year")`. The
+  `create_financial_calendar` / `create_ledger` / `enable_features` tools are
+  ready-made recipes over `screen_submit` for common setup steps.
 
 How it works (the bit that matters): each command is built by **cloning the
 field's descriptor from `GetSchema`**, which carries the `LinkedCommand` navigation
