@@ -799,6 +799,58 @@ async def screen_submit(
 
 
 @mcp.tool()
+async def screen_get(
+    screen_id: str,
+    fields: list[str],
+    top: int = 10,
+    instance: str | None = None,
+) -> Any:
+    """Read current values from a screen via the screen-based SOAP Export op.
+
+    The read counterpart to screen_submit — returns the live record/grid data
+    that Submit alone doesn't echo. Useful to confirm a write, or to read screens
+    the contract REST/DAC routes can't (config singletons, context grids).
+
+    fields: schema friendly field names = the columns to return (qualify
+            "Container.Field" if a name repeats; see screen_get_schema). top: max
+            rows. Returns {headers, rows:[{header: value}, ...]}.
+
+    Example — read the financial calendar periods (GL101000):
+        screen_get("GL101000", ["Periods.PeriodNbr","Periods.StartDate","Periods.Description"])
+    Read-only; opens/closes its own SOAP session (no API seat held at idle).
+    """
+    _require_range("top", top, 1, 5000)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.export(fields, top=int(top))
+
+
+@mcp.tool()
+async def release_sessions(instance: str | None = None) -> Any:
+    """Log out cached API sessions to free Web Service API license seats.
+
+    Each instance's contract-REST client keeps a logged-in session (one of the
+    instance's "Max Web Services API Users" seats — a trial allows only 2). This
+    logs out and drops the cached client(s) so the seat is freed immediately
+    rather than at idle timeout; the next tool call transparently re-logs in.
+
+    instance: release just that profile; omit to release ALL cached sessions.
+    Use it when you hit "API Login Limit", or after a batch of work.
+    """
+    names = [instance] if instance else list(_clients.keys())
+    released = []
+    for name in names:
+        client = _clients.pop(name, None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            released.append(name)
+    return {"released": released, "remaining_cached": list(_clients.keys())}
+
+
+@mcp.tool()
 async def load_from_excel(
     entity: str,
     path: str,
@@ -1399,14 +1451,32 @@ async def setup_readiness(instance: str | None = None) -> Any:
         for c in checklist if c["feature_enabled"]
         for s in c["steps"] if s["exists"] is False
     ]
+
+    # Financial calendar (GL101000) has no DAC/REST collection route — probe it via
+    # the screen-based SOAP Export (the wizard plane). Best-effort: degrades to
+    # exists:null if SOAP is unreachable. A calendar is the prerequisite for the GL
+    # ledger, so surface it as a gap when the financial module is on but it's absent.
+    calendar = {"exists": None, "checked_via": "GL101000 Export (screen SOAP)"}
+    try:
+        inst_obj = _cfg().get(instance or _cfg().default)
+        async with ScreenClient(inst_obj, "GL101000") as sc:
+            periods = await sc.export(["Periods.PeriodNbr"], top=1)
+            calendar["exists"] = bool(periods.get("rows"))
+    except Exception as e:  # noqa: BLE001 - readiness must never hard-fail
+        calendar["error"] = str(e)[:200]
+    if bool(feats.get("FinancialModule")) and calendar["exists"] is False:
+        gaps.insert(0, "General Ledger: Financial calendar (GL101000)")
+
     return {
         "instance": instance or _cfg().default,
         "modules": modules,
         "enabled_features": enabled_features,
+        "financial_calendar": calendar,
         "checklist": checklist,
         "gaps": gaps,
-        "note": "Probes are best-effort (exists: null = unknown DAC/route). Wizard steps "
-                "(features/license/calendar) and preference values are not checked.",
+        "note": "Probes are best-effort (exists: null = unknown DAC/route or SOAP "
+                "unreachable). The financial calendar is now probed via screen SOAP; "
+                "other wizard steps (features/license) and preference values are not.",
     }
 
 

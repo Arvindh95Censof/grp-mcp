@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import re
 import xml.etree.ElementTree as ET
-from html import escape
+from html import escape, unescape
 from typing import Any
 
 import httpx
@@ -289,17 +289,116 @@ class ScreenClient:
         """
         await self._ensure_tree()
         inner = "".join(self._spec_to_command(c) for c in commands)
-        xml = await self._call(
-            "Submit", f"<tns:Submit><tns:commands>{inner}</tns:commands></tns:Submit>"
-        )
-        # field-level errors come back inside a 200 (IsError/Message), not a Fault
-        errors = [
-            re.sub(r"\s+", " ", m).strip()
-            for m in re.findall(r"<Message>([^<]+)</Message>", xml)
-        ]
+        try:
+            xml = await self._call(
+                "Submit", f"<tns:Submit><tns:commands>{inner}</tns:commands></tns:Submit>"
+            )
+        except ScreenError as e:
+            # A fatal action (Save/Delete/AutoFill) faulted — the SOAP fault only
+            # carries a generic "record raised at least one error". Re-run just the
+            # field SETs (no actions, so nothing commits) and read the per-field
+            # IsError/Message from that Content to surface WHY.
+            field_errors = []
+            diag = [c for c in commands if ("set" in c or "key" in c)]
+            if diag and len(diag) < len(commands):
+                try:
+                    di = "".join(self._spec_to_command(c) for c in diag)
+                    dx = await self._call(
+                        "Submit",
+                        f"<tns:Submit><tns:commands>{di}</tns:commands></tns:Submit>",
+                    )
+                    field_errors = self._parse_field_errors(dx)
+                except ScreenError:
+                    pass
+            return {
+                "screen_id": self.screen_id,
+                "ok": False,
+                "error": str(e),
+                "field_errors": field_errors,
+                "messages": [f["message"] for f in field_errors],
+            }
+        errors = self._parse_field_errors(xml)
         return {
             "screen_id": self.screen_id,
             "ok": not errors,
-            "messages": errors,
+            "messages": [e["message"] for e in errors],
+            "field_errors": errors,
             "raw_len": len(xml),
+        }
+
+    @staticmethod
+    def _parse_field_errors(xml: str) -> list[dict]:
+        """Extract per-field errors from a Submit Content response.
+
+        An errored field comes back as a Value element carrying <Message> +
+        <IsError>true</IsError> (the API reports field errors inside an HTTP 200,
+        not as a SOAP fault). Returns [{field, object, message, level}].
+        """
+        out: list[dict] = []
+        try:
+            root = ET.fromstring(xml.encode("utf-8"))
+        except ET.ParseError:
+            # fall back to a loose scan
+            for m in re.findall(r"<Message>([^<]+)</Message>", xml):
+                out.append({"field": None, "object": None,
+                            "message": re.sub(r"\s+", " ", m).strip(), "level": None})
+            return out
+        for el in root.iter():
+            msg = el.find("Message")
+            iserr = el.find("IsError")
+            if msg is not None and msg.text and (iserr is None or iserr.text == "true"):
+                out.append({
+                    "field": (el.findtext("FieldName") or None),
+                    "object": (el.findtext("ObjectName") or None),
+                    "message": re.sub(r"\s+", " ", msg.text).strip(),
+                    "level": (el.findtext("ErrorLevel") or None),
+                })
+        return out
+
+    async def export(self, fields: list[str], top: int = 10) -> dict:
+        """Read current values from a screen via the Export SOAP operation.
+
+        fields: schema friendly field names (qualify Container.Field if ambiguous)
+                — the columns to return. top: max rows.
+        Returns {fields, headers, rows} where rows is a list of {header: value}.
+        This is the read counterpart to submit(): the screen-based API's Export
+        returns the live grid/record data (Submit alone doesn't echo it).
+        """
+        await self._ensure_tree()
+        cols = []
+        for f in fields:
+            el = self._find_field(f)
+            # Export columns are SIMPLE field references — FieldName + ObjectName
+            # only. The full descriptor (with its LinkedCommand navigation chain)
+            # confuses Export and collapses the result to one column.
+            fld = el.findtext("FieldName") or ""
+            obj = el.findtext("ObjectName") or ""
+            cols.append(
+                f'<Command xmlns="{_TNS}" xmlns:xsi="{_XSI}" xsi:type="Field">'
+                f"<FieldName>{escape(fld)}</FieldName>"
+                f"<ObjectName>{escape(obj)}</ObjectName></Command>"
+            )
+        inner = (
+            f"<tns:Export><tns:commands>{''.join(cols)}</tns:commands>"
+            f"<tns:filters></tns:filters><tns:topCount>{int(top)}</tns:topCount>"
+            f"<tns:includeHeaders>true</tns:includeHeaders>"
+            f"<tns:breakOnError>false</tns:breakOnError></tns:Export>"
+        )
+        xml = await self._call("Export", inner)
+        rows: list[list[str]] = []
+        try:
+            root = ET.fromstring(xml.encode("utf-8"))
+            for aos in root.iter():
+                if aos.tag.split("}")[-1] == "ArrayOfString":
+                    rows.append([(s.text or "") for s in list(aos)])
+        except ET.ParseError:
+            pass
+        if not rows:
+            return {"screen_id": self.screen_id, "fields": fields, "headers": [], "rows": []}
+        headers = rows[0]
+        return {
+            "screen_id": self.screen_id,
+            "fields": fields,
+            "headers": headers,
+            "rows": [dict(zip(headers, r)) for r in rows[1:]],
         }
