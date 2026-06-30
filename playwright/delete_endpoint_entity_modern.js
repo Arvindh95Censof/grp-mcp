@@ -39,8 +39,12 @@ const cmd=(frame,c)=>frame.evaluate(c=>{const x=document.querySelector(`[data-cm
   let deleted=false;
   for(const c of ['DeleteNode','delete','Delete']){ if(await cmd(frame,c)){ log('clicked cmd',c); deleted=true; break; } }
   if(!deleted) log('no Delete data-cmd found - check screenshot');
-  await sleep(pg,3000); shot('2_afterdelete');
-  await cmd(frame,'Save'); await sleep(pg,8000); shot('3_saved');
+  await sleep(pg,2000);
+  // confirm any in-page "are you sure / save changes?" modal (Yes/OK)
+  const clickBtn=(t)=>frame.evaluate(t=>{const x=[...document.querySelectorAll('button')].find(b=>(b.textContent||'').trim()===t&&b.getBoundingClientRect().width>0);if(x){x.click();return true;}return false;},t);
+  await clickBtn('Yes'); await clickBtn('OK'); await sleep(pg,2000); shot('2_afterdelete');
+  await cmd(frame,'Save'); await sleep(pg,4000);
+  await clickBtn('Yes'); await clickBtn('OK'); await sleep(pg,6000); shot('3_saved');
   log('done. still present?', await present());
   await b.close();
 })().catch(e=>{ console.error('[del-entity] ERR:',e.message); process.exit(1); });
