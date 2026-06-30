@@ -51,7 +51,7 @@ almost anything:
 | `list_attachments` | List files attached to a record (name + download href). |
 | `download_file` | Download a record's attached file to disk. |
 | `get_endpoint_definition` | Read an endpoint's contract (entity tree/props) from SM207060. |
-| `setup_readiness` | Report instance setup state: enabled features (FeaturesSet) + per-module config gaps (ledger, CoA, customer/vendor class, …) vs the implementation checklist. |
+| `setup_readiness` | Report instance setup state: enabled features + **activation/install status** (Validated vs staged), per-module config gaps (ledger, CoA, customer/vendor class, …), financial calendar, **GL Preferences system accounts**, and **open periods** — the GL-phase gates — vs the implementation checklist. |
 
 **Write**
 

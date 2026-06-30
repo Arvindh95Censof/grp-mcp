@@ -2096,16 +2096,71 @@ async def setup_readiness(instance: str | None = None) -> Any:
     if bool(feats.get("FinancialModule")) and calendar["exists"] is False:
         gaps.insert(0, "General Ledger: Financial calendar (GL101000)")
 
+    # Feature ACTIVATION (are the enabled flags actually INSTALLED, or only staged?).
+    # CS100000 ActivationStatus via screen Export — "Validated" = installed; "Pending
+    # Activation" = saved but not applied (call activate_features). This is the gap
+    # that silently blocks everything downstream.
+    feature_activation = {"status": None, "installed": None,
+                          "checked_via": "CS100000 Export (screen SOAP)"}
+    try:
+        async with ScreenClient(inst_obj, "CS100000") as sc:
+            rows = (await sc.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
+        st = rows[0].get("Status") if rows else None
+        feature_activation.update(status=st, installed=(st == "Validated"))
+    except Exception as e:  # noqa: BLE001
+        feature_activation["error"] = str(e)[:160]
+    if feature_activation.get("installed") is False:
+        gaps.insert(0, "Features: staged but NOT installed — ActivationStatus is "
+                    f"'{feature_activation.get('status')}' (call activate_features)")
+
+    # GL Preferences system accounts (GL102000): Retained Earnings + YTD Net Income
+    # must be set before the GL master calendar can be generated / posting enabled.
+    gl_preferences = {"retained_earnings": None, "ytd_net_income": None,
+                      "configured": None, "checked_via": "GL102000 Export (screen SOAP)"}
+    try:
+        async with ScreenClient(inst_obj, "GL102000") as sc:
+            rows = (await sc.export(["GLSetupRecord.RetainedEarningsAccount",
+                                     "GLSetupRecord.YTDNetIncomeAccount"], top=1)).get("rows")
+        if rows:
+            vals = list(rows[0].values())
+            re_acct = (vals[0] if len(vals) > 0 else None) or None
+            ytd_acct = (vals[1] if len(vals) > 1 else None) or None
+            gl_preferences.update(
+                retained_earnings=re_acct, ytd_net_income=ytd_acct,
+                configured=bool(re_acct) and bool(ytd_acct))
+    except Exception as e:  # noqa: BLE001
+        gl_preferences["error"] = str(e)[:160]
+    if bool(feats.get("FinancialModule")) and gl_preferences.get("configured") is False:
+        gaps.append("General Ledger: GL Preferences system accounts not set "
+                    "(GL102000 Retained Earnings + YTD Net Income — GL phase)")
+
+    # Open periods — no open period means no posting. FinPeriod is empty until the
+    # master calendar is generated (GL201000) + periods opened (GL201100).
+    periods = {"any_exist": None, "checked_via": "FinPeriod DAC"}
+    try:
+        pr = await client.run_dac("FinPeriod", {"$top": 1})
+        rows = pr.get("value") if isinstance(pr, dict) else None
+        periods["any_exist"] = bool(rows) if rows is not None else None
+    except Exception as e:  # noqa: BLE001
+        periods["error"] = str(e)[:160]
+    if bool(feats.get("FinancialModule")) and periods.get("any_exist") is False:
+        gaps.append("General Ledger: no financial periods generated/open "
+                    "(GL201000 generate calendar → GL201100 open periods — GL phase)")
+
     return {
         "instance": instance or _cfg().default,
         "modules": modules,
         "enabled_features": enabled_features,
+        "feature_activation": feature_activation,
         "financial_calendar": calendar,
+        "gl_preferences": gl_preferences,
+        "open_periods": periods,
         "checklist": checklist,
         "gaps": gaps,
-        "note": "Probes are best-effort (exists: null = unknown DAC/route or SOAP "
-                "unreachable). The financial calendar is now probed via screen SOAP; "
-                "other wizard steps (features/license) and preference values are not.",
+        "note": "Probes are best-effort (null = unknown DAC/route or SOAP unreachable). "
+                "Now also reports: feature ACTIVATION (installed vs staged), GL Preferences "
+                "system accounts, and whether any financial periods exist — the GL-phase "
+                "gates. Calendar/features/GL-prefs are read via screen SOAP.",
     }
 
 
