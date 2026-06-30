@@ -469,11 +469,31 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.3 — 39 tools (incl. runtime profile management + `setup_readiness`). Covers the
-contract REST API (CRUD, actions, `$skip` paging,
+v0.15 — 57 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
-discovery), import scenarios, setup-readiness introspection, and the
-Customization Web API. By-design gap: endpoint **writes** (SM207060) are a stateful
-wizard — do those via the SM207060 UI / playwright or a customization project, not
-REST. Roadmap: nested detail rows in `load_from_excel`.
+discovery), and the **screen-based SOAP engine** (drives context/master-detail/wizard
+screens the REST API can't). On top sit setup recipes — `enable_features` +
+`activate_features` (install/recompile), `create_financial_calendar` (incl. start date),
+`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts` — plus
+import scenarios, the Customization Web API, and `setup_readiness` (now reports feature
+activation, GL preferences, and open periods). The whole foundation chain is grp-mcp-drivable
+(no Playwright).
+
+### Known limitations (by design / platform)
+
+- **Endpoint writes (SM207060)** are a stateful wizard — extend entities via the UI /
+  customization project, not REST.
+- **Multi-segment segmented-key deletion** is impossible via *any* API (and via the UI):
+  Acumatica requires ≥1 segment and won't cascade-delete a key's segments, so the last
+  segment always orphans. `delete_segmented_key` handles single-segment keys + safely
+  stops on multi-segment (KB-confirmed; structural change = "contact support").
+- **Tenant snapshot (SM203520)** is UI-only — the create dialog's action is server-gated
+  behind a client-opened panel the typed SOAP API can't reach, and it requires maintenance
+  mode (which locks the instance). Left as a deliberate manual step.
+- **Combo/dropdown allowed-values** aren't exposed by the typed SOAP schema; use
+  `screen_preflight` (CSDL mandatory fields) and known enums instead.
+- A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
+
+Roadmap: GL phase (`set_gl_preferences` → generate calendar → open periods); nested detail
+rows in `load_from_excel`.
 
