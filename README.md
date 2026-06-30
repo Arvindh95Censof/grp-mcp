@@ -46,6 +46,8 @@ base URL + OAuth credentials.
 | `setup_data_provider` | Create + fully configure a Data Provider (SM206015) from a data file (schema written directly from its header; optional file upload). |
 | `attach_file` | Upload a file and attach it to a record (`files:put`). |
 | `attach_file_to_provider` | Attach a source file to a Data Provider by id — GET-free (works around the `DataProvider` read-back 500). |
+| `screen_get_schema` | Discover a screen's command schema via the screen-based SOAP API (containers → fields). |
+| `screen_submit` | Drive a screen via the screen-based SOAP API — writes screens the contract REST API can't (context/master-detail). Ergonomic set/key/action/new_row specs resolved against the schema (replays the LinkedCommand navigation chains). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |

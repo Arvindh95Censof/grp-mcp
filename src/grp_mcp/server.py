@@ -18,6 +18,7 @@ from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
+from .screen import ScreenClient, ScreenError
 
 mcp = FastMCP("grp-mcp")
 
@@ -738,6 +739,63 @@ async def attach_file_to_provider(
         "record_id": record_id,
         "url": url,
     }
+
+
+@mcp.tool()
+async def screen_get_schema(screen_id: str, instance: str | None = None) -> Any:
+    """Discover a screen's command schema via the screen-based SOAP API.
+
+    Returns {containers: {<Container>: {<Field>: {object, field}}}} — the exact
+    ObjectName + FieldName the Submit engine expects for each field. Use this to
+    build the `commands` for screen_submit.
+
+    This is the entry point for writing screens the contract REST API can't —
+    context/popup/master-detail screens (e.g. Segment Values CS203000), whose
+    insert actions only enable once a parent record is loaded. Read-only; opens
+    and closes its own SOAP session (no API seat held at idle).
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.get_schema()
+
+
+@mcp.tool()
+async def screen_submit(
+    screen_id: str,
+    commands: list[dict],
+    instance: str | None = None,
+) -> Any:
+    """Drive a screen via the screen-based SOAP API — writes screens REST can't.
+
+    Replays a UI command sequence *as a user*, so it works on context screens
+    the contract REST API refuses (insert enabled only with a parent loaded).
+    Commands reference the schema's FRIENDLY field/action names (from
+    screen_get_schema) — the client clones the matching descriptor, which
+    carries the LinkedCommand navigation chain that actually loads/edits the
+    record (bare field-name commands silently no-op). Spec shapes:
+        {"set": "<FriendlyName>", "to": <value>}   set a field (navigates if key)
+        {"action": "<FriendlyName>"}               click a button (e.g. "Save")
+        {"new_row": "<Container>"}                 add a detail row
+        {"delete_row": "<Container>"}              delete the current detail row
+        {"answer": "<Container>", "to": "Yes"}     answer a pop-up dialog
+    Use "Container.Field" for `set` when a friendly name repeats across
+    containers. Friendly names + containers come from screen_get_schema.
+
+    Recipe — update a record: set the key field, set other fields, Save:
+        [{"set":"CustomerID","to":"ABARTENDE"},
+         {"set":"AccountName","to":"New Name"},
+         {"action":"Save"}]
+    Add a detail row (master-detail/context screen): set the parent key(s),
+    new_row the detail container, set the row's fields, Save.
+
+    Field-level errors are returned in `messages` (the API reports them inside a
+    200, not as a fault). Requires "allow_write": true. Opens/closes its own SOAP
+    session so it never holds an API seat at idle (trial = 2 seats — always frees).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.submit(commands)
 
 
 @mcp.tool()
