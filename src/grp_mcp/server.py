@@ -1123,6 +1123,77 @@ async def chart_of_accounts(
 
 
 @mcp.tool()
+async def create_segmented_key(
+    key_id: str,
+    description: str,
+    segments: list[dict],
+    lookup_mode: str | None = None,
+    specific_module: str | None = None,
+    numbering_id: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Create a segmented key on Segment Keys (CS202000) — key header + segment rows.
+
+    This is the PREREQUISITE step for set_segment_value: a key (and its segments)
+    must exist here before CS203000 can hold values. Per the KB chain: CS202000
+    (this tool) -> CS203000 (set_segment_value) -> GL203000 etc.
+
+    key_id:      the segmented key identifier (e.g. "SUBACCOUNT", "ZZFUND").
+    description: key description.
+    segments:    list of dicts, one per segment (at least one required). Per segment:
+        length      (required) int, segment length in characters
+        description optional segment label
+        validate    optional bool — ON = segment holds a validated value list you
+                    then populate with set_segment_value (a 1-segment key is always
+                    validated). OFF = only length/mask are checked.
+        edit_mask   optional "Alpha" | "Numeric" | "Alphanumeric" | "Unicode"
+                    (omit = screen default)
+        align       optional "Left" | "Right"
+        auto_number optional bool (only ONE segment per key; requires numbering_id)
+        separator   optional char shown between segments (default "-")
+    lookup_mode:     optional; omit to use the screen default. A validated segment
+                     needs a lookup mode that supports validation (see KB
+                     'Lookup Modes for Segmented Keys').
+    specific_module: optional module to scope the key to.
+    numbering_id:    optional numbering sequence ID (required if any auto_number
+                     segment; its length must match that segment's length).
+
+    Verify with run_dac_odata('Segment', filter="DimensionID eq '<key_id>'").
+    Requires allow_write. Total of all segment lengths must not exceed the key max.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    K = "SegmentedKeyDefinition"
+    S = "SegmentDefinition"
+    cmds: list[dict] = [{"set": f"{K}.SegmentedKeyID", "to": key_id}]
+    if lookup_mode:
+        cmds.append({"set": f"{K}.LookupMode", "to": lookup_mode})
+    if specific_module:
+        cmds.append({"set": f"{K}.SpecificModule", "to": specific_module})
+    if numbering_id:
+        cmds.append({"set": f"{K}.NumberingID", "to": numbering_id})
+    cmds.append({"set": f"{K}.Description", "to": description})
+    for seg in segments:
+        cmds.append({"new_row": S})
+        if seg.get("description") is not None:
+            cmds.append({"set": f"{S}.Description", "to": seg["description"]})
+        cmds.append({"set": f"{S}.Length", "to": str(seg["length"])})
+        if seg.get("edit_mask"):
+            cmds.append({"set": f"{S}.EditMask", "to": seg["edit_mask"]})
+        if seg.get("align"):
+            cmds.append({"set": f"{S}.Align", "to": seg["align"]})
+        if seg.get("separator"):
+            cmds.append({"set": f"{S}.Separator", "to": seg["separator"]})
+        if seg.get("auto_number"):
+            cmds.append({"set": f"{S}.AutoNumber", "to": "True"})
+        if seg.get("validate"):
+            cmds.append({"set": f"{S}.Validate", "to": "True"})
+    cmds.append({"action": "Save"})
+    async with ScreenClient(inst, "CS202000") as s:
+        return await s.submit(cmds, auto_answer="Yes")
+
+
+@mcp.tool()
 async def set_segment_value(
     segmented_key_id: str,
     value: str,
