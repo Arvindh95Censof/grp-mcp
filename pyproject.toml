@@ -1,6 +1,6 @@
 [project]
 name = "grp-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "MCP server exposing Acumatica ERP (contract-based REST API) as tools for AI agents. Multi-instance, OAuth2."
 readme = "README.md"
 requires-python = ">=3.10"

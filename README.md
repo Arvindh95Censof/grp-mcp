@@ -174,7 +174,8 @@ tools are sandboxed:
   any other host is refused (prevents OAuth-token exfiltration / SSRF).
 - **Writes are opt-in.** Record mutations (`create_or_update_entity`,
   `load_from_excel`, `invoke_action`, `run_import_scenario`, `set_note`,
-  `attach_file`) require `"allow_write": true`; `delete_entity` requires the stricter
+  `attach_file`, `attach_file_to_provider`, `screen_submit`) require
+  `"allow_write": true`; `delete_entity` requires the stricter
   `"allow_delete": true`; customization publish/import/unpublish require
   `"allow_publish": true`. **Default is read-only.**
 - **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
@@ -226,10 +227,56 @@ required set — graph-validated business-required fields (e.g. GL Preferences' 
 Earnings / YTD Net Income accounts) are `Nullable=true` here and won't show; cross-check
 the screen's KB form reference for those.
 
+### Writing screens the REST API can't (screen-based SOAP)
+
+The contract REST API addresses records by key and can't write **context screens**
+— popup / master-detail / wizard screens whose insert or edit action only enables
+once a parent record is loaded. `screen_get_schema` + `screen_submit` drive
+Acumatica's screen-based SOAP API (`<base>/Soap/<ScreenID>.asmx`), replaying a UI
+command sequence *as a user* so the screen has its context. Pure async httpx — no
+zeep (its WSDL dependency is a dead end here: some screens' `?wsdl` 500s while the
+SOAP operations themselves work).
+
+- `screen_get_schema(screen_id)` returns the screen's containers → fields (the
+  friendly names you reference in commands).
+- `screen_submit(screen_id, commands)` runs a sequence of ergonomic command specs:
+  - `{"set": "<Field>", "to": <value>}` — set a field (navigates if it's a key)
+  - `{"key": "<Field>", "to": <value>}` — select an existing record via a key
+  - `{"action": "<Name>"}` — click a button, e.g. `{"action": "Save"}`
+  - `{"new_row": "<Container>"}` / `{"delete_row": "<Container>"}` — detail rows
+  - `{"answer": "<Container>", "to": "Yes"}` — answer a pop-up dialog
+
+  Qualify a name as `Container.Field` when the same friendly name appears in more
+  than one container (the tool errors and lists the options). Example — update a
+  customer's name on **Customers** (AR303000):
+
+  ```json
+  [{"set": "CustomerSummary.CustomerID", "to": "ABARTENDE"},
+   {"set": "CurrentCustomer.AccountName", "to": "USA Bartending School"},
+   {"action": "Save"}]
+  ```
+
+  Add a detail row: select the parent key(s), `new_row` the detail container, set
+  the row's fields, then `{"action": "Save"}`.
+
+How it works (the bit that matters): each command is built by **cloning the
+field's descriptor from `GetSchema`**, which carries the `LinkedCommand` navigation
+chain that actually loads/navigates the record, then overwriting its value. Bare
+hand-built commands omit that chain and silently no-op (Submit returns ok but
+nothing persists). Field-level errors come back in `messages` (the API reports them
+inside an HTTP 200, not as a fault). `screen_submit` needs `"allow_write": true`;
+it opens and closes its own SOAP session per call so it never holds an API license
+seat at idle (a trial license allows only 2 — always log out).
+
 ### Attachments and reports
 
 - `attach_file` uploads a file onto a record (`files:put`); `list_attachments`
   lists what's attached (name + href); `download_file` pulls an attachment to disk.
+- `attach_file_to_provider` attaches a source file to a Data Provider **by id**,
+  building the `files:put` URL from a template instead of reading the record first
+  — a workaround for the `DataProvider` contract entity, which 500s on read-back
+  (its `Link` field carries a BQL delegate). `setup_data_provider` uses the same
+  GET-free upload.
 - `run_report` runs a **Report-type** endpoint entity: it PUTs the report with its
   parameters, polls the returned `Location` until the render completes, and writes
   the file (usually PDF) to disk. The report must first be added to the endpoint as
