@@ -1167,6 +1167,51 @@ async def create_ledger(
 
 
 @mcp.tool()
+async def set_gl_preferences(
+    retained_earnings: str,
+    ytd_net_income: str,
+    auto_post_on_release: bool | None = None,
+    hold_batches_on_entry: bool | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Set General Ledger Preferences (GL102000) — the system accounts + posting flags.
+
+    The GL-phase keystone: sets the two REQUIRED Chart-of-Accounts settings that
+    enable posting, then optional posting/data-entry flags, then Save.
+
+    retained_earnings: the Retained Earnings account code. MUST be an account of
+        type LIABILITY (Acumatica errors otherwise — there is no Equity type).
+    ytd_net_income:    the YTD Net Income account code (also Liability by convention).
+    auto_post_on_release: optional — set the "Automatically Post on Release" flag
+        (True simplifies batch processing: no Unposted batches).
+    hold_batches_on_entry: optional — set "Hold Batches on Entry" (False = new
+        batches are Balanced immediately).
+
+    PREREQUISITE: both accounts must already exist in the Chart of Accounts
+    (chart_of_accounts) with type Liability. Verify after with
+    screen_get('GL102000', ['GLSetupRecord.RetainedEarningsAccount',
+    'GLSetupRecord.YTDNetIncomeAccount']) or setup_readiness (gl_preferences).
+    Requires allow_write. (KB: To Specify General Ledger Preferences.)
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    G = "GLSetupRecord"
+    cmds: list[dict] = [
+        {"set": f"{G}.YTDNetIncomeAccount", "to": ytd_net_income},
+        {"set": f"{G}.RetainedEarningsAccount", "to": retained_earnings},
+    ]
+    if auto_post_on_release is not None:
+        cmds.append({"set": f"{G}.AutomaticallyPostOnRelease",
+                     "to": "True" if auto_post_on_release else "False"})
+    if hold_batches_on_entry is not None:
+        cmds.append({"set": f"{G}.HoldBatchesOnEntry",
+                     "to": "True" if hold_batches_on_entry else "False"})
+    cmds.append({"action": "Save"})
+    async with ScreenClient(inst, "GL102000") as s:
+        return await s.submit(cmds, auto_answer="Yes")
+
+
+@mcp.tool()
 async def chart_of_accounts(
     accounts: list[dict],
     save: bool = True,

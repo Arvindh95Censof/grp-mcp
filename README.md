@@ -75,6 +75,7 @@ almost anything:
 | `activate_features` | Activate/install the staged feature set (CS100000 RequestValidation = the "Enable" button) — recompiles the site, then polls ActivationStatus until "Validated" (returns activated=true/false). |
 | `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
+| `set_gl_preferences` | Set GL Preferences (GL102000): Retained Earnings + YTD Net Income system accounts (Liability) + posting flags → Save. The GL-phase keystone for posting. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
 | `create_segmented_key` | Create a segmented key + its segments on Segment Keys (CS202000) — the prerequisite for `set_segment_value`. |
 | `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. Requires the key to exist on CS202000 first. |
@@ -469,7 +470,7 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.15 — 57 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
+v0.16 — 58 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
 discovery), and the **screen-based SOAP engine** (drives context/master-detail/wizard
 screens the REST API can't). On top sit setup recipes — `enable_features` +
@@ -494,6 +495,6 @@ activation, GL preferences, and open periods). The whole foundation chain is grp
   `screen_preflight` (CSDL mandatory fields) and known enums instead.
 - A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
 
-Roadmap: GL phase (`set_gl_preferences` → generate calendar → open periods); nested detail
-rows in `load_from_excel`.
+Roadmap: GL phase — `set_gl_preferences` ✅ done; next `generate_master_calendar` (GL201000)
+→ `open_periods` (GL201100). Also: nested detail rows in `load_from_excel`.
 
