@@ -1133,6 +1133,12 @@ async def set_segment_value(
 ) -> Any:
     """Add a value to a segment on Segment Values (CS203000) — the one that works.
 
+    PREREQUISITE: the segmented key + its segments must already exist on Segment
+    Keys (CS202000) — CS203000 only lists keys defined there, and a segment must
+    have Validate=ON to hold a value list. So the chain is CS202000 (create key,
+    add segments, set Validate) -> CS203000 (this tool). See the KB
+    'Segmented Identifiers' / 'Segment Values (CS203000)' for the full order.
+
     CS203000 IS writable via the screen-based SOAP engine. The trick is NAVIGATION:
     select the segment with a descriptor `set` on the header key (which replays the
     LinkedCommand chain), NOT a flat key command — a flat key leaves the screen on
