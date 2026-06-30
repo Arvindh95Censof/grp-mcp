@@ -764,6 +764,7 @@ async def screen_submit(
     screen_id: str,
     commands: list[dict],
     dry_run: bool = False,
+    auto_answer: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the screen-based SOAP API — writes screens REST can't.
@@ -771,6 +772,10 @@ async def screen_submit(
     dry_run=True previews: it drops the committing commands (button actions like
     Save + row deletes) so the field SETs run but nothing persists, and still
     returns any field-level errors. Use it to validate a sequence before writing.
+
+    auto_answer (e.g. "Yes"): if the Submit faults, retry once with a confirmation
+    dialog answered — clears "Are you sure?" pop-ups that block Save/Release on
+    some screens. Only applied to containers that actually expose a dialog.
 
     Replays a UI command sequence *as a user*, so it works on context screens
     the contract REST API refuses (insert enabled only with a parent loaded).
@@ -800,7 +805,86 @@ async def screen_submit(
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        return await s.submit(commands, dry_run=dry_run)
+        return await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer)
+
+
+@mcp.tool()
+async def screen_insert_rows(
+    screen_id: str,
+    container: str,
+    rows: list[dict],
+    header: dict | None = None,
+    save: bool = True,
+    auto_answer: str | None = None,
+    dry_run: bool = False,
+    instance: str | None = None,
+) -> Any:
+    """Insert many grid/detail rows into one container in a single transaction.
+
+    The master-detail / bulk-grid writer on top of the screen-based SOAP engine —
+    use it for Chart of Accounts rows, subaccount segments, GL batch lines, any
+    screen where one Save commits N rows.
+
+    container: the grid container friendly name (from screen_get_schema), e.g.
+               "AccountRecords" on GL202500.
+    rows:      list of {field: value}; each row becomes NewRow + the field SETs.
+               Field names are friendly (qualify "Container.Field" if a name
+               repeats across containers).
+    header:    optional field sets applied once before the rows (a parent key /
+               document context).
+    save:      add a final Save (set False to chain more work first).
+    auto_answer: answer a confirmation dialog raised by Save (e.g. "Yes").
+    dry_run:   preview — runs the SETs, drops Save, surfaces field errors.
+
+    Example — add two GL accounts (GL202500):
+        screen_insert_rows("GL202500", "AccountRecords", [
+          {"Account":"10100","Type":"Asset","AccountClass":"CASH","Description":"Cash"},
+          {"Account":"40100","Type":"Income","Description":"Sales"}])
+    Requires allow_write. Opens/closes its own SOAP session (frees the API seat).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.insert_rows(
+            container, rows, header=header, save=save,
+            auto_answer=auto_answer, dry_run=dry_run,
+        )
+
+
+@mcp.tool()
+async def screen_record(
+    screen_id: str,
+    key_field: str,
+    key_value: str,
+    fields: dict,
+    insert: bool = False,
+    save: bool = True,
+    auto_answer: str | None = None,
+    dry_run: bool = False,
+    instance: str | None = None,
+) -> Any:
+    """Create or edit ONE record on a master-style screen (idempotent setup helper).
+
+    insert=False (default): set the key field, which NAVIGATES to the existing
+        record, then apply `fields` and Save — an in-place edit. Re-runnable.
+    insert=True: click Insert to start a fresh record, then set the key + `fields`
+        and Save — a create.
+
+    key_field/fields use friendly schema names (from screen_get_schema; qualify
+    "Container.Field" if a name repeats). For grids with many rows per Save use
+    screen_insert_rows instead.
+
+    Example — set a GL ledger's description (edit existing):
+        screen_record("GL201500","LedgerID","ACTUAL",{"Description":"Actual Ledger"})
+    Requires allow_write. Opens/closes its own SOAP session (frees the API seat).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.set_record(
+            key_field, key_value, fields, insert=insert, save=save,
+            auto_answer=auto_answer, dry_run=dry_run,
+        )
 
 
 @mcp.tool()
@@ -984,6 +1068,96 @@ async def create_ledger(
     ]
     async with ScreenClient(inst, "GL201500") as s:
         return await s.submit(cmds)
+
+
+@mcp.tool()
+async def chart_of_accounts(
+    accounts: list[dict],
+    save: bool = True,
+    dry_run: bool = False,
+    auto_answer: str | None = "Yes",
+    instance: str | None = None,
+) -> Any:
+    """Create Chart of Accounts rows (GL202500) in one transaction.
+
+    accounts: list of dicts. Per account:
+        account      (required) the account number/CD, e.g. "10100"
+        type         (required) "Asset" | "Liability" | "Income" | "Expense"
+        description  (required) free text
+        account_class            optional account class ID (must already exist)
+        post_option              optional, e.g. "Detail" | "Summary"
+        active                   optional bool, defaults True
+    Each becomes a NewRow + field SETs on the AccountRecords grid; one Save
+    commits them all. A confirmation dialog (if any) is auto-answered "Yes".
+
+    Prerequisites: the GL module enabled and a posting ledger to exist. Verify
+    after with screen_get('GL202500', ['AccountRecords.Account',
+    'AccountRecords.Description']). dry_run previews without saving. Requires
+    allow_write.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    rows: list[dict] = []
+    for a in accounts:
+        row = {
+            "Account": str(a["account"]),
+            "Type": a["type"],
+            "Description": a["description"],
+        }
+        if a.get("account_class"):
+            row["AccountClass"] = a["account_class"]
+        if a.get("post_option"):
+            row["PostOption"] = a["post_option"]
+        row["Active"] = "True" if a.get("active", True) else "False"
+        rows.append(row)
+    async with ScreenClient(inst, "GL202500") as s:
+        return await s.insert_rows(
+            "AccountRecords", rows, save=save,
+            auto_answer=auto_answer, dry_run=dry_run,
+        )
+
+
+@mcp.tool()
+async def screen_preflight(
+    dac: str,
+    provided: list[str],
+    instance: str | None = None,
+) -> Any:
+    """Check supplied fields against a DAC's MANDATORY fields before a write.
+
+    Reads the OData CSDL ($metadata) — the authoritative mandatory-field source
+    (Nullable="false" or key = mandatory) — and reports which required fields are
+    NOT in `provided`. The screen-based SOAP plane returns no field-state, so this
+    is the practical preflight: catch missing required fields up front instead of
+    eating a generic "record raised at least one error" fault on Save.
+
+    dac:      the DAC entity-type name (e.g. "Account", "Ledger", "Branch").
+              List them with get_dac_metadata(dac=None).
+    provided: the field names you intend to set (friendly or DAC names — matched
+              case-insensitively against the DAC's mandatory field names).
+
+    Returns {dac, mandatory, provided, missing, ok}. ok=False means `missing` lists
+    required fields you haven't set. Read-only. Note: container friendly names may
+    differ from DAC field names — treat `missing` as a strong hint, not a hard gate.
+    """
+    meta = await get_dac_metadata(dac=dac, mandatory_only=True, instance=instance)
+    if isinstance(meta, dict) and "error" in meta:
+        return meta
+    fields = meta.get(dac) or (next(iter(meta.values()), []) if meta else [])
+    # Drop framework/system columns the CSDL marks non-nullable but no caller sets.
+    _SYS = {"deleteddatabaserecord", "noteid", "tstamp", "createdbyid",
+            "createddatetime", "lastmodifiedbyid", "lastmodifieddatetime",
+            "createdbyscreenid", "lastmodifiedbyscreenid"}
+    mandatory = [f["name"] for f in fields if (f["name"] or "").lower() not in _SYS]
+    have = {p.lower() for p in provided}
+    missing = [m for m in mandatory if m and m.lower() not in have]
+    return {
+        "dac": dac,
+        "mandatory": mandatory,
+        "provided": provided,
+        "missing": missing,
+        "ok": not missing,
+    }
 
 
 @mcp.tool()

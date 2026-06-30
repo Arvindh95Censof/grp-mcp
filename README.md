@@ -13,9 +13,12 @@ almost anything:
 - **Screen-based SOAP engine** — *drive screens the REST API can't*: context /
   master-detail / wizard screens (segment values, Enable Features, the financial
   calendar…). Discover (`list_screens`, `screen_get_schema`), read (`screen_get`),
-  and write (`screen_submit`, with dry-run + per-field errors) any screen by
-  replaying its UI commands — no browser, no zeep. Ready-made setup recipes
-  (`create_financial_calendar`, `create_ledger`, `enable_features`) sit on top.
+  and write (`screen_submit`, with dry-run + per-field errors + dialog
+  auto-answer) any screen by replaying its UI commands — no browser, no zeep.
+  Higher-level writers (`screen_insert_rows` for master-detail/bulk grids,
+  `screen_record` for idempotent create-or-edit) and ready-made setup recipes
+  (`create_financial_calendar`, `create_ledger`, `chart_of_accounts`,
+  `enable_features`) sit on top.
 
 ## Tools
 
@@ -61,13 +64,17 @@ almost anything:
 | `attach_file_to_provider` | Attach a source file to a Data Provider by id — GET-free (works around the `DataProvider` read-back 500). |
 | `screen_get_schema` | Discover a screen's command schema via the screen-based SOAP API (containers → fields). |
 | `screen_get` | Read current values from a screen via the SOAP Export op (the read counterpart to screen_submit; reaches config singletons/context grids with no DAC route). |
-| `screen_submit` | Drive a screen via the screen-based SOAP API — writes screens the contract REST API can't (context/master-detail). Ergonomic set/key/action/new_row specs resolved against the schema (replays the LinkedCommand navigation chains). Surfaces per-field errors. |
+| `screen_submit` | Drive a screen via the screen-based SOAP API — writes screens the contract REST API can't (context/master-detail). Ergonomic set/key/action/new_row specs resolved against the schema (replays the LinkedCommand navigation chains). `dry_run` preview + `auto_answer` to clear confirmation dialogs. Surfaces per-field errors. |
+| `screen_insert_rows` | Insert many grid/detail rows into one container in a single Save (master-detail / bulk-grid writer over the SOAP engine) — e.g. Chart of Accounts rows, subaccount segments. |
+| `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
+| `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
 | `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (recipe over screen_submit). |
 | `create_financial_calendar` | Create the financial calendar (GL101000): set first year → AutoFill → Save. |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
+| `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
@@ -284,9 +291,28 @@ SOAP operations themselves work).
   field problems inside an HTTP 200, and on a fatal action it re-reads the field
   state to surface why); pass `dry_run=true` to preview (drops the Save/Delete so
   nothing persists). `screen_get` takes `filters` (e.g. `[{"field":"CustomerSummary.CustomerID","value":"ABARTENDE"}]`)
-  to read one record. Find ScreenIDs with `list_screens("financial year")`. The
-  `create_financial_calendar` / `create_ledger` / `enable_features` tools are
-  ready-made recipes over `screen_submit` for common setup steps.
+  to read one record. Find ScreenIDs with `list_screens("financial year")`.
+
+  Higher-level writers sit on top of the engine so you don't hand-build command
+  lists for the common shapes:
+
+  - `screen_insert_rows(screen_id, container, rows, header?, auto_answer?)` — the
+    master-detail / bulk-grid writer: one `NewRow` + field SETs per row, all under
+    one Save (Chart of Accounts, subaccount segments, GL batch lines).
+  - `screen_record(screen_id, key_field, key_value, fields, insert?)` — create
+    (`insert=True`) or edit one record by key; an idempotent, re-runnable setup step.
+  - `screen_submit(..., auto_answer="Yes")` — retry once with a confirmation dialog
+    answered when a Save/Release raises an "Are you sure?" pop-up (only containers
+    that actually expose a dialog get one).
+  - `screen_preflight(dac, provided)` — the screen-based SOAP plane returns **no
+    field-state** (no combo option-lists, no required flags — `Submit` echoes an
+    empty result), so required-field checking comes from the OData CSDL instead:
+    this reports which of a DAC's mandatory fields you haven't supplied (system
+    columns filtered out). Treat `missing` as a strong hint, not a hard gate.
+
+  Ready-made recipes over the engine for common setup steps:
+  `create_financial_calendar` / `create_ledger` / `enable_features`, and
+  `chart_of_accounts(accounts)` to populate GL202500 in one transaction.
 
 How it works (the bit that matters): each command is built by **cloning the
 field's descriptor from `GetSchema`**, which carries the `LinkedCommand` navigation

@@ -218,6 +218,41 @@ class ScreenClient:
             )
         return copy.deepcopy(el)
 
+    def _has_service(self, container: str, which: str) -> bool:
+        """True if `container` exposes the named service command (e.g. DialogAnswer)."""
+        root = self._tree
+        c = root.find(container)
+        sc = c.find("ServiceCommands") if c is not None else None
+        return sc is not None and sc.find(which) is not None
+
+    def _primary_container(self) -> str | None:
+        """The first non-meta container in the schema tree (the screen's main view)."""
+        for cont in list(self._tree):
+            if cont.tag not in ("Actions",):
+                return cont.tag
+        return None
+
+    @staticmethod
+    def _referenced_containers(commands: list[dict]) -> list[str]:
+        """Containers named by command specs (the bit before '.' on set/key, or the
+        whole value on new_row/delete_row/answer). Order-preserving, de-duped."""
+        seen: list[str] = []
+        for c in commands:
+            cont = None
+            if "new_row" in c:
+                cont = c["new_row"]
+            elif "delete_row" in c:
+                cont = c["delete_row"]
+            elif "answer" in c:
+                cont = c["answer"]
+            elif "set" in c and "." in c["set"]:
+                cont = c["set"].split(".", 1)[0]
+            elif "key" in c and "." in c["key"]:
+                cont = c["key"].split(".", 1)[0]
+            if cont and cont not in seen:
+                seen.append(cont)
+        return seen
+
     @staticmethod
     def _wrap(el: ET.Element, xsi_type: str, value: str | None) -> str:
         if value is not None:
@@ -270,7 +305,29 @@ class ScreenClient:
             )
         raise ScreenError(f"unrecognized command spec: {c!r}")
 
-    async def submit(self, commands: list[dict], dry_run: bool = False) -> dict:
+    def _answer_commands(self, commands: list[dict], answer: str) -> list[dict]:
+        """Build {"answer", "to"} specs for each referenced container that exposes a
+        DialogAnswer service command, falling back to the primary container.
+
+        Many Save/Release actions raise a confirmation dialog ("Are you sure?")
+        that the API surfaces as a generic fault; appending an Answer command and
+        re-submitting clears it. Only containers that actually have a DialogAnswer
+        get one — answering a container that has none just faults again.
+        """
+        conts = [c for c in self._referenced_containers(commands)
+                 if self._has_service(c, "DialogAnswer")]
+        if not conts:
+            pc = self._primary_container()
+            if pc and self._has_service(pc, "DialogAnswer"):
+                conts = [pc]
+        return [{"answer": c, "to": answer} for c in conts]
+
+    async def submit(
+        self,
+        commands: list[dict],
+        dry_run: bool = False,
+        auto_answer: str | None = None,
+    ) -> dict:
         """Submit an ergonomic command sequence; return parsed result.
 
         Commands reference the schema's friendly field/action names (from
@@ -283,6 +340,11 @@ class ScreenClient:
         dry_run=True drops the committing commands (button actions + row deletes)
         so the field SETs run but nothing persists — a safe preview that still
         surfaces field-level errors.
+
+        auto_answer (e.g. "Yes"): if the Submit faults, re-submit once with a
+        DialogAnswer appended for each referenced container that exposes one —
+        clears confirmation pop-ups ("Are you sure?") that would otherwise block
+        the action. Skipped under dry_run.
 
         Recipe — update a record: set the key field, set other fields, Save:
             [{"set":"CustomerID","to":"ABARTENDE"},
@@ -302,6 +364,31 @@ class ScreenClient:
                 "Submit", f"<tns:Submit><tns:commands>{inner}</tns:commands></tns:Submit>"
             )
         except ScreenError as e:
+            # First chance: a confirmation dialog blocked the action. Re-submit once
+            # with the dialog answered, if the caller opted in and an answerable
+            # container exists.
+            if auto_answer and not dry_run:
+                answers = self._answer_commands(commands, auto_answer)
+                if answers:
+                    try:
+                        ai = "".join(
+                            self._spec_to_command(c) for c in (commands + answers)
+                        )
+                        ax = await self._call(
+                            "Submit",
+                            f"<tns:Submit><tns:commands>{ai}</tns:commands></tns:Submit>",
+                        )
+                        errs = self._parse_field_errors(ax)
+                        return {
+                            "screen_id": self.screen_id,
+                            "ok": not errs,
+                            "answered": auto_answer,
+                            "messages": [x["message"] for x in errs],
+                            "field_errors": errs,
+                            "raw_len": len(ax),
+                        }
+                    except ScreenError as e2:
+                        e = e2  # fall through to diagnostics with the post-answer fault
             # A fatal action (Save/Delete/AutoFill) faulted — the SOAP fault only
             # carries a generic "record raised at least one error". Re-run just the
             # field SETs (no actions, so nothing commits) and read the per-field
@@ -334,6 +421,69 @@ class ScreenClient:
             "field_errors": errors,
             "raw_len": len(xml),
         }
+
+    async def insert_rows(
+        self,
+        container: str,
+        rows: list[dict],
+        header: dict | None = None,
+        save: bool = True,
+        auto_answer: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Insert N grid/detail rows into `container` in one transaction.
+
+        header: field sets applied first (the parent/context, e.g. a document key)
+                — keys may be friendly or "Container.Field".
+        rows:   list of {field: value}; each becomes NewRow + the field SETs. Field
+                names are the schema's friendly names (qualify "Container.Field" if a
+                name repeats). One Save commits them all.
+
+        This is the master-detail / bulk-grid writer (e.g. Chart of Accounts rows,
+        subaccount segments). Returns the submit() result.
+        """
+        cmds: list[dict] = []
+        for k, v in (header or {}).items():
+            cmds.append({"set": k, "to": v})
+        for row in rows:
+            cmds.append({"new_row": container})
+            for k, v in row.items():
+                cmds.append({"set": k, "to": v})
+        if save:
+            cmds.append({"action": "Save"})
+        return await self.submit(cmds, dry_run=dry_run, auto_answer=auto_answer)
+
+    async def set_record(
+        self,
+        key_field: str,
+        key_value: str,
+        fields: dict,
+        insert: bool = False,
+        save: bool = True,
+        auto_answer: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Create or edit ONE record on a master-style screen.
+
+        insert=False (default): set the key field, which NAVIGATES to the existing
+            record (via its descriptor's LinkedCommand chain), then set `fields` and
+            Save — an in-place edit.
+        insert=True: click Insert first to start a fresh record, then set the key +
+            `fields` and Save — a create.
+
+        key_field/fields use friendly schema names (qualify "Container.Field" if a
+        name repeats). Returns the submit() result. For grid screens with many rows
+        per Save, use insert_rows instead.
+        """
+        cmds: list[dict] = []
+        if insert:
+            cmds.append({"action": "Insert"})
+        cmds.append({"set": key_field, "to": key_value})
+        for k, v in fields.items():
+            cmds.append({"set": k, "to": v})
+        if save:
+            cmds.append({"action": "Save"})
+        return await self.submit(cmds, dry_run=dry_run, auto_answer=auto_answer)
 
     @staticmethod
     def _parse_field_errors(xml: str) -> list[dict]:
