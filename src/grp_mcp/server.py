@@ -699,6 +699,48 @@ async def attach_file(
 
 
 @mcp.tool()
+async def attach_file_to_provider(
+    record_id: str,
+    file_path: str,
+    filename: str | None = None,
+    content_type: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Attach a source file to a Data Provider (SM206015) record — GET-free.
+
+    Use this instead of attach_file for Data Providers: the `DataProvider`
+    contract entity 500s on read-back (its `Link` field has a BQL delegate), so
+    the normal _links resolution fails. This builds the files:put URL by
+    template (.../files/PX.Api.SYProviderMaint/Providers/<id>/<file>) and PUTs
+    directly — no GET on the broken entity.
+
+    record_id: the provider's GUID, as returned by setup_data_provider's `id`
+               (also visible in the URL of its read-back error).
+    file_path: the .xlsx/.csv to upload (must be within the instance read_roots).
+    filename:  stored name (defaults to the file's basename).
+
+    Requires "allow_write": true. Returns the upload URL + byte count.
+    """
+    import mimetypes
+
+    _require_write(instance)
+    p = _check_read_path(file_path, instance)
+    name = filename or p.name
+    ctype = content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    client = _client(instance)
+    url = client.provider_files_put_url(record_id, name)
+    content = p.read_bytes()
+    await client.put_file(url, content, ctype)
+    return {
+        "attached": name,
+        "bytes": len(content),
+        "content_type": ctype,
+        "record_id": record_id,
+        "url": url,
+    }
+
+
+@mcp.tool()
 async def load_from_excel(
     entity: str,
     path: str,
@@ -849,13 +891,24 @@ async def setup_data_provider(
         "key_columns": sorted(keys),
         "file_uploaded": False,
     }
-    # 3) optionally upload the source file so an import run can read it
+    # 3) optionally upload the source file so an import run can read it.
+    #    Use the GET-free template URL: the DataProvider entity 500s on
+    #    read-back (Link field BQL delegate), so record_files_put_url would
+    #    fail to resolve _links. Don't let an upload hiccup mask a created
+    #    provider — surface it instead of raising.
     if upload_file and rid:
-        url = await client.record_files_put_url("DataProvider", rid, p.name)
-        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-        await client.put_file(url, p.read_bytes(), ctype)
-        out["file_uploaded"] = True
-        out["filename"] = p.name
+        try:
+            url = client.provider_files_put_url(rid, p.name)
+            ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+            await client.put_file(url, p.read_bytes(), ctype)
+            out["file_uploaded"] = True
+            out["filename"] = p.name
+        except Exception as e:
+            out["file_upload_error"] = str(e)[:300]
+            out["note"] = (
+                "Provider + schema created, but file upload failed. Retry with "
+                f"attach_file_to_provider(record_id='{rid}', file_path=...)."
+            )
     return out
 
 

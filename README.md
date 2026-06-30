@@ -45,6 +45,7 @@ base URL + OAuth credentials.
 | `load_from_excel` | Bulk upsert an entity from `.xlsx`/`.csv` with column mapping + dry-run. |
 | `setup_data_provider` | Create + fully configure a Data Provider (SM206015) from a data file (schema written directly from its header; optional file upload). |
 | `attach_file` | Upload a file and attach it to a record (`files:put`). |
+| `attach_file_to_provider` | Attach a source file to a Data Provider by id — GET-free (works around the `DataProvider` read-back 500). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |

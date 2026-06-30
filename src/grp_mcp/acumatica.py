@@ -492,6 +492,35 @@ class AcumaticaClient:
             )
         return link.replace("{filename}", filename)
 
+    def constructed_files_put_url(
+        self, graph: str, view: str, record_id: str, filename: str
+    ) -> str:
+        """Build a files:put URL WITHOUT reading the record first.
+
+        Some entities 500 on GET-by-id and can't resolve their _links — notably
+        `DataProvider`, whose `Link` field carries a BQL delegate (the server
+        raises CannotOptimize / NoEntitySatisfiesTheCondition on both get-by-id
+        and list). When the graph type + primary view are known, the files:put
+        path is deterministic and matches the server's own link template:
+            {entity_base}/files/<GraphType>/<View>/<id>/<filename>
+        (e.g. .../files/PX.Api.SYProviderMaint/Providers/<id>/<file>).
+        """
+        return (
+            f"{self.instance.entity_base}/files/"
+            f"{graph}/{view}/{record_id}/{filename}"
+        )
+
+    def provider_files_put_url(self, record_id: str, filename: str) -> str:
+        """files:put URL for a Data Provider (SM206015) record, GET-free.
+
+        The DataProvider contract entity 500s on read-back, so resolve its
+        upload URL by template instead. Graph = PX.Api.SYProviderMaint, the
+        file view = Providers.
+        """
+        return self.constructed_files_put_url(
+            "PX.Api.SYProviderMaint", "Providers", record_id, filename
+        )
+
     # ---- OData (Generic Inquiries) -------------------------------------
 
     async def run_gi(self, name: str, params: dict | None = None) -> Any:
