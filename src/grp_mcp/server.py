@@ -1027,9 +1027,10 @@ async def create_financial_calendar(
     saves — the prerequisite for the GL ledger.
 
     LIMITATION: the start date (FinancialYearStartsOn) can't be set via the API
-    (masked field; insert validation rejects it) — the calendar uses the screen's
-    DEFAULT start (≈ business date). For a specific 1-Jan start, set the date in
-    the GL101000 UI date-picker. Requires allow_write. Verify with
+    (insert validation rejects it) — the calendar uses the screen's DEFAULT start
+    (≈ business date). For a specific 1-Jan start, just TYPE the date into the
+    GL101000 "Financial Year Starts On" field in the UI (MONTH/DAY/YEAR; no picker
+    needed), then Create Periods + Save. Requires allow_write. Verify with
     screen_get('GL101000', ['Periods.PeriodNbr','Periods.StartDate']).
     """
     _require_write(instance)
