@@ -1,8 +1,21 @@
 # grp-mcp
 
-MCP server that exposes **Acumatica ERP** (contract-based REST API) as tools for
-AI agents. Multi-instance, OAuth2. Point it at any Acumatica site by giving it a
-base URL + OAuth credentials.
+MCP server that exposes **Acumatica ERP** as tools for AI agents. Multi-instance,
+OAuth2 — point it at any Acumatica site with a base URL + credentials.
+
+It reaches Acumatica through **three planes**, so an agent can read and write
+almost anything:
+
+- **Contract-based REST** — CRUD entities, bulk-load from Excel/CSV, invoke
+  actions, run reports, attach files, manage customization projects.
+- **DAC-based OData** — read tables/DACs that aren't on the endpoint, plus
+  mandatory-field metadata (`run_dac_odata`, `get_dac_metadata`).
+- **Screen-based SOAP engine** — *drive screens the REST API can't*: context /
+  master-detail / wizard screens (segment values, Enable Features, the financial
+  calendar…). Discover (`list_screens`, `screen_get_schema`), read (`screen_get`),
+  and write (`screen_submit`, with dry-run + per-field errors) any screen by
+  replaying its UI commands — no browser, no zeep. Ready-made setup recipes
+  (`create_financial_calendar`, `create_ledger`, `enable_features`) sit on top.
 
 ## Tools
 
