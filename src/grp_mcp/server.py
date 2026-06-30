@@ -1158,7 +1158,16 @@ async def create_segmented_key(
     numbering_id:    optional numbering sequence ID (required if any auto_number
                      segment; its length must match that segment's length).
 
-    Verify with run_dac_odata('Segment', filter="DimensionID eq '<key_id>'").
+    Verify creation against the MASTER table: run_dac_odata('Dimension',
+    filter="DimensionID eq '<key_id>'") — the CS202000 picker lists Dimension, not
+    Segment. (Segment/SegmentValue are the children.) Always pass >=1 segment; a key
+    with none fails "Segmented key must have at least one segment".
+
+    To DELETE a key later, tear down children-first (deleting the master alone
+    orphans the children, which then can't be removed via the API): delete the
+    segment values on CS203000, then the segments on CS202000 LAST-segment-first,
+    then delete_row the master + Save.
+
     Requires allow_write. Total of all segment lengths must not exceed the key max.
     """
     _require_write(instance)
