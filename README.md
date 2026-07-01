@@ -26,7 +26,11 @@ one confirmed platform gap), so an agent can read and write almost anything:
   grid keys — and `ui_screen_action` sets fields + fires actions (incl.
   dialog-confirm). This reaches what classic SOAP can't: actions whose classic
   tag is a silent no-op (e.g. GL201000 Generate Calendar), enum value discovery,
-  and live workflow-aware field/action state. Works on any Modern-UI screen.
+  live workflow-aware field/action state, and **full grid CRUD** — read, insert,
+  update, and delete an *existing* grid row (the classic engine can only append
+  rows; editing one in place silently corrupts data there — see below), on both
+  top-level grids and **master-detail** child grids under a header record. Works
+  on any Modern-UI screen.
 
 ## Tools
 
@@ -66,7 +70,7 @@ one confirmed platform gap), so an agent can read and write almost anything:
 
 | Tool | What it does |
 |------|--------------|
-| `create_or_update_entity` | Create/update a record (PUT, upsert by key). |
+| `create_or_update_entity` | Create/update a record (PUT, upsert by key). Auto-corrects a real Acumatica quirk: a successful write can echo a nested detail collection you just wrote as `[]`; when detected, this re-fetches the record with that field expanded and patches in the real values (a failed re-fetch surfaces as `_unverified_details` instead of a silent wrong `[]`). |
 | `load_from_excel` | Bulk upsert an entity from `.xlsx`/`.csv` with column mapping + dry-run. |
 | `setup_data_provider` | Create + fully configure a Data Provider (SM206015) from a data file (schema written directly from its header; optional file upload). |
 | `attach_file` | Upload a file and attach it to a record (`files:put`). |
@@ -78,7 +82,11 @@ one confirmed platform gap), so an agent can read and write almost anything:
 | `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
 | `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
 | `ui_get_structure` | Discover a screen via the **modern UI-screen API** (`/ui/screen/<ID>/structure`): views → fields (type, required, readonly, enabled, **enum allowed-values**), the live action inventory (enabled/visible/confirmation), and grid key fields. Richer than screen_get_schema; a live workflow-aware preflight. Read-only, any Modern-UI screen. |
-| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). |
+| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). FORM-view fields only — for a GRID cell, use the grid tools below. |
+| `ui_read_grid` | Read GRID rows via the **modern UI-screen plane** — the read peer of the grid CRUD below. Returns each row flattened to `{field: value}` + its `_rowId`, live per-cell state (enum options, readonly), and the grid's key fields. `parent` reads a CHILD grid under a header (master-detail). Read-only, no gate. |
+| `ui_insert_grid_row` | Append a NEW row to a GRID on the modern UI-screen plane (`changes.inserted`). `parent` targets a CHILD grid under a header — the parent-linkage id is auto-filled server-side, so `values` needs only the child's own fields. Requires allow_write. |
+| `ui_update_grid_row` | Edit ONE **existing** GRID row in place on the modern UI-screen plane (`changes.modified`) — the capability classic screen SOAP lacks (its positional row selector is inert, see Known limitations). Matched by key; `parent` targets a CHILD grid under a header. Requires allow_write. |
+| `ui_delete_grid_row` | Delete an existing GRID row (matched by key) on the modern UI-screen plane (`changes.deleted`). `parent` targets a CHILD grid under a header. **Requires allow_delete.** |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
@@ -220,14 +228,15 @@ tools are sandboxed:
   any other host is refused (prevents OAuth-token exfiltration / SSRF).
 - **Writes are opt-in.** Record mutations (`create_or_update_entity`,
   `load_from_excel`, `invoke_action`, `run_import_scenario`, `set_note`,
-  `attach_file`, `attach_file_to_provider`, `screen_submit`, `ui_screen_action`)
-  require `"allow_write": true`. **Deletes require the stricter
-  `"allow_delete": true` across ALL planes** — not just `delete_entity`, but also
-  a `screen_submit` `delete_row` **or record-level `Delete` action**,
-  `delete_segmented_key`, and a destructive `ui_screen_action` (e.g.
-  `action="Delete"`), so the screen/UI planes can't sidestep the delete gate.
-  Customization publish/import/unpublish require
-  `"allow_publish": true`. **Default is read-only.**
+  `attach_file`, `attach_file_to_provider`, `screen_submit`, `ui_screen_action`,
+  `ui_insert_grid_row`, `ui_update_grid_row`) require `"allow_write": true`.
+  **Deletes require the stricter `"allow_delete": true` across ALL planes** —
+  not just `delete_entity`, but also a `screen_submit` `delete_row` **or
+  record-level `Delete` action**, `delete_segmented_key`, a destructive
+  `ui_screen_action` (e.g. `action="Delete"`), and `ui_delete_grid_row`, so the
+  screen/UI planes can't sidestep the delete gate. Customization
+  publish/import/unpublish require `"allow_publish": true`. **Default is
+  read-only.**
 - **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
   `load_from_excel`) or write (`download_file`, `run_report`, `snapshot_entity`,
   `export_customization`) a local path enforce `read_roots` / `write_roots` (a path
@@ -489,7 +498,8 @@ Restart the client after adding — tools load at startup.
 ## Development
 
 Smoke tests (pure logic — config/gating model, the write/delete/publish gates, the value
-wrapper, the modern UI-screen error parser; no live instance needed):
+wrapper, the modern UI-screen error parser, and the grid CRUD payload shapes incl.
+master-detail; no live instance needed):
 
 ```bash
 pip install -e ".[dev]"
@@ -498,17 +508,22 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.20 — 64 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
-attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
-discovery), the **screen-based SOAP engine** (context/master-detail/wizard screens REST
-can't), and the **modern UI-screen plane** (`ui_get_structure` + `ui_screen_action` — the
-browser's own JSON protocol, for dialog actions classic SOAP can't reach, enum-value
-discovery, and live workflow-aware state). On top sit setup recipes — `enable_features` +
-`activate_features` (install/recompile), `create_financial_calendar` (incl. start date),
-`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts`,
-`generate_master_calendar` + `manage_financial_periods` (open/close/lock/reopen/deactivate)
-— plus import scenarios, the Customization Web API, and `setup_readiness`. **The GL
-foundation chain is fully grp-mcp-drivable end-to-end, no manual/UI steps.**
+v0.25 — 68 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
+quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
+SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen
+plane** (`ui_get_structure` + `ui_screen_action` for dialog actions classic SOAP can't reach,
+enum-value discovery, and live workflow-aware state — plus full **grid CRUD**,
+`ui_read_grid`/`ui_insert_grid_row`/`ui_update_grid_row`/`ui_delete_grid_row`, on top-level
+and master-detail grids). On top sit setup recipes — `enable_features` + `activate_features`
+(install/recompile), `create_financial_calendar` (incl. start date), `create_ledger`,
+`create_numbering_sequence`, `create_segmented_key` → `set_segment_value`,
+`chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
+(open/close/lock/reopen/deactivate) — plus import scenarios, the Customization Web API,
+`setup_readiness`, and `get_setup_guidance` (a baked-in foundation setup map: prereqs,
+required fields, gotchas, and plane-to-drive per screen). **The financial foundation chain —
+System→GL→CA→AP→AR→Tax — is fully grp-mcp-drivable end-to-end, no manual/UI steps**, proven
+live on a real instance.
 
 ### The modern UI-screen plane (`ui_get_structure` / `ui_screen_action`)
 
@@ -537,6 +552,46 @@ Earnings Account' cannot be empty"`). **Two rules baked in:** (1) load the views
 same session (separate graph state → 409). Works on any Modern-UI screen; an unconfigured
 module returns a clear "PREREQUISITE NOT MET" and an unlicensed module is access-denied.
 
+### Grid CRUD — editing an existing row (`ui_read_grid` / `ui_insert_grid_row` / `ui_update_grid_row` / `ui_delete_grid_row`)
+
+The classic screen-SOAP engine can **append** a detail row (`new_row`) but cannot
+**edit an existing one in place** — its positional row selector (`{"row": N}`,
+the `RowNumber` service command) does not move the grid cursor at all; a `set`
+after it silently lands on row 1. Proven live (GL202500 Chart of Accounts): a
+`{"row": 8}` + field `set` returned a clean ~335-byte "success" while actually
+overwriting row 1 — a silent **wrong-row write**, worse than a no-op. `{"row": ...}`
+now raises `ScreenError` instead of risking that.
+
+The fix is a genuine capability, not a workaround: the modern UI-screen plane
+addresses grid rows individually, reverse-engineered from a live browser capture
+of a cell-edit Save. One rule unifies all three write ops — **the row's key
+field(s) must be inside its `values`**, or the server misinterprets the request:
+
+| Op | `controlsParams.<grid>.changes` channel | Gotcha if the key is missing |
+|----|------------------------------------------|-------------------------------|
+| Update | `modified: [{id, index, values}]` | inserts a new blank row instead |
+| Insert | `inserted: [{id: <generated>, index, values}]` | — (no key to omit; but omitting a *required* column still fails validation) |
+| Delete | `deleted: [{id, index, values}]` | silently no-ops (clean 200, nothing removed) |
+
+The `columns` array and pager fields must also be echoed back in the request, or
+the Save returns a clean 200 that persists **nothing** — `ui_grid_read` (the
+`ScreenClient` method backing all four tools) handles this for you.
+
+**Master-detail.** A detail grid (e.g. CA202000's `ETDetails` entry types under a
+selected cash account) only populates once its header is loaded. Pass
+`parent={"view": "<PrimaryView>", "key": {keyField: value}}` and the tools
+navigate the master (set its key, `changeType:5`) and co-request the child grid
+in the *same* call, then keep the master loaded across the write. The
+parent-linkage id is auto-filled server-side on insert — `values` needs only the
+child's own fields. Proven end-to-end (insert → update → delete) on both a
+top-level grid (GL202500) and a master-detail child grid (CA202000 `ETDetails`
+under `CashAccount`).
+
+Payload shapes are locked by regression tests in `tests/test_smoke.py`
+(`test_insert_payload_has_key_columns_id_no_datakey`, `test_md_insert_navigates_master_and_scopes_viewsparams`,
+and siblings) — a refactor that breaks the key-in-values rule or drops the
+`columns` echo fails a test instead of shipping a silent no-op.
+
 ### Known limitations (by design / platform)
 
 - **Endpoint writes (SM207060)** are a stateful wizard — extend entities via the UI /
@@ -550,15 +605,34 @@ module returns a clear "PREREQUISITE NOT MET" and an unlicensed module is access
   itself is *not* API-gated: it opens its dialog via the modern `/ui/screen/` plane just
   like Generate Calendar — so it's drivable if ever needed, but gated behind the
   instance-locking maintenance step by design.)
-- A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
+- A list GET (no `record_id`) can't return nested detail collections (Acumatica REST) —
+  and a successful *write* can echo one back as `[]` too; `create_or_update_entity`
+  auto-corrects the write case (see above), but a list `get_entity` still needs a
+  keyed re-fetch with `expand=...`.
+- **Editing an existing classic-SOAP grid row by position is not supported** —
+  `screen_submit`'s `RowNumber` selector doesn't move the grid cursor (proven: it
+  silently wrote to row 1 instead of the targeted row). Use `ui_update_grid_row`
+  (modern plane, addressed by key) instead; `new_row` still works for appending.
+- A detail row's `id` in `create_or_update_entity`/`get_entity` responses is **not
+  stable across separate requests** (two consecutive fetches of the same record
+  returned different ids for matching rows) — it does remain valid for an action
+  issued immediately after the fetch that produced it. Fetch, then act right away;
+  never cache a detail id across a later call.
+- Detail collections in `create_or_update_entity` always **append**, never
+  upsert-by-content — resending identical nested data creates a duplicate row
+  every time. Pass the row's own `id` to target an existing one for update/delete.
 
 (Resolved in v0.19: **combo/dropdown allowed-values** — the classic typed SOAP schema
 doesn't expose them, but `ui_get_structure` returns each enum field's `options:[{value,text}]`
-from the modern `/structure` endpoint.)
+from the modern `/structure` endpoint. Resolved in v0.21–0.24: **grid-row CRUD** —
+`ui_read_grid`/`ui_insert_grid_row`/`ui_update_grid_row`/`ui_delete_grid_row` over the
+modern plane's row identity, top-level and master-detail.)
 
-Roadmap: GL phase fully closed; the modern UI-screen plane makes new dialog/config screens
-self-service (read `ui_get_structure`, drive `ui_screen_action`). Next: the remaining
-foundation modules — numbering sequences (CS201010), branches (CS102000), tax, AP/AR/CA
-preferences — each KB-first + verify. Also: nested detail rows in `load_from_excel`, and a
-grid-row editor over the modern plane's row identity.
+Roadmap: GL phase fully closed; foundation build now covers System→GL→CA→AP→AR→Tax (Currency
+is instance-conditional — skip on a single-currency site). The modern UI-screen plane makes
+new dialog/config screens self-service (read `ui_get_structure`, drive `ui_screen_action`),
+and grid rows are now fully CRUD-able on both planes (append via `screen_submit`, everything
+else via the `ui_*_grid_row` tools). Next: nested detail rows in `load_from_excel`; grid CRUD
+on line-number-keyed transactional document grids (invoice/bill lines) is unproven beyond the
+master-detail case already verified (CA202000 entry types).
 

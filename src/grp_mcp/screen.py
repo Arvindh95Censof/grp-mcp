@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from html import escape, unescape
 from typing import Any
@@ -348,6 +349,180 @@ class ScreenClient:
             raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
         return resp.json()
 
+    # ---- modern-plane GRID editing (existing-row update) ----------------
+    #
+    # Editing an EXISTING grid row is NOT possible on the classic screen-SOAP
+    # plane (RowNumber doesn't move the cursor — see _spec_to_command). The
+    # modern UI does it through controlsParams.<grid>.changes.modified[], which
+    # the browser was captured sending (2026-07-01, GL202500). The row is
+    # matched server-side by the KEY field(s) included in `values` — omit the key
+    # and the server treats it as an INSERT of a blank row ("<field> cannot be
+    # empty"). The `columns` list + pager fields must be echoed back or the Save
+    # returns a clean 200 that persists NOTHING (proven: minimal payload no-ops).
+
+    async def ui_grid_read(self, grid_view: str, parent: dict | None = None) -> dict:
+        """Fresh grid read via the modern plane (clearSession → live DB rows).
+
+        Returns {columns, rows, key_names, quick_filter_fields}. `rows` items are
+        {id, cells:{Field:{value,...}}}. clearSession forces a DB reload so stale
+        graph-session state isn't returned.
+
+        parent (MASTER-DETAIL): {"view": <primaryView>, "key": {keyField: value}}.
+        A detail grid only populates under its selected header, so when `parent` is
+        given the master is navigated first (its key set on the primary view via a
+        changeType:5 field-set) and the CHILD grid is co-requested in the SAME graph
+        state. The master stays current on this session, so a following grid write
+        targets it (and the child's parent-link id is auto-filled server-side).
+        parent=None → a top-level grid. (Proven: CA202000 CashAccount→ETDetails.)
+        """
+        if parent:
+            pv = parent["view"]
+            await self._http.post(self.ui_url, json={
+                "isFirstRequest": True, "data": [], "controlsParams": {},
+                "activeRowContexts": [], "viewsParams": {pv: {}}, "clearSession": True,
+            }, headers=_UI_HEADERS)
+            (pf, pval), = parent["key"].items()
+            resp = await self._http.post(self.ui_url, json={
+                "data": [{"viewName": pv, "fieldName": pf, "value": str(pval),
+                          "rowId": "", "changeType": 5}],
+                "controlsParams": {}, "activeRowContexts": [],
+                "viewsParams": {pv: {}, grid_view: {}},
+            }, headers=_UI_HEADERS)
+        else:
+            resp = await self._http.post(self.ui_url, json={
+                "isFirstRequest": True, "data": [], "controlsParams": {},
+                "activeRowContexts": [], "viewsParams": {grid_view: {}}, "clearSession": True,
+            }, headers=_UI_HEADERS)
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_grid_read {grid_view} on {self.screen_id}: {err}")
+        cd = ((resp.json().get("controlsData") or {}).get(grid_view)) or {}
+        self._ui_booted, self._classic_used = True, False
+        return {"columns": cd.get("columns"), "rows": cd.get("rows") or [],
+                "key_names": cd.get("dataKeyNames") or [],
+                "quick_filter_fields": cd.get("quickFilterFields") or []}
+
+    @staticmethod
+    def _cell_val(row: dict, field: str):
+        return (row.get("cells") or {}).get(field, {}).get("value")
+
+    @classmethod
+    def _cell_key(cls, row: dict, field: str):
+        """Raw key value of a cell — a lookup/selector cell holds {id,text}; use id."""
+        v = cls._cell_val(row, field)
+        return v.get("id") if isinstance(v, dict) else v
+
+    @staticmethod
+    def _kv(d: dict) -> list:
+        """{field: value} -> [{"field","value"}] (bools kept, everything else str)."""
+        return [{"field": k, "value": (v if isinstance(v, bool) else str(v))}
+                for k, v in d.items()]
+
+    def _locate_row(self, rows: list, key: dict):
+        """(index, row) of the row whose key cells match every key field, else (None, None)."""
+        for i, row in enumerate(rows):
+            if all(str(self._cell_key(row, k) or "").strip() == str(v).strip()
+                   for k, v in key.items()):
+                return i, row
+        return None, None
+
+    def _full_key(self, row: dict, key_names: list) -> dict:
+        """The row's COMPLETE key from its cells — incl. the parent-linkage id for a
+        detail row (e.g. {CashAccountID: 994, EntryTypeID: 'BANKCHG'}). Falls back to
+        empty if the grid exposes no dataKeyNames."""
+        return {kn: self._cell_key(row, kn) for kn in (key_names or [])}
+
+    def _grid_ctrl(self, grid_view: str, g: dict, changes: dict, key: dict | None) -> dict:
+        """controlsParams.<grid> block for a Save. The columns + pager fields MUST be
+        echoed or the Save persists nothing (a minimal payload returns a clean 200
+        no-op — proven)."""
+        ctrl = {
+            "view": grid_view, "columns": g["columns"],
+            "generateColumns": 0, "retrieveMode": 0, "pagerMode": 1, "startRow": 0,
+            "pageIndex": 0, "pageSize": max(len(g["rows"]) + 1, 1),
+            "preserveSortsAndFilters": True, "syncPosition": True,
+            "refreshFilters": False, "suppressStoredFilters": False,
+            "fastFilterByAllFields": True, "fastFilter": "",
+            "filterID": "00000000-0000-0000-0000-000000000000",
+            "quickFilterFields": g["quick_filter_fields"],
+            "changes": changes, "isRequestOwner": False, "resultType": "GridData",
+        }
+        if key is not None:
+            ctrl["dataKey"] = key
+        return ctrl
+
+    async def _grid_save(self, grid_view: str, g: dict, changes: dict,
+                          dataKey: dict | None, op: str, parent: dict | None = None) -> dict:
+        """POST a grid Save (changes = {modified|inserted|deleted: [...]}) and raise on error.
+
+        dataKey present (update/delete) → sent as the ctrl dataKey (+ an
+        activeRowContexts entry for a top-level grid); None (insert) → no dataKey.
+        parent (master-detail) → the master view is re-listed in viewsParams so the
+        Save keeps the header context; activeRowContexts stays empty (the loaded
+        master, not a row-context, anchors the child)."""
+        ctrl = self._grid_ctrl(grid_view, g, changes, dataKey)
+        views = {grid_view: {}}
+        if parent:
+            views[parent["view"]] = {}
+        payload = {
+            "command": [{"name": "Save"}], "data": [],
+            "controlsParams": {grid_view: ctrl},
+            "activeRowContexts": ([{"dataView": grid_view, "syncPosition": True,
+                                     "dataKey": dataKey, "resultType": "GridActiveDataRow"}]
+                                   if (dataKey is not None and not parent) else []),
+            "viewsParams": views,
+        }
+        resp = await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"{op} {grid_view}{dataKey or ''} on {self.screen_id}: {err}")
+        return resp.json()
+
+    async def ui_update_grid_row(self, grid_view: str, key: dict, values: dict,
+                                 parent: dict | None = None) -> dict:
+        """Update ONE existing grid row in place, matched by its key field(s).
+
+        key:    {keyField: value} — the child-identifying key (for a detail grid the
+                parent-linkage id is resolved from the row automatically).
+        values: {field: newValue} cells to change. The full key is re-sent in the
+                row's `values` so the server UPDATES (not inserts). Idempotent.
+        parent: {"view", "key"} to target a detail grid under a header (see
+                ui_grid_read). None = top-level grid.
+        """
+        g = await self.ui_grid_read(grid_view, parent)
+        idx, row = self._locate_row(g["rows"], key)
+        if row is None:
+            raise ScreenError(f"ui_update_grid_row: no row in {grid_view} matches key {key}")
+        full = self._full_key(row, g["key_names"]) or key
+        change = {"id": row.get("id"), "index": idx, "values": self._kv(full) + self._kv(values)}
+        return await self._grid_save(grid_view, g, {"modified": [change]}, full,
+                                     "ui_update_grid_row", parent)
+
+    async def ui_insert_grid_row(self, grid_view: str, values: dict,
+                                 parent: dict | None = None) -> dict:
+        """Append a NEW grid row. `values` MUST include the grid's key field(s) plus
+        any other required columns (e.g. GL202500 needs AccountCD + Type + Description).
+        For a detail grid (parent set) the parent-linkage id is auto-filled server-side,
+        so `values` needs only the child fields. A client rowId is generated."""
+        g = await self.ui_grid_read(grid_view, parent)
+        change = {"id": str(uuid.uuid4()), "index": len(g["rows"]), "values": self._kv(values)}
+        return await self._grid_save(grid_view, g, {"inserted": [change]}, None,
+                                     "ui_insert_grid_row", parent)
+
+    async def ui_delete_grid_row(self, grid_view: str, key: dict,
+                                 parent: dict | None = None) -> dict:
+        """Delete an existing grid row matched by its key field(s). The full key (incl.
+        the parent-linkage id for a detail row) is sent inside the deleted row's
+        `values` — required, else the delete no-ops. parent targets a detail grid."""
+        g = await self.ui_grid_read(grid_view, parent)
+        idx, row = self._locate_row(g["rows"], key)
+        if row is None:
+            raise ScreenError(f"ui_delete_grid_row: no row in {grid_view} matches key {key}")
+        full = self._full_key(row, g["key_names"]) or key
+        change = {"id": row.get("id"), "index": idx, "values": self._kv(full)}
+        return await self._grid_save(grid_view, g, {"deleted": [change]}, full,
+                                     "ui_delete_grid_row", parent)
+
     async def __aenter__(self) -> "ScreenClient":
         await self.login()
         return self
@@ -524,10 +699,22 @@ class ScreenClient:
         if "action" in c:
             return self._wrap(self._find_field(c["action"]), "Action", None)
         if "row" in c:
-            # select the Nth (1-based) row of a grid container so a following
-            # set/delete_row targets THAT row — without it, delete_row/sets hit the
-            # current (usually first) row. Uses the RowNumber service command.
-            return self._wrap(self._service(c["row"], "RowNumber"), "RowNumber", c.get("to"))
+            # DISABLED (2026-07-01): the RowNumber service command does NOT position
+            # the grid cursor on this API — proven end-to-end on GL202500: a
+            # {"row":8} followed by a set silently edited row 1 (10100), returning a
+            # clean 335-byte "success" with no error. That is a silent WRONG-ROW
+            # write (data corruption footgun), so we refuse it rather than pretend to
+            # target a row. To edit an EXISTING grid row: (a) if the row is
+            # key-navigable, set its key on a master screen (set_record); (b) for
+            # pure detail grids, use the modern UI-screen plane (rowId-addressed) —
+            # tracked separately. Appending rows (new_row) is unaffected and works.
+            raise ScreenError(
+                "positional row selection ({\"row\": N}) is unsupported: the "
+                "screen-SOAP RowNumber command does not move the grid cursor, so a "
+                "following set/delete would silently hit row 1 (wrong-row write). "
+                "Edit an existing grid row via ui_update_grid_row (modern plane, "
+                "addressed by key); use new_row only to APPEND."
+            )
         if "new_row" in c:
             return self._wrap(self._service(c["new_row"], "NewRow"), "NewRow", None)
         if "delete_row" in c:

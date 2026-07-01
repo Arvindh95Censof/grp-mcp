@@ -690,9 +690,45 @@ async def create_or_update_entity(
                           "Details": [{"InventoryID": "ITEM1", "OrderQty": 2}]}.
 
     Requires the instance's "allow_write": true (default is read-only).
+
+    Detail-collection echo quirk (auto-corrected): Acumatica's PUT response
+    echoes a nested detail collection you just wrote as `[]` even when it
+    persisted correctly (proven on TaxReportingSettings.ReportingGroups,
+    Tax.TaxSchedule, TaxCategory.Details, TaxZone.ApplicableTaxes — all `[]` on
+    write, all present on read-back). When that happens here, this tool
+    automatically re-fetches the record by id with those fields expanded and
+    patches the real values into the result — so what you get back is always
+    the true persisted state, not a misleading empty array. If that re-fetch
+    itself fails (rare), the suspect keys are still `[]` but the result carries
+    an `_unverified_details` list naming them — verify those manually with
+    get_entity(..., expand=...) before trusting them.
     """
     _require_write(instance)
-    return await _client(instance).put_entity(entity, _wrap_fields(fields))
+    client = _client(instance)
+    result = await client.put_entity(entity, _wrap_fields(fields))
+    if isinstance(result, dict):
+        empty_details = [
+            k for k, v in fields.items()
+            if isinstance(v, list) and v
+            and isinstance(result.get(k), list) and not result[k]
+        ]
+        record_id = result.get("id")
+        if empty_details and record_id:
+            try:
+                fresh = await client.get_entity(
+                    entity, record_id, {"$expand": ",".join(empty_details)}
+                )
+                still_empty = []
+                for k in empty_details:
+                    if isinstance(fresh, dict) and fresh.get(k):
+                        result[k] = fresh[k]
+                    else:
+                        still_empty.append(k)
+                if still_empty:
+                    result["_unverified_details"] = still_empty
+            except Exception:
+                result["_unverified_details"] = empty_details
+    return result
 
 
 @mcp.tool()
@@ -890,8 +926,9 @@ async def ui_screen_action(
             if (f["view"], f["field"]) in grid_cols:
                 raise ScreenError(
                     f"ui_screen_action: {f['view']}.{f['field']} is a GRID column; "
-                    f"grid-cell editing isn't supported yet (no per-row addressing). "
-                    f"Use screen_submit for detail-row writes."
+                    f"this tool sets FORM-view fields only. To EDIT an existing grid "
+                    f"row use ui_update_grid_row (per-row addressing by key); to APPEND "
+                    f"a row use screen_submit new_row."
                 )
             avail = sorted(x["field"] for x in struct["views"].get(f["view"], []))
             raise ScreenError(
@@ -910,6 +947,170 @@ async def ui_screen_action(
         result = await s.ui_command(action)
     return {"screen_id": screen_id.upper(), "action": action,
             "set_fields": set_fields or [], "ok": True, "raw": result}
+
+
+@mcp.tool()
+async def ui_read_grid(
+    screen_id: str,
+    grid_view: str,
+    fields: list[str] | None = None,
+    top: int | None = None,
+    parent: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Read GRID rows via the MODERN UI-screen plane (the read peer of the grid CRUD).
+
+    Reads fresh from the DB (clearSession) and returns each row flattened to
+    {field: value} plus its `_rowId`. Unlike screen_get (classic Export) /
+    run_dac_odata (raw DB), this reflects the LIVE grid — the same rows/cells the
+    modern write tools see.
+
+    grid_view: the grid container/view (from ui_get_structure `grids`, e.g.
+        "AccountRecords" on GL202500).
+    fields:    optional list of columns to return (default: all bound cells).
+    top:       optional row cap.
+    parent:    MASTER-DETAIL — {"view": <primaryView>, "key": {keyField: value}} to
+        read a CHILD grid under a header record (e.g. CA202000 entry-type details of
+        one cash account: parent={"view":"CashAccount","key":{"CashAccountCD":"10200"}},
+        grid_view="ETDetails"). Omit for a top-level grid.
+
+    Returns {grid_view, key_names, columns, row_count, rows:[{...cells, _rowId}]}.
+    Read-only (no gate).
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        g = await s.ui_grid_read(grid_view, parent)
+    col_fields = [c.get("field") for c in (g["columns"] or []) if isinstance(c, dict) and c.get("field")]
+    out = []
+    for r in g["rows"]:
+        cells = r.get("cells") or {}
+        if fields:
+            row = {f: cells.get(f, {}).get("value") for f in fields}
+        else:
+            row = {f: c.get("value") for f, c in cells.items()
+                   if isinstance(c, dict) and "value" in c}
+        row["_rowId"] = r.get("id")
+        out.append(row)
+        if top and len(out) >= top:
+            break
+    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
+            "key_names": g["key_names"], "columns": col_fields,
+            "row_count": len(out), "rows": out}
+
+
+@mcp.tool()
+async def ui_update_grid_row(
+    screen_id: str,
+    grid_view: str,
+    key: dict,
+    values: dict,
+    parent: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Edit ONE existing GRID row in place, on the MODERN UI-screen plane.
+
+    The capability the classic screen SOAP engine lacks: change a cell of an
+    EXISTING detail/grid row. (Classic positional selection is inert — a {"row":N}
+    there silently hits row 1, so it now hard-errors.) This drives the modern
+    plane's `controlsParams.<grid>.changes.modified` channel, reverse-engineered
+    from a live browser capture (GL202500, 2026-07-01). No browser, same session.
+
+    grid_view: the grid container/view (from ui_get_structure `grids`, e.g.
+        "AccountRecords" on GL202500 Chart of Accounts).
+    key:    {keyField: value} identifying the row — MUST be the grid's live key
+        (ui_get_structure grids[...].key_fields), e.g. {"AccountCD": "40000"}. The
+        server matches the existing row by this key (that's why it updates instead
+        of inserting a blank row).
+    values: {field: newValue} cells to change; booleans as true/false.
+    parent: MASTER-DETAIL — {"view", "key"} to target a CHILD grid under a header
+        record (see ui_read_grid). For a detail grid pass only the child key; the
+        parent-linkage id is resolved automatically. Omit for a top-level grid.
+
+    Reads the grid fresh (clearSession → live DB) to resolve the row's id+index,
+    then Saves. Idempotent. Requires allow_write. Verify with run_dac_odata /
+    screen_get. To APPEND a new row use ui_insert_grid_row; for FORM-view (non-
+    grid) field edits use ui_screen_action.
+
+    Example — rename a GL account's description:
+        ui_update_grid_row("GL202500", "AccountRecords",
+            key={"AccountCD": "40000"}, values={"Description": "Sales Revenue"})
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        await s.ui_update_grid_row(grid_view, key, values, parent)
+    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
+            "key": key, "values": values, "parent": parent, "ok": True}
+
+
+@mcp.tool()
+async def ui_insert_grid_row(
+    screen_id: str,
+    grid_view: str,
+    values: dict,
+    parent: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Append a NEW row to a GRID on the MODERN UI-screen plane.
+
+    Drives the modern plane's `controlsParams.<grid>.changes.inserted` channel
+    (reverse-engineered live on GL202500). A client rowId is generated for you.
+
+    grid_view: the grid container/view (from ui_get_structure `grids`).
+    values:    {field: value} for the new row — MUST include the grid's KEY
+        field(s) plus any other REQUIRED columns, or the Save fails validation
+        (e.g. GL202500 needs AccountCD + Type + Description). Enum fields take the
+        stored code (Type "E"=Expense); booleans as true/false.
+    parent:    MASTER-DETAIL — {"view", "key"} to append into a CHILD grid under a
+        header (see ui_read_grid). The parent-linkage id is auto-filled server-side,
+        so `values` needs only the child fields. Omit for a top-level grid.
+
+    Requires allow_write. Verify with run_dac_odata / screen_get.
+
+    Examples:
+        ui_insert_grid_row("GL202500", "AccountRecords",
+            values={"AccountCD": "40100", "Type": "I", "Description": "Service Revenue"})
+        ui_insert_grid_row("CA202000", "ETDetails", values={"EntryTypeID": "BANKCHG"},
+            parent={"view": "CashAccount", "key": {"CashAccountCD": "10200"}})
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        await s.ui_insert_grid_row(grid_view, values, parent)
+    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
+            "values": values, "parent": parent, "ok": True}
+
+
+@mcp.tool()
+async def ui_delete_grid_row(
+    screen_id: str,
+    grid_view: str,
+    key: dict,
+    parent: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Delete an existing GRID row (matched by key) on the MODERN UI-screen plane.
+
+    Drives `controlsParams.<grid>.changes.deleted` (the full key is sent inside the
+    row's values — required, else the delete silently no-ops). Reads the grid
+    fresh to resolve the row, then Saves.
+
+    grid_view: the grid container/view (from ui_get_structure `grids`).
+    key:       {keyField: value} identifying the row, e.g. {"AccountCD": "40100"}
+        (for a detail grid pass only the child key; the parent id is resolved).
+    parent:    MASTER-DETAIL — {"view", "key"} to delete from a CHILD grid under a
+        header (see ui_read_grid). Omit for a top-level grid.
+
+    DESTRUCTIVE — requires allow_delete (stricter than allow_write). Some rows
+    can't be deleted once referenced (e.g. a posted GL account) — the screen's own
+    validation surfaces as a clear error. Verify with run_dac_odata.
+    """
+    _require_delete(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        await s.ui_delete_grid_row(grid_view, key, parent)
+    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
+            "key": key, "parent": parent, "ok": True}
 
 
 @mcp.tool()
