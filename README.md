@@ -163,7 +163,12 @@ saved secrets never leave the machine.
 Prefer a page over JSON/tools? Run the bundled config UI:
 
 ```bash
-grp-mcp-ui            # or: python -m grp_mcp.ui
+grp-mcp-ui                        # venv install
+uvx --from grp-mcp grp-mcp-ui     # uvx (note --from: this script's name differs
+                                   # from the package name, so the bare `uvx
+                                   # grp-mcp-ui` form resolves it as its own
+                                   # (nonexistent) package and fails)
+python -m grp_mcp.ui              # either install method
 # -> http://127.0.0.1:8765
 ```
 
@@ -424,15 +429,29 @@ In Acumatica: **Integration → Connected Applications**. Create one with the
 
 ### 2. Install
 
+**Option A — `uvx` (recommended, no persistent install).** [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+runs a PyPI package straight from its cache, installing on first use and reusing
+that cache after (no venv to manage, no separate upgrade step — it always
+resolves the latest version unless you pin one):
+
 ```bash
+uvx grp-mcp          # first run installs (~5-10s); every run after is ~1s
+```
+
+If `uv` isn't installed yet: `pip install uv`, or see the link above. This is
+what the `claude mcp add` command below uses. (The bundled config UI's script
+has a different name than the package — see [Config UI](#config-ui-localhost)
+for its `uvx --from` form.)
+
+**Option B — a dedicated venv (classic, most explicit):**
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate      # macOS/Linux: source .venv/bin/activate
 pip install grp-mcp
 ```
 
-To upgrade later:
-
-```bash
-pip install --upgrade grp-mcp
-```
+To upgrade later: `pip install --upgrade grp-mcp`.
 
 ### 3. Configure (pick one)
 
@@ -452,6 +471,12 @@ works best with a launcher that sets `cwd` (see below).
 Recommended for distribution because you can point at it with an absolute path
 that does not depend on the launch directory.
 
+**Installed from PyPI (`uvx`/`pip install`, no git clone)?** Neither example file
+ships in the package — only the `grp_mcp` Python package itself does. Use the
+bundled [Config UI](#config-ui-localhost) instead (`uvx --from grp-mcp grp-mcp-ui`
+or `grp-mcp-ui` in a venv install): it creates `connections.json` for you from a
+blank state, no template file or hand-written JSON needed.
+
 Both `.env` and `connections.json` are gitignored — never commit real credentials.
 
 ### 4. Register with Claude
@@ -460,6 +485,12 @@ Both `.env` and `connections.json` are gitignored — never commit real credenti
 absolute `connections.json` so launch directory does not matter:
 
 ```bash
+# Option A (uvx) — no prior install needed, uvx fetches it on first launch:
+claude mcp add grp-mcp -s user \
+  -e GRP_MCP_CONNECTIONS=/abs/path/to/connections.json \
+  -- uvx grp-mcp
+
+# Option B (venv) — point at the venv's installed script:
 claude mcp add grp-mcp -s user \
   -e GRP_MCP_CONNECTIONS=/abs/path/to/connections.json \
   -- /abs/path/to/.venv/Scripts/grp-mcp.exe        # use grp-mcp on macOS/Linux
@@ -471,16 +502,16 @@ claude mcp add grp-mcp -s user \
 {
   "mcpServers": {
     "grp-mcp": {
-      "command": "grp-mcp",
-      "cwd": "C:\\path\\to\\grp-mcp",
-      "env": { "GRP_MCP_CONNECTIONS": "C:\\path\\to\\grp-mcp\\connections.json" }
+      "command": "uvx",
+      "args": ["grp-mcp"],
+      "env": { "GRP_MCP_CONNECTIONS": "C:\\path\\to\\connections.json" }
     }
   }
 }
 ```
 
-(`cwd` lets `.env` load; the `env` line makes `connections.json` work regardless.
-Use one config method — you don't need both files.)
+(Using a venv install instead: set `"command"` to the venv's `grp-mcp`/`grp-mcp.exe`
+path and drop `args`; `cwd` also lets a same-directory `.env` load.)
 
 Restart the client after adding — tools load at startup.
 
