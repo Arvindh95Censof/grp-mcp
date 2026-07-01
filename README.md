@@ -3,8 +3,8 @@
 MCP server that exposes **Acumatica ERP** as tools for AI agents. Multi-instance,
 OAuth2 — point it at any Acumatica site with a base URL + credentials.
 
-It reaches Acumatica through **three client planes** (plus a narrow fourth for
-one confirmed platform gap), so an agent can read and write almost anything:
+It reaches Acumatica through **four client planes**, so an agent can read and
+write almost anything:
 
 - **Contract-based REST** — CRUD entities, bulk-load from Excel/CSV, invoke
   actions, run reports, attach files, manage customization projects.
@@ -177,13 +177,12 @@ set-active / remove / test** profiles, writing the same connections.json. **Firs
 needs no config file** — on a fresh machine the page opens with an empty list; add your
 first profile in the browser and it creates connections.json for you (no JSON editing).
 It binds to `127.0.0.1` only (it edits credentials) and **never sends secrets to the
-browser** —
-the profile list only reports whether a secret/password is set. Leave the secret and
-password blank when editing to keep the existing values. Because the MCP server reads
-config at startup. To apply add/active changes to the live connector **without a
+browser** — the profile list only reports whether a secret/password is set. Leave the secret and
+password blank when editing to keep the existing values. The MCP server reads config
+only at startup, so to apply add/active changes to the live connector **without a
 restart**, run the `reload_config` tool in Claude (it re-reads connections.json and
-frees old sessions). Restarting the MCP also works. (Test works immediately — it opens
-its own session.)
+frees old sessions) — or just restart the MCP. (Test works immediately — it opens its
+own session.)
 
 The header shows a build marker (e.g. `build 2`); if you don't see it after editing,
 you're on a cached page or an old server process. Responses send `Cache-Control:
@@ -299,8 +298,10 @@ screen/entity and the specific action — read its prerequisites, dependent scre
 required fields, validation rules, and ordering constraints, then verify each
 prerequisite exists in the instance before writing. Pure reads are exempt.
 
-This is stated in the server's MCP `instructions` (so any client is told to do it) and
-echoed as a `PRECONDITION` on the write tools. It exists because Acumatica screens have
+This is stated in the server's MCP `instructions` (so any client is told to do it, and
+sees every write tool named explicitly) — the two trickiest to get wrong,
+`screen_submit` and `ui_screen_action`, also carry an explicit `PRECONDITION` note in
+their own docstring. It exists because Acumatica screens have
 hard dependencies the screen won't surface until a write fails with a generic, misleading
 error — e.g. *Segment Values* (CS203000) requires the key to exist on *Segment Keys*
 (CS202000) with a `Validate=ON` segment, and a segmented key must be torn down
@@ -633,37 +634,18 @@ and siblings) — a refactor that breaks the key-in-values rule or drops the
   stops on multi-segment (KB-confirmed; structural change = "contact support").
 - **Tenant snapshot (SM203520)** requires **maintenance mode** (which locks the instance) —
   a deliberate maintenance-window operation, left manual for safety. (The create action
-  itself is *not* API-gated: it opens its dialog via the modern `/ui/screen/` plane just
-  like Generate Calendar — so it's drivable if ever needed, but gated behind the
-  instance-locking maintenance step by design.)
-- A list GET (no `record_id`) can't return nested detail collections (Acumatica REST) —
-  and a successful *write* can echo one back as `[]` too; `create_or_update_entity`
-  auto-corrects the write case (see above), but a list `get_entity` still needs a
-  keyed re-fetch with `expand=...`.
-- **Editing an existing classic-SOAP grid row by position is not supported** —
-  `screen_submit`'s `RowNumber` selector doesn't move the grid cursor (proven: it
-  silently wrote to row 1 instead of the targeted row). Use `ui_update_grid_row`
-  (modern plane, addressed by key) instead; `new_row` still works for appending.
-- A detail row's `id` in `create_or_update_entity`/`get_entity` responses is **not
-  stable across separate requests** (two consecutive fetches of the same record
-  returned different ids for matching rows) — it does remain valid for an action
-  issued immediately after the fetch that produced it. Fetch, then act right away;
-  never cache a detail id across a later call.
-- Detail collections in `create_or_update_entity` always **append**, never
-  upsert-by-content — resending identical nested data creates a duplicate row
-  every time. Pass the row's own `id` to target an existing one for update/delete.
+  itself is drivable via the modern `/ui/screen/` plane, like Generate Calendar, but is
+  gated behind the instance-locking maintenance step by design.)
+- **A classic-SOAP grid row can't be edited by position** — see **Grid CRUD** above.
+  `screen_submit`'s `{"row": N}` selector doesn't move the grid cursor and now raises
+  an error rather than risk a wrong-row write; use `ui_update_grid_row` instead.
+- **A list GET can't return nested detail collections** — see **Detail-field guard**
+  above. `create_or_update_entity` handles the parallel write-side case automatically
+  (see its Write-table entry), which also documents two related gotchas on nested
+  detail arrays: they always **append** rather than upsert-by-content, and a row's
+  `id` is **not stable** across separate requests.
 
-(Resolved in v0.19: **combo/dropdown allowed-values** — the classic typed SOAP schema
-doesn't expose them, but `ui_get_structure` returns each enum field's `options:[{value,text}]`
-from the modern `/structure` endpoint. Resolved in v0.21–0.24: **grid-row CRUD** —
-`ui_read_grid`/`ui_insert_grid_row`/`ui_update_grid_row`/`ui_delete_grid_row` over the
-modern plane's row identity, top-level and master-detail.)
-
-Roadmap: GL phase fully closed; foundation build now covers System→GL→CA→AP→AR→Tax (Currency
-is instance-conditional — skip on a single-currency site). The modern UI-screen plane makes
-new dialog/config screens self-service (read `ui_get_structure`, drive `ui_screen_action`),
-and grid rows are now fully CRUD-able on both planes (append via `screen_submit`, everything
-else via the `ui_*_grid_row` tools). Next: nested detail rows in `load_from_excel`; grid CRUD
-on line-number-keyed transactional document grids (invoice/bill lines) is unproven beyond the
-master-detail case already verified (CA202000 entry types).
+Roadmap: nested detail rows in `load_from_excel`; grid CRUD on line-number-keyed
+transactional document grids (invoice/bill lines) is unproven beyond the master-detail
+case already verified (CA202000 entry types).
 
