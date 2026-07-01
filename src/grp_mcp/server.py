@@ -27,8 +27,9 @@ _KB_FIRST_POLICY = (
     "create_or_update_entity, delete_entity, load_from_excel, invoke_action, "
     "attach_file, set_note, screen_submit, screen_insert_rows, screen_record, "
     "set_segment_value, create_segmented_key, create_ledger, chart_of_accounts, "
-    "create_financial_calendar, enable_features, run_import_scenario, or any other "
-    "write — FIRST consult the Acumatica knowledge base (the kb-mcp server: "
+    "create_financial_calendar, enable_features, run_import_scenario, "
+    "ui_screen_action, ui_insert_grid_row, ui_update_grid_row, ui_delete_grid_row, "
+    "or any other write — FIRST consult the Acumatica knowledge base (the kb-mcp server: "
     "search_kb, then read_kb_file) for that screen/entity and the specific action. "
     "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
     "and ordering constraints; verify each prerequisite exists in the instance "
@@ -702,6 +703,18 @@ async def create_or_update_entity(
     itself fails (rare), the suspect keys are still `[]` but the result carries
     an `_unverified_details` list naming them — verify those manually with
     get_entity(..., expand=...) before trusting them.
+
+    Two more real gotchas on nested detail arrays (proven on TaxReportingSettings.
+    ReportingGroups): (1) a detail array ALWAYS APPENDS, never upserts-by-content —
+    resending identical detail data creates a duplicate row every time; to update
+    or remove an EXISTING row you must include its own `id` (from a prior
+    get_entity fetch): `{"id": <id>, ...changed fields...}` to update, or
+    `{"id": <id>, "delete": true}` to remove (id/delete stay bare, never
+    {"value":...}-wrapped). (2) That `id` is NOT stable across separate requests —
+    two consecutive fetches of the same record can return different ids for the
+    same rows — but it DOES remain valid for an action issued immediately after
+    the fetch that produced it. Fetch, then act right away; never cache a detail
+    row's id across a later, separate call.
     """
     _require_write(instance)
     client = _client(instance)
