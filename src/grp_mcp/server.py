@@ -1156,14 +1156,14 @@ async def create_ledger(
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     cmds = [
-        {"set": "LedgerID", "to": ledger_id},
+        {"set": "LedgerRecords.LedgerID", "to": ledger_id},
         {"set": "Description", "to": description},
         {"set": "Type", "to": ledger_type},
         {"set": "Currency", "to": currency},
         {"action": "Save"},
     ]
     async with ScreenClient(inst, "GL201500") as s:
-        return await s.submit(cmds)
+        return await s.submit(cmds, auto_answer="Yes")
 
 
 @mcp.tool()
@@ -1256,6 +1256,56 @@ async def chart_of_accounts(
             "AccountRecords", rows, save=save,
             auto_answer=auto_answer, dry_run=dry_run,
         )
+
+
+@mcp.tool()
+async def manage_financial_periods(
+    from_year: str,
+    to_year: str | None = None,
+    action: str = "Open",
+    company: str | None = None,
+    reopen_in_subledgers: bool | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Bulk period action on Manage Financial Periods (GL503000) — Open by default.
+
+    Drives the screen's "Process All" flow (no per-period checkbox selection
+    needed): set the filter, then process every matching period in one shot.
+
+    from_year/to_year: financial year range to act on (required — this can
+        touch every period in range, so the scope is explicit rather than
+        defaulting to "every period that ever existed"). Omit to_year to
+        target just from_year.
+    action:   "Open" | "Close" | "Lock" | "Unlock" | "Reopen" | "Deactivate".
+    company:  optional — restrict to one company/branch; omit for the
+        logged-in tenant's default.
+    reopen_in_subledgers: optional bool, meaningful only for action="Reopen"
+        (maps to ReopenFinancialPeriodsInAllModules on the filter).
+
+    PREREQUISITE: periods must already exist for the range with a status this
+    action can act on (Open needs Inactive, Close needs Open, etc.). Generating
+    them (GL201000 "Generate Calendar") is UI-only — see Known limitations;
+    this tool picks up from there. Verify after with screen_get('GL503000',
+    ['FinPeriods.FinancialPeriodID','FinPeriods.Status']) or setup_readiness
+    (open_periods). Requires allow_write. (KB: Opening Financial Periods —
+    Process Activity.)
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    to_year = str(to_year or from_year)
+    cmds: list[dict] = [
+        {"set": "Filter_.Action", "to": action},
+        {"set": "Filter_.FromYear", "to": str(from_year)},
+        {"set": "Filter_.ToYear", "to": to_year},
+    ]
+    if company:
+        cmds.append({"set": "Filter_.Company", "to": company})
+    if reopen_in_subledgers is not None:
+        cmds.append({"set": "Filter_.ReopenFinancialPeriodsInAllModules",
+                     "to": "True" if reopen_in_subledgers else "False"})
+    cmds.append({"action": "ProcessAll"})
+    async with ScreenClient(inst, "GL503000") as s:
+        return await s.submit(cmds, auto_answer="Yes")
 
 
 @mcp.tool()

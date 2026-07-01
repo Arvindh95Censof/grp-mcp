@@ -18,7 +18,7 @@ almost anything:
   Higher-level writers (`screen_insert_rows` for master-detail/bulk grids,
   `screen_record` for idempotent create-or-edit) and ready-made setup recipes
   (`create_financial_calendar`, `create_ledger`, `chart_of_accounts`,
-  `enable_features`) sit on top.
+  `enable_features`, `manage_financial_periods`) sit on top.
 
 ## Tools
 
@@ -80,6 +80,7 @@ almost anything:
 | `create_segmented_key` | Create a segmented key + its segments on Segment Keys (CS202000) — the prerequisite for `set_segment_value`. |
 | `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. Requires the key to exist on CS202000 first. |
 | `delete_segmented_key` | Tear down a segmented key in the correct children-first order (values → segment → master); recovers orphaned keys by recreating the master. Single-segment keys only (multi-segment reported for UI). |
+| `manage_financial_periods` | Bulk period action on Manage Financial Periods (GL503000) — Open/Close/Lock/Unlock/Reopen/Deactivate a year range in one Process All. Periods must already be generated (GL201000 "Generate Calendar" — UI-only, see Known limitations). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
@@ -470,15 +471,16 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.16 — 58 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
+v0.17 — 58 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
 discovery), and the **screen-based SOAP engine** (drives context/master-detail/wizard
 screens the REST API can't). On top sit setup recipes — `enable_features` +
 `activate_features` (install/recompile), `create_financial_calendar` (incl. start date),
-`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts` — plus
-import scenarios, the Customization Web API, and `setup_readiness` (now reports feature
-activation, GL preferences, and open periods). The whole foundation chain is grp-mcp-drivable
-(no Playwright).
+`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts`,
+`manage_financial_periods` (open/close/lock/reopen/deactivate) — plus import scenarios,
+the Customization Web API, and `setup_readiness` (now reports feature activation, GL
+preferences, and open periods). The GL foundation chain is grp-mcp-drivable end-to-end
+except one UI-only step (generating the periods themselves — see Known limitations).
 
 ### Known limitations (by design / platform)
 
@@ -494,7 +496,17 @@ activation, GL preferences, and open periods). The whole foundation chain is grp
 - **Combo/dropdown allowed-values** aren't exposed by the typed SOAP schema; use
   `screen_preflight` (CSDL mandatory fields) and known enums instead.
 - A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
+- **Master Financial Calendar generation (GL201000 "Generate Calendar")** is UI-only.
+  The typed screen SOAP schema exposes a matching action tag (`GenerateYears`) and it
+  returns a clean success either way, but it's a confirmed no-op: network capture during
+  a manual UI click showed the browser calling a *different* endpoint entirely
+  (`/t/Company/ui/screen/GL201000`, the modern UI-screen API) rather than the classic
+  `/Soap/GL201000.asmx` typed endpoint this engine uses — the classic SOAP shim's
+  implementation of this specific action isn't wired up on this platform version.
+  Generate periods manually in the UI first; `manage_financial_periods` (GL503000,
+  proven working via classic SOAP) picks up from there for Open/Close/Lock/etc.
 
-Roadmap: GL phase — `set_gl_preferences` ✅ done; next `generate_master_calendar` (GL201000)
-→ `open_periods` (GL201100). Also: nested detail rows in `load_from_excel`.
+Roadmap: GL phase closed (modulo the UI-only calendar-generation step above). Next:
+numbering sequences (CS201010) and branches (CS102000) — same tier of foundation
+prerequisite as GL. Also: nested detail rows in `load_from_excel`.
 
