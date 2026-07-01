@@ -77,7 +77,7 @@ one confirmed platform gap), so an agent can read and write almost anything:
 | `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
 | `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
 | `ui_get_structure` | Discover a screen via the **modern UI-screen API** (`/ui/screen/<ID>/structure`): views → fields (type, required, readonly, enabled, **enum allowed-values**), the live action inventory (enabled/visible/confirmation), and grid key fields. Richer than screen_get_schema; a live workflow-aware preflight. Read-only, any Modern-UI screen. |
-| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write. |
+| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
@@ -218,9 +218,12 @@ tools are sandboxed:
   any other host is refused (prevents OAuth-token exfiltration / SSRF).
 - **Writes are opt-in.** Record mutations (`create_or_update_entity`,
   `load_from_excel`, `invoke_action`, `run_import_scenario`, `set_note`,
-  `attach_file`, `attach_file_to_provider`, `screen_submit`) require
-  `"allow_write": true`; `delete_entity` requires the stricter
-  `"allow_delete": true`; customization publish/import/unpublish require
+  `attach_file`, `attach_file_to_provider`, `screen_submit`, `ui_screen_action`)
+  require `"allow_write": true`. **Deletes require the stricter
+  `"allow_delete": true` across ALL planes** — not just `delete_entity`, but also
+  a `screen_submit` `delete_row`, `delete_segmented_key`, and a destructive
+  `ui_screen_action` (e.g. `action="Delete"`), so the screen/UI planes can't
+  sidestep the delete gate. Customization publish/import/unpublish require
   `"allow_publish": true`. **Default is read-only.**
 - **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
   `load_from_excel`) or write (`download_file`, `run_report`, `snapshot_entity`,
@@ -479,6 +482,16 @@ Restart the client after adding — tools load at startup.
   `poll_action` (204 = finished, 202 = still running).
 - `snapshot_entity` writes to `<connections dir>/snapshots/` by default; that
   folder is gitignored (it can contain business data).
+
+## Development
+
+Smoke tests (pure logic — config/gating model, the write/delete/publish gates, the value
+wrapper, the modern UI-screen error parser; no live instance needed):
+
+```bash
+pip install -e ".[dev]"
+python -m pytest tests/ -q
+```
 
 ## Status
 

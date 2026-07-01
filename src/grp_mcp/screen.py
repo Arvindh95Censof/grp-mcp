@@ -186,24 +186,32 @@ class ScreenClient:
         messages (messageType error/warning/info), and for setup/validation
         faults a `{type, title, detail}` envelope (e.g. type=SetupNotEntered when
         the screen's module isn't configured). We surface those instead of a raw
-        truncated body — a 200 with an empty `messages[]` is success.
+        truncated body.
+
+        A 200 is a FAILURE only if it carries an explicit `messageType:"error"`
+        message — a warning/info message (or one with no type) on an otherwise-OK
+        200 is NOT an error (avoids false positives on informational notices). A
+        >=400 always surfaces (all its messages, else its type/title, else body).
         """
         j = None
         try:
             j = resp.json()
         except Exception:  # noqa: BLE001 — non-JSON body
             j = None
+        failed = resp.status_code >= 400
         if isinstance(j, dict):
             if j.get("type") == "SetupNotEntered":
                 return ("PREREQUISITE NOT MET — this screen's module is not configured "
                         "yet (SetupNotEntered). Configure its Preferences/Setup form first.")
-            errs = [m["message"] for m in (j.get("messages") or [])
-                    if m.get("message") and str(m.get("messageType", "error")).lower() == "error"]
-            if errs:
-                return "; ".join(errs)
-            if resp.status_code >= 400:
+            msgs = j.get("messages") or []
+            # on a 200, only explicit error-type messages count; on a failure, surface all.
+            picked = [m["message"] for m in msgs if m.get("message") and (
+                failed or str(m.get("messageType", "")).lower() == "error")]
+            if picked:
+                return "; ".join(picked)
+            if failed:
                 return f"{j.get('type') or 'Error'}: {j.get('detail') or j.get('title') or resp.text[:200]}"
-        if resp.status_code >= 400:
+        if failed:
             return f"HTTP {resp.status_code}: {resp.text[:300]}"
         return None
 

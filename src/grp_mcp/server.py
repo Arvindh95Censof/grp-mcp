@@ -101,6 +101,11 @@ def _require_write(instance: str | None) -> None:
         )
 
 
+# Modern UI-screen actions that DELETE data — held to the stricter allow_delete
+# gate (not just allow_write) so the /ui/screen/ plane can't sidestep it.
+_DESTRUCTIVE_UI_ACTIONS = frozenset({"Delete", "DeleteRow", "DeleteDetail", "DeleteAll"})
+
+
 def _require_delete(instance: str | None) -> None:
     """Block record deletes unless the instance opted in (allow_delete)."""
     cfg = _cfg()
@@ -834,7 +839,9 @@ async def ui_screen_action(
     Business/validation errors surface as clear messages (the screen's own
     `messages[]`), not opaque HTTP codes. PRECONDITION (KB-first policy): consult
     kb-mcp for the screen's prerequisites first — an unconfigured module returns
-    "PREREQUISITE NOT MET". Requires allow_write. Verify the write with
+    "PREREQUISITE NOT MET". Requires allow_write; a DESTRUCTIVE action (Delete,
+    ...) additionally requires allow_delete. Only FORM-view fields are supported;
+    grid-cell edits aren't yet (no per-row addressing). Verify the write with
     ui_get_structure, screen_get, or run_dac_odata.
 
     Example — generate financial periods (what generate_master_calendar does):
@@ -846,6 +853,10 @@ async def ui_screen_action(
             set_fields=[{"view":"GLSetupRecord","field":"ConsolidatedPosting","value":"true"}])
     """
     _require_write(instance)
+    # A destructive action deletes data — hold it to the stricter allow_delete gate,
+    # so the modern plane can't sidestep it (parity with delete_entity).
+    if action in _DESTRUCTIVE_UI_ACTIONS:
+        _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
         # Preflight against /structure: unknown actions AND unknown fields both
@@ -859,13 +870,21 @@ async def ui_screen_action(
                 f"Available: {sorted(valid_actions)}"
             )
         valid_fields = {(v, f["field"]) for v, fs in struct["views"].items() for f in fs}
+        grid_cols = {(g, c) for g, gd in struct["grids"].items() for c in (gd.get("columns") or [])}
         for f in (set_fields or []):
-            if (f["view"], f["field"]) not in valid_fields:
-                avail = sorted(x["field"] for x in struct["views"].get(f["view"], []))
+            if (f["view"], f["field"]) in valid_fields:
+                continue
+            if (f["view"], f["field"]) in grid_cols:
                 raise ScreenError(
-                    f"ui_screen_action: unknown field {f['view']}.{f['field']} on "
-                    f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'}"
+                    f"ui_screen_action: {f['view']}.{f['field']} is a GRID column; "
+                    f"grid-cell editing isn't supported yet (no per-row addressing). "
+                    f"Use screen_submit for detail-row writes."
                 )
+            avail = sorted(x["field"] for x in struct["views"].get(f["view"], []))
+            raise ScreenError(
+                f"ui_screen_action: unknown field {f['view']}.{f['field']} on "
+                f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'}"
+            )
         # Load the views we'll edit (so a Save validates a full record) PLUS the
         # primary view (first in /structure) — it carries the record/company
         # context an action needs (e.g. GL201000 generateYears faults "Select a
@@ -925,10 +944,16 @@ async def screen_submit(
     new_row the detail container, set the row's fields, Save.
 
     Field-level errors are returned in `messages` (the API reports them inside a
-    200, not as a fault). Requires "allow_write": true. Opens/closes its own SOAP
+    200, not as a fault). Requires "allow_write": true; a sequence containing a
+    `delete_row` (unless dry_run) additionally requires "allow_delete": true, so
+    the screen plane can't sidestep the delete gate. Opens/closes its own SOAP
     session so it never holds an API seat at idle (trial = 2 seats — always frees).
     """
     _require_write(instance)
+    # A delete_row destroys a detail row — hold it to the stricter allow_delete gate
+    # (dry_run drops committing commands, so it never actually deletes).
+    if not dry_run and any("delete_row" in c for c in commands):
+        _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
         return await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer)
@@ -1597,7 +1622,8 @@ async def delete_segmented_key(key_id: str, instance: str | None = None) -> Any:
       4. delete the master row.
 
     Verifies via the Dimension/Segment/SegmentValue DACs and returns the final
-    state. Requires allow_write.
+    state. This DELETES records, so it requires the stricter allow_delete (not
+    just allow_write) — parity with delete_entity.
 
     LIMIT: the typed screen API can't reliably select a non-first segment row, so a
     key with MULTIPLE segments can't be fully torn down here (the last-segment-first
@@ -1605,7 +1631,7 @@ async def delete_segmented_key(key_id: str, instance: str | None = None) -> Any:
     segment keys are reported as partially handled (delete the extra segments in the
     CS202000 UI).
     """
-    _require_write(instance)
+    _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     client = _client(instance)
 

@@ -94,8 +94,20 @@ class AcumaticaClient:
                 self._refresh_token = None
                 await self._fetch_token()
                 return
+            # surface only the OAuth error CODE/description — never the raw body,
+            # which is the one response adjacent to the credential-bearing request.
+            detail = ""
+            try:
+                err = resp.json()
+                detail = err.get("error") or ""
+                if err.get("error_description"):
+                    detail = f"{detail}: {err['error_description']}"
+            except Exception:  # noqa: BLE001 — non-JSON error body; omit it
+                detail = ""
             raise AcumaticaError(
-                f"OAuth token request failed ({resp.status_code}): {resp.text}"
+                f"OAuth token request failed ({resp.status_code})"
+                + (f": {detail}" if detail else "")
+                + ". Check the instance's client_id/secret + username/password."
             )
         payload = resp.json()
         self._access_token = payload["access_token"]
