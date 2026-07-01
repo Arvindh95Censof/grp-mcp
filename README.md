@@ -19,12 +19,14 @@ one confirmed platform gap), so an agent can read and write almost anything:
   `screen_record` for idempotent create-or-edit) and ready-made setup recipes
   (`create_financial_calendar`, `create_ledger`, `chart_of_accounts`,
   `enable_features`, `manage_financial_periods`) sit on top.
-- **Modern UI-screen plane** (internal, not a public tool) — for the rare action
-  whose classic-SOAP schema tag is a confirmed no-op (currently just GL201000
-  "Generate Calendar"), `ScreenClient.ui_command`/`ui_set_field` drive the same
-  JSON protocol the real browser UI uses (`/t/<Tenant>/ui/screen/<ScreenID>`),
-  reusing the SAME login session as the classic plane — no extra auth, no
-  browser. `generate_master_calendar` is the one recipe built on it so far.
+- **Modern UI-screen plane** — the JSON protocol the real browser UI uses
+  (`/t/<Tenant>/ui/screen/<ScreenID>`), reusing the SAME login session as the
+  classic plane (no extra auth, no browser). `ui_get_structure` reads a screen's
+  full descriptor — views, fields, **enum allowed-values**, action inventory,
+  grid keys — and `ui_screen_action` sets fields + fires actions (incl.
+  dialog-confirm). This reaches what classic SOAP can't: actions whose classic
+  tag is a silent no-op (e.g. GL201000 Generate Calendar), enum value discovery,
+  and live workflow-aware field/action state. Works on any Modern-UI screen.
 
 ## Tools
 
@@ -74,6 +76,8 @@ one confirmed platform gap), so an agent can read and write almost anything:
 | `screen_insert_rows` | Insert many grid/detail rows into one container in a single Save (master-detail / bulk-grid writer over the SOAP engine) — e.g. Chart of Accounts rows, subaccount segments. |
 | `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
 | `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
+| `ui_get_structure` | Discover a screen via the **modern UI-screen API** (`/ui/screen/<ID>/structure`): views → fields (type, required, readonly, enabled, **enum allowed-values**), the live action inventory (enabled/visible/confirmation), and grid key fields. Richer than screen_get_schema; a live workflow-aware preflight. Read-only, any Modern-UI screen. |
+| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write. |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
@@ -478,45 +482,44 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.18 — 60 tools across three client planes (plus a narrow internal fourth): contract
-REST (CRUD, actions, `$skip` paging, attachments up/down, notes, reports), DAC + GI OData
-(incl. CSDL metadata / mandatory-field discovery), and the **screen-based SOAP engine**
-(drives context/master-detail/wizard screens the REST API can't). On top sit setup recipes —
-`enable_features` + `activate_features` (install/recompile), `create_financial_calendar`
-(incl. start date), `create_ledger`, `create_segmented_key` → `set_segment_value`,
-`chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
-(open/close/lock/reopen/deactivate) — plus import scenarios, the Customization Web API,
-and `setup_readiness` (reports feature activation, GL preferences, and open periods).
-**The GL foundation chain is now grp-mcp-drivable fully end-to-end, no manual/UI steps
-at all** — the one action classic SOAP couldn't reach (GL201000 "Generate Calendar") is
-driven by a small internal fourth plane instead (see below).
+v0.19 — 62 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
+discovery), the **screen-based SOAP engine** (context/master-detail/wizard screens REST
+can't), and the **modern UI-screen plane** (`ui_get_structure` + `ui_screen_action` — the
+browser's own JSON protocol, for dialog actions classic SOAP can't reach, enum-value
+discovery, and live workflow-aware state). On top sit setup recipes — `enable_features` +
+`activate_features` (install/recompile), `create_financial_calendar` (incl. start date),
+`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts`,
+`generate_master_calendar` + `manage_financial_periods` (open/close/lock/reopen/deactivate)
+— plus import scenarios, the Customization Web API, and `setup_readiness`. **The GL
+foundation chain is fully grp-mcp-drivable end-to-end, no manual/UI steps.**
 
-### The modern UI-screen plane (internal — how `generate_master_calendar` works)
+### The modern UI-screen plane (`ui_get_structure` / `ui_screen_action`)
 
-`GL201000`'s "Generate Calendar" exposes a matching action tag (`GenerateYears`) in the
-classic typed SOAP schema, but invoking it there is a confirmed no-op: a clean, empty
-~335-byte success every time, with zero effect, verified empty across three independent
-read channels. Network capture during a manual UI click showed why — the browser calls a
-*different* endpoint entirely, `/t/<Tenant>/ui/screen/<ScreenID>` (the modern UI's own
-JSON protocol), not the classic `/Soap/<ScreenID>.asmx` this engine's `ScreenClient` uses.
-The classic SOAP shim advertises the action; its handler for this one isn't wired up on
-this platform build.
+Some actions expose a tag in the classic typed SOAP schema but their handler isn't wired up
+there — invoking it is a silent no-op (clean ~335-byte success, zero effect; GL201000
+"Generate Calendar" is the found example). The real implementation lives behind the modern
+UI's own JSON protocol at `/t/<Tenant>/ui/screen/<ScreenID>`, which the browser itself
+calls. It **reuses the same login session** as the classic plane (same cookie — no separate
+auth, no browser), and is a genuine superset: schema discovery, **enum allowed-values**, row
+identity, structured errors, dialog confirmation, and persisted field-writes.
 
-Reverse-engineered live and now built as `ScreenClient.ui_command`/`ui_set_field`:
-- Reuses the **same login session** as the classic plane (same cookie — no separate auth).
+Protocol (reverse-engineered live, now `ScreenClient.get_ui_structure`/`ui_set_field`/`ui_command`):
+- Discover: `GET .../structure` → views + fields (type/required/readonly/enabled/**options**),
+  action inventory (enabled/visible/confirm), grid key fields.
 - Set a field: `POST {"data":[{"viewName":V,"fieldName":F,"value":val,"rowId":"","changeType":5}],...}`
-- Fire an action: `POST {"command":[{"name":cmd}],"data":[],...}` → `200` if it just runs,
-  or `302 {"redirects":[{"settings":{"type":"openDialog","viewName":V}}]}` if it needs
-  confirmation — answered with `{"command":[{"name":cmd}],"dialogCallback":
-  {"dialogResult":1,"viewName":V},...}` (`dialogResult` follows the public
-  `PX.Data.WebDialogResult` enum: OK=1, Yes=6, No=7, Cancel=2, ...).
+  (enums use the option `value`; booleans `"true"`/`"false"`).
+- Fire an action: `POST {"command":[{"name":cmd}],"data":[],...}` → `200`, or
+  `302 openDialog` → auto-confirmed with `dialogCallback:{dialogResult:1,viewName:V}`
+  (`dialogResult` = public `PX.Data.WebDialogResult`: OK=1, Yes=6, No=7, Cancel=2, …).
 
-Proven end-to-end (`FinPeriod` DAC read-back, matching timestamps): generated periods for
-2027 and 2028 in one call. Real Acumatica errors (e.g. a business-rule rejection) surface
-as clean exceptions through this path too — it isn't just a silent-success trap like the
-classic-SOAP call was. Kept deliberately narrow (not a public tool) — reach for it only
-when a specific action is confirmed classic-SOAP-dead, the same bar as everything in
-Known limitations below.
+Proven: field write persists (set→Save→cross-plane read-back), dialog action generates
+periods, and the screen's own `messages[]` surface as clean errors (e.g. `"'Retained
+Earnings Account' cannot be empty"`). **Two rules baked in:** (1) load the views you edit
+(and the primary view) so a Save validates a full record and actions have company context;
+(2) one plane per session — never interleave classic (Export/Submit) with modern ops on the
+same session (separate graph state → 409). Works on any Modern-UI screen; an unconfigured
+module returns a clear "PREREQUISITE NOT MET" and an unlicensed module is access-denied.
 
 ### Known limitations (by design / platform)
 
@@ -526,16 +529,20 @@ Known limitations below.
   Acumatica requires ≥1 segment and won't cascade-delete a key's segments, so the last
   segment always orphans. `delete_segmented_key` handles single-segment keys + safely
   stops on multi-segment (KB-confirmed; structural change = "contact support").
-- **Tenant snapshot (SM203520)** is UI-only — the create dialog's action is server-gated
-  behind a client-opened panel the typed SOAP API can't reach, and it requires maintenance
-  mode (which locks the instance). Left as a deliberate manual step. (Unlike GL201000's
-  gap, this one is genuinely client-gated even in the modern UI, not just missing from the
-  classic shim — not yet attempted via the `/ui/screen/` plane.)
-- **Combo/dropdown allowed-values** aren't exposed by the typed SOAP schema; use
-  `screen_preflight` (CSDL mandatory fields) and known enums instead.
+- **Tenant snapshot (SM203520)** requires **maintenance mode** (which locks the instance) —
+  a deliberate maintenance-window operation, left manual for safety. (The create action
+  itself is *not* API-gated: it opens its dialog via the modern `/ui/screen/` plane just
+  like Generate Calendar — so it's drivable if ever needed, but gated behind the
+  instance-locking maintenance step by design.)
 - A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
 
-Roadmap: GL phase fully closed. Next:
-numbering sequences (CS201010) and branches (CS102000) — same tier of foundation
-prerequisite as GL. Also: nested detail rows in `load_from_excel`.
+(Resolved in v0.19: **combo/dropdown allowed-values** — the classic typed SOAP schema
+doesn't expose them, but `ui_get_structure` returns each enum field's `options:[{value,text}]`
+from the modern `/structure` endpoint.)
+
+Roadmap: GL phase fully closed; the modern UI-screen plane makes new dialog/config screens
+self-service (read `ui_get_structure`, drive `ui_screen_action`). Next: the remaining
+foundation modules — numbering sequences (CS201010), branches (CS102000), tax, AP/AR/CA
+preferences — each KB-first + verify. Also: nested detail rows in `load_from_excel`, and a
+grid-row editor over the modern plane's row identity.
 

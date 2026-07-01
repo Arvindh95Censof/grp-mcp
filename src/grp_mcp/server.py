@@ -781,6 +781,106 @@ async def screen_get_schema(screen_id: str, instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+async def ui_get_structure(screen_id: str, instance: str | None = None) -> Any:
+    """Discover a screen via the MODERN UI-screen API (/ui/screen/<ID>/structure).
+
+    The richer, modern-plane counterpart to screen_get_schema. Returns:
+      views:   {ViewName: [{field, label, type, required, readonly, enabled,
+                            options}]} — `options` lists a fixed-enum field's
+               allowed values as [{value, text}] (SET the `value`, not `text`).
+      actions: [{name, label, enabled, visible, confirm}] — the live action
+               inventory; `confirm` is the dialog text an action will pop.
+      grids:   {GridName: {key_fields, columns}} — key_fields are the row-key
+               fields for addressing a specific grid row.
+
+    Use this to drive ANY screen with ui_screen_action without a browser capture:
+    read the views/fields (and enum options) here, then set + act. Reflects the
+    LIVE graph + workflow state (what's required/enabled right now), not just DB
+    nullability — a stronger preflight than screen_preflight.
+
+    Read-only GET. Works on any Modern-UI screen; a screen whose module isn't
+    configured returns a clear "PREREQUISITE NOT MET" (SetupNotEntered) error, and
+    an unlicensed module is access-denied — both distinguish "not set up here" from
+    a real failure. (KB: Modern UI web API controllers; JSON protocol.)
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.get_ui_structure()
+
+
+@mcp.tool()
+async def ui_screen_action(
+    screen_id: str,
+    action: str,
+    set_fields: list[dict] | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
+
+    The general driver for the modern plane. Use it for screens/actions the classic
+    screen SOAP engine can't reach: notably dialog-driven actions whose classic tag
+    is a silent no-op (e.g. GL201000 "Generate Calendar"), and plain record edits
+    (set fields + action="Save"). Reuses the same login session as the rest of the
+    engine — no browser, no separate auth.
+
+    set_fields: optional list of {"view": <ViewName>, "field": <FieldName>,
+        "value": <value>} — from ui_get_structure. For enum fields pass the option
+        `value` (not its display text); booleans are "true"/"false".
+    action:     the internal command to fire after setting (from ui_get_structure
+        `actions`), e.g. "Save" to commit a record edit, or a screen action like
+        "generateYears". If the action opens a confirmation dialog it's
+        auto-answered OK.
+
+    Business/validation errors surface as clear messages (the screen's own
+    `messages[]`), not opaque HTTP codes. PRECONDITION (KB-first policy): consult
+    kb-mcp for the screen's prerequisites first — an unconfigured module returns
+    "PREREQUISITE NOT MET". Requires allow_write. Verify the write with
+    ui_get_structure, screen_get, or run_dac_odata.
+
+    Example — generate financial periods (what generate_master_calendar does):
+        ui_screen_action("GL201000", action="generateYears",
+            set_fields=[{"view":"GenerateParams","field":"FromYear","value":"2026"},
+                        {"view":"GenerateParams","field":"ToYear","value":"2026"}])
+    Example — edit a record: set fields, then Save:
+        ui_screen_action("GL102000", action="Save",
+            set_fields=[{"view":"GLSetupRecord","field":"ConsolidatedPosting","value":"true"}])
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        # Preflight against /structure: unknown actions AND unknown fields both
+        # silently no-op in this protocol (the server ignores them and returns 200),
+        # which would look like a bogus success. Validate up front and fail loudly.
+        struct = await s.get_ui_structure()
+        valid_actions = {a["name"] for a in struct["actions"]}
+        if action not in valid_actions:
+            raise ScreenError(
+                f"ui_screen_action: unknown action {action!r} on {screen_id.upper()}. "
+                f"Available: {sorted(valid_actions)}"
+            )
+        valid_fields = {(v, f["field"]) for v, fs in struct["views"].items() for f in fs}
+        for f in (set_fields or []):
+            if (f["view"], f["field"]) not in valid_fields:
+                avail = sorted(x["field"] for x in struct["views"].get(f["view"], []))
+                raise ScreenError(
+                    f"ui_screen_action: unknown field {f['view']}.{f['field']} on "
+                    f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'}"
+                )
+        # Load the views we'll edit (so a Save validates a full record) PLUS the
+        # primary view (first in /structure) — it carries the record/company
+        # context an action needs (e.g. GL201000 generateYears faults "Select a
+        # company" if FiscalYear, the primary view, isn't loaded).
+        primary = next(iter(struct["views"]), None)
+        load = {f["view"] for f in (set_fields or [])} | ({primary} if primary else set())
+        await s.ui_bootstrap(sorted(load))
+        for f in (set_fields or []):
+            await s.ui_set_field(f["view"], f["field"], f["value"])
+        result = await s.ui_command(action)
+    return {"screen_id": screen_id.upper(), "action": action,
+            "set_fields": set_fields or [], "ok": True, "raw": result}
+
+
+@mcp.tool()
 async def screen_submit(
     screen_id: str,
     commands: list[dict],
@@ -1291,6 +1391,9 @@ async def generate_master_calendar(
     inst = _cfg().get(instance or _cfg().default)
     to_year = str(to_year or from_year)
     async with ScreenClient(inst, "GL201000") as s:
+        # Load FiscalYear so the company/calendar context is present — without it
+        # generateYears faults "Select a company and create its first calendar year."
+        await s.ui_bootstrap(["FiscalYear"])
         await s.ui_set_field("GenerateParams", "FromYear", str(from_year))
         await s.ui_set_field("GenerateParams", "ToYear", to_year)
         result = await s.ui_command("generateYears")

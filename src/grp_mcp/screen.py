@@ -69,6 +69,7 @@ class ScreenClient:
         self._logged_in = False
         self._tree: ET.Element | None = None
         self._ui_booted = False
+        self._classic_used = False  # guard: don't mix classic + modern graph state
 
     @property
     def url(self) -> str:
@@ -84,6 +85,9 @@ class ScreenClient:
     # ---- transport ------------------------------------------------------
 
     async def _call(self, op: str, inner_xml: str) -> str:
+        # classic SOAP op: mark it so the modern plane re-bootstraps a clean graph
+        # if these get interleaved in one session (they keep separate graph state).
+        self._classic_used = True
         resp = await self._http.post(
             self.url,
             content=(_ENV_OPEN + inner_xml + _ENV_CLOSE).encode("utf-8"),
@@ -174,35 +178,145 @@ class ScreenClient:
     def ui_url(self) -> str:
         return f"{self.instance.base_url.rstrip('/')}/t/{self.instance.tenant}/ui/screen/{self.screen_id}"
 
+    @staticmethod
+    def _ui_error(resp: httpx.Response) -> str | None:
+        """Parse a modern UI-screen response into a human error string, or None if OK.
+
+        The plane carries structured errors: a `messages[]` array of typed
+        messages (messageType error/warning/info), and for setup/validation
+        faults a `{type, title, detail}` envelope (e.g. type=SetupNotEntered when
+        the screen's module isn't configured). We surface those instead of a raw
+        truncated body — a 200 with an empty `messages[]` is success.
+        """
+        j = None
+        try:
+            j = resp.json()
+        except Exception:  # noqa: BLE001 — non-JSON body
+            j = None
+        if isinstance(j, dict):
+            if j.get("type") == "SetupNotEntered":
+                return ("PREREQUISITE NOT MET — this screen's module is not configured "
+                        "yet (SetupNotEntered). Configure its Preferences/Setup form first.")
+            errs = [m["message"] for m in (j.get("messages") or [])
+                    if m.get("message") and str(m.get("messageType", "error")).lower() == "error"]
+            if errs:
+                return "; ".join(errs)
+            if resp.status_code >= 400:
+                return f"{j.get('type') or 'Error'}: {j.get('detail') or j.get('title') or resp.text[:200]}"
+        if resp.status_code >= 400:
+            return f"HTTP {resp.status_code}: {resp.text[:300]}"
+        return None
+
+    async def ui_bootstrap(self, views: list[str] | None = None) -> None:
+        """Load the modern-UI graph, populating the given views from the DB.
+
+        Pass the views you'll EDIT so their existing record loads: else a Save
+        validates a half-empty record and fails on the untouched required fields
+        (e.g. editing one GL-preference checkbox with the record unloaded →
+        "'Retained Earnings Account' cannot be empty"). For a pure dialog/process
+        action with no field edits, views can be empty.
+
+        NOTE: intentionally does NOT send `clearSession:true` — that resets the
+        whole graph including the company/branch + selected-record context, which
+        breaks process actions that depend on it (e.g. GL201000 generateYears →
+        "Select a company..."). Cross-plane isolation is handled by the one-plane-
+        per-session rule instead (each tool uses only classic OR only modern),
+        with a best-effort re-bootstrap in _ui_post if the two ever interleave.
+        """
+        vp = {v: {} for v in (views or [])}
+        await self._http.post(
+            self.ui_url,
+            json={"isFirstRequest": True, "data": [], "controlsParams": {},
+                  "activeRowContexts": [], "viewsParams": vp},
+            headers=_UI_HEADERS,
+        )
+        self._ui_booted = True
+        self._classic_used = False
+
     async def _ui_post(self, payload: dict) -> httpx.Response:
-        if not self._ui_booted:
-            await self._http.post(
-                self.ui_url,
-                json={"isFirstRequest": True, "data": [], "controlsParams": {},
-                      "activeRowContexts": [], "viewsParams": {}},
-                headers=_UI_HEADERS,
-            )
-            self._ui_booted = True
+        # Ensure a graph exists (fallback bootstrap). Re-bootstrap if a classic SOAP
+        # op ran since (the planes keep separate graph state — interleaving them in
+        # one session can collide, e.g. a 409 on Save). Callers editing an existing
+        # record should call ui_bootstrap([views]) FIRST so the record loads.
+        if not self._ui_booted or self._classic_used:
+            await self.ui_bootstrap()
         return await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
 
+    async def get_ui_structure(self) -> dict:
+        """Read the modern UI-screen `/structure` — the schema/metadata endpoint.
+
+        The modern-plane analog of get_schema(): returns the screen's views +
+        fields (type, required, readonly, enabled, and ENUM allowed-values), the
+        action inventory (enabled/visible/confirmation message), and grid key
+        fields. Use it to discover what ui_set_field/ui_command can drive on any
+        screen — no browser capture needed. Read-only GET (stateless, no bootstrap).
+        """
+        resp = await self._http.get(self.ui_url + "/structure", headers={"Accept": "application/json"})
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"get_ui_structure {self.screen_id}: {err}")
+        d = resp.json()
+        views: dict[str, list] = {}
+        for vname, fields in (d.get("fieldStates") or {}).items():
+            if not isinstance(fields, list):
+                continue
+            out = []
+            for f in fields:
+                st = f.get("fieldState") or {}
+                opts = st.get("options")
+                out.append({
+                    "field": f.get("fieldName"),
+                    "label": st.get("text"),
+                    "type": st.get("typeName"),
+                    "required": bool(st.get("required")),
+                    "readonly": bool(st.get("readOnly")),
+                    "enabled": st.get("enabled", True) is not False,
+                    "options": ([{"value": o.get("value"), "text": o.get("text")} for o in opts]
+                                if opts else None),
+                })
+            views[vname] = out
+        actions = [
+            {"name": name, "label": st.get("text"),
+             "enabled": st.get("enabled", True) is not False,
+             "visible": st.get("visible", True) is not False,
+             "confirm": st.get("confirmationMessage")}
+            for name, st in (d.get("actionStates") or {}).items() if isinstance(st, dict)
+        ]
+        grids = {
+            cname: {"key_fields": cd.get("dataKeyNames"),
+                    "columns": [c.get("field") for c in (cd.get("columns") or []) if isinstance(c, dict)]}
+            for cname, cd in (d.get("controlsData") or {}).items()
+            if isinstance(cd, dict) and cd.get("dataKeyNames")
+        }
+        return {"screen_id": self.screen_id, "primary_dac": d.get("primaryDacName"),
+                "views": views, "actions": actions, "grids": grids}
+
     async def ui_set_field(self, view: str, field: str, value: str) -> None:
-        """Set one field via the modern UI-screen protocol (see class docstring above)."""
+        """Set one field via the modern UI-screen protocol (see class docstring above).
+
+        Value formats: strings/enums = the raw code (for enums use the option
+        `value`, not its display text — see get_ui_structure); booleans = "true"/
+        "false". The set lands in the graph working state; a following ui_command
+        ("Save" or a screen action) commits it. Do NOT interleave with classic
+        get_schema/export/submit on the same session (separate graph state).
+        """
         resp = await self._ui_post({
             "data": [{"viewName": view, "fieldName": field, "value": str(value),
                        "rowId": "", "changeType": 5}],
             "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
         })
-        if resp.status_code >= 400:
-            raise ScreenError(
-                f"ui_set_field {view}.{field} on {self.screen_id} -> "
-                f"HTTP {resp.status_code}: {resp.text[:300]}"
-            )
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_set_field {view}.{field} on {self.screen_id}: {err}")
 
     async def ui_command(self, name: str) -> dict:
         """Fire a modern UI-screen command; auto-answers OK if it opens a dialog.
 
-        Field values set via ui_set_field() beforehand persist server-side in
-        the session and don't need to be resent here.
+        Field values set via ui_set_field() beforehand persist server-side in the
+        session and don't need to be resent here. `name` is the internal command
+        (from get_ui_structure `actions`), e.g. "Save", "generateYears". A 302
+        `openDialog` reply is auto-confirmed (WebDialogResult.OK). Raises with the
+        parsed `messages[]` on a business/validation error.
         """
         resp = await self._ui_post({
             "command": [{"name": name}], "data": [],
@@ -221,10 +335,9 @@ class ScreenClient:
                 "dialogCallback": {"dialogResult": 1, "validateInput": False, "viewName": view},
                 "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
             })
-        if resp.status_code >= 400:
-            raise ScreenError(
-                f"ui_command {name} on {self.screen_id} -> HTTP {resp.status_code}: {resp.text[:300]}"
-            )
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
         return resp.json()
 
     async def __aenter__(self) -> "ScreenClient":
