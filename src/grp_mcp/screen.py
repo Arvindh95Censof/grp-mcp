@@ -43,6 +43,13 @@ _ENV_CLOSE = "</soap:Body></soap:Envelope>"
 # bind (no-bind). Used to flag suspected silent no-persist on an HTTP-200 result.
 _NOBIND_LEN = 1500
 
+# Headers the modern UI-screen protocol (/t/<Tenant>/ui/screen/<ScreenID>) expects.
+_UI_HEADERS = {
+    "Accept": "application/json,text/html",
+    "X-Requested-With": "Fetch",
+    "Content-Type": "application/json",
+}
+
 
 class ScreenError(RuntimeError):
     pass
@@ -61,6 +68,7 @@ class ScreenClient:
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._logged_in = False
         self._tree: ET.Element | None = None
+        self._ui_booted = False
 
     @property
     def url(self) -> str:
@@ -136,6 +144,88 @@ class ScreenClient:
             await self._http.aclose()
         except Exception:
             pass
+
+    # ---- modern UI-screen plane (/ui/screen/<ScreenID>) ------------------
+    #
+    # Some dialog-driven actions (confirmed: GL201000 "Generate Calendar") are
+    # exposed in the classic typed-SOAP schema but their server-side handler
+    # isn't wired up on that endpoint — Submit returns a clean empty success
+    # with zero effect. The REAL implementation lives behind the modern UI's
+    # own JSON protocol at /t/<Tenant>/ui/screen/<ScreenID>, which the browser
+    # itself calls. Reverse-engineered live (2026-07-01): it shares the SAME
+    # cookie session as the classic SOAP Login above (same ASP.NET app), so no
+    # separate auth is needed — just reuse self._http after login().
+    #
+    # Protocol shape (JSON POST, Content-Type: application/json):
+    #   bootstrap:  {"isFirstRequest": true, "data": [], ...}                (once)
+    #   set field:  {"data": [{"viewName": V, "fieldName": F, "value": val,
+    #                           "rowId": "", "changeType": 5}], ...}
+    #   fire cmd:   {"command": [{"name": cmd}], "data": [], ...}
+    #     -> 200 if it just executes, OR
+    #     -> 302 {"redirects":[{"settings":{"type":"openDialog","viewName":V}}]}
+    #        meaning a confirmation dialog would open client-side; answer it:
+    #   confirm:    {"command": [{"name": cmd}], "data": [],
+    #                "dialogCallback": {"dialogResult": 1, "validateInput": false,
+    #                                   "viewName": V}, ...}
+    # dialogResult follows the public PX.Data.WebDialogResult enum: None=0,
+    # OK=1, Cancel=2, Abort=3, Retry=4, Ignore=5, Yes=6, No=7.
+
+    @property
+    def ui_url(self) -> str:
+        return f"{self.instance.base_url.rstrip('/')}/t/{self.instance.tenant}/ui/screen/{self.screen_id}"
+
+    async def _ui_post(self, payload: dict) -> httpx.Response:
+        if not self._ui_booted:
+            await self._http.post(
+                self.ui_url,
+                json={"isFirstRequest": True, "data": [], "controlsParams": {},
+                      "activeRowContexts": [], "viewsParams": {}},
+                headers=_UI_HEADERS,
+            )
+            self._ui_booted = True
+        return await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
+
+    async def ui_set_field(self, view: str, field: str, value: str) -> None:
+        """Set one field via the modern UI-screen protocol (see class docstring above)."""
+        resp = await self._ui_post({
+            "data": [{"viewName": view, "fieldName": field, "value": str(value),
+                       "rowId": "", "changeType": 5}],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        if resp.status_code >= 400:
+            raise ScreenError(
+                f"ui_set_field {view}.{field} on {self.screen_id} -> "
+                f"HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+
+    async def ui_command(self, name: str) -> dict:
+        """Fire a modern UI-screen command; auto-answers OK if it opens a dialog.
+
+        Field values set via ui_set_field() beforehand persist server-side in
+        the session and don't need to be resent here.
+        """
+        resp = await self._ui_post({
+            "command": [{"name": name}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        if resp.status_code == 302:
+            body = resp.json()
+            view = None
+            for r in body.get("redirects", []):
+                settings = r.get("settings", {})
+                if settings.get("type") == "openDialog":
+                    view = settings.get("viewName")
+                    break
+            resp = await self._ui_post({
+                "command": [{"name": name}], "data": [],
+                "dialogCallback": {"dialogResult": 1, "validateInput": False, "viewName": view},
+                "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+            })
+        if resp.status_code >= 400:
+            raise ScreenError(
+                f"ui_command {name} on {self.screen_id} -> HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        return resp.json()
 
     async def __aenter__(self) -> "ScreenClient":
         await self.login()

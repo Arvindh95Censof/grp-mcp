@@ -3,8 +3,8 @@
 MCP server that exposes **Acumatica ERP** as tools for AI agents. Multi-instance,
 OAuth2 — point it at any Acumatica site with a base URL + credentials.
 
-It reaches Acumatica through **three planes**, so an agent can read and write
-almost anything:
+It reaches Acumatica through **three client planes** (plus a narrow fourth for
+one confirmed platform gap), so an agent can read and write almost anything:
 
 - **Contract-based REST** — CRUD entities, bulk-load from Excel/CSV, invoke
   actions, run reports, attach files, manage customization projects.
@@ -19,6 +19,12 @@ almost anything:
   `screen_record` for idempotent create-or-edit) and ready-made setup recipes
   (`create_financial_calendar`, `create_ledger`, `chart_of_accounts`,
   `enable_features`, `manage_financial_periods`) sit on top.
+- **Modern UI-screen plane** (internal, not a public tool) — for the rare action
+  whose classic-SOAP schema tag is a confirmed no-op (currently just GL201000
+  "Generate Calendar"), `ScreenClient.ui_command`/`ui_set_field` drive the same
+  JSON protocol the real browser UI uses (`/t/<Tenant>/ui/screen/<ScreenID>`),
+  reusing the SAME login session as the classic plane — no extra auth, no
+  browser. `generate_master_calendar` is the one recipe built on it so far.
 
 ## Tools
 
@@ -74,13 +80,14 @@ almost anything:
 | `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (stages them). Pass `activate=True` to also install them. |
 | `activate_features` | Activate/install the staged feature set (CS100000 RequestValidation = the "Enable" button) — recompiles the site, then polls ActivationStatus until "Validated" (returns activated=true/false). |
 | `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
+| `generate_master_calendar` | Generate financial periods (GL201000 "Generate Calendar") for a year range. Classic SOAP exposes this action's tag but it's a no-op there; this recipe drives the modern UI-screen JSON protocol instead (same login session, no browser). |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `set_gl_preferences` | Set GL Preferences (GL102000): Retained Earnings + YTD Net Income system accounts (Liability) + posting flags → Save. The GL-phase keystone for posting. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
 | `create_segmented_key` | Create a segmented key + its segments on Segment Keys (CS202000) — the prerequisite for `set_segment_value`. |
 | `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. Requires the key to exist on CS202000 first. |
 | `delete_segmented_key` | Tear down a segmented key in the correct children-first order (values → segment → master); recovers orphaned keys by recreating the master. Single-segment keys only (multi-segment reported for UI). |
-| `manage_financial_periods` | Bulk period action on Manage Financial Periods (GL503000) — Open/Close/Lock/Unlock/Reopen/Deactivate a year range in one Process All. Periods must already be generated (GL201000 "Generate Calendar" — UI-only, see Known limitations). |
+| `manage_financial_periods` | Bulk period action on Manage Financial Periods (GL503000) — Open/Close/Lock/Unlock/Reopen/Deactivate a year range in one Process All. Periods must already be generated (`generate_master_calendar`). |
 | `set_note` | Set/clear a record's Note text. |
 | `delete_entity` | Delete a record by id. |
 | `invoke_action` | Run a record action (Release, ConfirmShipment, …). |
@@ -471,16 +478,45 @@ Restart the client after adding — tools load at startup.
 
 ## Status
 
-v0.17 — 58 tools across three planes: contract REST (CRUD, actions, `$skip` paging,
-attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
-discovery), and the **screen-based SOAP engine** (drives context/master-detail/wizard
-screens the REST API can't). On top sit setup recipes — `enable_features` +
-`activate_features` (install/recompile), `create_financial_calendar` (incl. start date),
-`create_ledger`, `create_segmented_key` → `set_segment_value`, `chart_of_accounts`,
-`manage_financial_periods` (open/close/lock/reopen/deactivate) — plus import scenarios,
-the Customization Web API, and `setup_readiness` (now reports feature activation, GL
-preferences, and open periods). The GL foundation chain is grp-mcp-drivable end-to-end
-except one UI-only step (generating the periods themselves — see Known limitations).
+v0.18 — 60 tools across three client planes (plus a narrow internal fourth): contract
+REST (CRUD, actions, `$skip` paging, attachments up/down, notes, reports), DAC + GI OData
+(incl. CSDL metadata / mandatory-field discovery), and the **screen-based SOAP engine**
+(drives context/master-detail/wizard screens the REST API can't). On top sit setup recipes —
+`enable_features` + `activate_features` (install/recompile), `create_financial_calendar`
+(incl. start date), `create_ledger`, `create_segmented_key` → `set_segment_value`,
+`chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
+(open/close/lock/reopen/deactivate) — plus import scenarios, the Customization Web API,
+and `setup_readiness` (reports feature activation, GL preferences, and open periods).
+**The GL foundation chain is now grp-mcp-drivable fully end-to-end, no manual/UI steps
+at all** — the one action classic SOAP couldn't reach (GL201000 "Generate Calendar") is
+driven by a small internal fourth plane instead (see below).
+
+### The modern UI-screen plane (internal — how `generate_master_calendar` works)
+
+`GL201000`'s "Generate Calendar" exposes a matching action tag (`GenerateYears`) in the
+classic typed SOAP schema, but invoking it there is a confirmed no-op: a clean, empty
+~335-byte success every time, with zero effect, verified empty across three independent
+read channels. Network capture during a manual UI click showed why — the browser calls a
+*different* endpoint entirely, `/t/<Tenant>/ui/screen/<ScreenID>` (the modern UI's own
+JSON protocol), not the classic `/Soap/<ScreenID>.asmx` this engine's `ScreenClient` uses.
+The classic SOAP shim advertises the action; its handler for this one isn't wired up on
+this platform build.
+
+Reverse-engineered live and now built as `ScreenClient.ui_command`/`ui_set_field`:
+- Reuses the **same login session** as the classic plane (same cookie — no separate auth).
+- Set a field: `POST {"data":[{"viewName":V,"fieldName":F,"value":val,"rowId":"","changeType":5}],...}`
+- Fire an action: `POST {"command":[{"name":cmd}],"data":[],...}` → `200` if it just runs,
+  or `302 {"redirects":[{"settings":{"type":"openDialog","viewName":V}}]}` if it needs
+  confirmation — answered with `{"command":[{"name":cmd}],"dialogCallback":
+  {"dialogResult":1,"viewName":V},...}` (`dialogResult` follows the public
+  `PX.Data.WebDialogResult` enum: OK=1, Yes=6, No=7, Cancel=2, ...).
+
+Proven end-to-end (`FinPeriod` DAC read-back, matching timestamps): generated periods for
+2027 and 2028 in one call. Real Acumatica errors (e.g. a business-rule rejection) surface
+as clean exceptions through this path too — it isn't just a silent-success trap like the
+classic-SOAP call was. Kept deliberately narrow (not a public tool) — reach for it only
+when a specific action is confirmed classic-SOAP-dead, the same bar as everything in
+Known limitations below.
 
 ### Known limitations (by design / platform)
 
@@ -492,21 +528,14 @@ except one UI-only step (generating the periods themselves — see Known limitat
   stops on multi-segment (KB-confirmed; structural change = "contact support").
 - **Tenant snapshot (SM203520)** is UI-only — the create dialog's action is server-gated
   behind a client-opened panel the typed SOAP API can't reach, and it requires maintenance
-  mode (which locks the instance). Left as a deliberate manual step.
+  mode (which locks the instance). Left as a deliberate manual step. (Unlike GL201000's
+  gap, this one is genuinely client-gated even in the modern UI, not just missing from the
+  classic shim — not yet attempted via the `/ui/screen/` plane.)
 - **Combo/dropdown allowed-values** aren't exposed by the typed SOAP schema; use
   `screen_preflight` (CSDL mandatory fields) and known enums instead.
 - A list GET (no `record_id`) can't return nested detail collections (Acumatica REST).
-- **Master Financial Calendar generation (GL201000 "Generate Calendar")** is UI-only.
-  The typed screen SOAP schema exposes a matching action tag (`GenerateYears`) and it
-  returns a clean success either way, but it's a confirmed no-op: network capture during
-  a manual UI click showed the browser calling a *different* endpoint entirely
-  (`/t/Company/ui/screen/GL201000`, the modern UI-screen API) rather than the classic
-  `/Soap/GL201000.asmx` typed endpoint this engine uses — the classic SOAP shim's
-  implementation of this specific action isn't wired up on this platform version.
-  Generate periods manually in the UI first; `manage_financial_periods` (GL503000,
-  proven working via classic SOAP) picks up from there for Open/Close/Lock/etc.
 
-Roadmap: GL phase closed (modulo the UI-only calendar-generation step above). Next:
+Roadmap: GL phase fully closed. Next:
 numbering sequences (CS201010) and branches (CS102000) — same tier of foundation
 prerequisite as GL. Also: nested detail rows in `load_from_excel`.
 

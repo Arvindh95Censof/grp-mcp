@@ -1259,6 +1259,45 @@ async def chart_of_accounts(
 
 
 @mcp.tool()
+async def generate_master_calendar(
+    from_year: str, to_year: str | None = None, instance: str | None = None
+) -> Any:
+    """Generate financial periods on the Master Financial Calendar (GL201000).
+
+    The GL101000 financial-year pattern only defines period LENGTHS — no actual
+    Period records exist until this runs. Creates them with status Inactive for
+    the given year range, the prerequisite for manage_financial_periods.
+
+    from_year: first financial year to generate periods for, e.g. "2026". Must
+        already exist as a financial-year pattern (create_financial_calendar).
+    to_year:   last year in the range; omit to generate just from_year.
+
+    NOTE ON MECHANISM: the classic typed screen SOAP API exposes this action's
+    tag (GenerateYears) but its handler isn't wired up there — it returns a
+    clean success with zero effect (confirmed via live testing). The real
+    implementation lives behind the modern UI's own JSON protocol
+    (/ui/screen/GL201000), which this tool drives directly — reusing the SAME
+    login session as the rest of this engine (same cookie, no separate auth).
+    See ScreenClient.ui_command/ui_set_field for the reverse-engineered
+    protocol details.
+
+    Only applies when *Centralized Period Management* is the active mode (one
+    calendar org-wide, the common case). Verify after with screen_get(
+    'GL201000', ['Periods.FinancialPeriodID','Periods.Status']) or
+    run_dac_odata('FinPeriod', filter="FinYear eq '<year>'"). Requires
+    allow_write. (KB: To Generate Financial Periods for the Master Calendar.)
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    to_year = str(to_year or from_year)
+    async with ScreenClient(inst, "GL201000") as s:
+        await s.ui_set_field("GenerateParams", "FromYear", str(from_year))
+        await s.ui_set_field("GenerateParams", "ToYear", to_year)
+        result = await s.ui_command("generateYears")
+    return {"generated": True, "from_year": str(from_year), "to_year": to_year, "raw": result}
+
+
+@mcp.tool()
 async def manage_financial_periods(
     from_year: str,
     to_year: str | None = None,
@@ -1283,12 +1322,11 @@ async def manage_financial_periods(
         (maps to ReopenFinancialPeriodsInAllModules on the filter).
 
     PREREQUISITE: periods must already exist for the range with a status this
-    action can act on (Open needs Inactive, Close needs Open, etc.). Generating
-    them (GL201000 "Generate Calendar") is UI-only — see Known limitations;
-    this tool picks up from there. Verify after with screen_get('GL503000',
-    ['FinPeriods.FinancialPeriodID','FinPeriods.Status']) or setup_readiness
-    (open_periods). Requires allow_write. (KB: Opening Financial Periods —
-    Process Activity.)
+    action can act on (Open needs Inactive, Close needs Open, etc.) —
+    generate_master_calendar creates them Inactive. Verify after with
+    screen_get('GL503000', ['FinPeriods.FinancialPeriodID','FinPeriods.Status'])
+    or setup_readiness (open_periods). Requires allow_write. (KB: Opening
+    Financial Periods — Process Activity.)
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
