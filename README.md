@@ -60,6 +60,7 @@ one confirmed platform gap), so an agent can read and write almost anything:
 | `download_file` | Download a record's attached file to disk. |
 | `get_endpoint_definition` | Read an endpoint's contract (entity tree/props) from SM207060. |
 | `setup_readiness` | Report instance setup state: enabled features + **activation/install status** (Validated vs staged), per-module config gaps (ledger, CoA, customer/vendor class, …), financial calendar, **GL Preferences system accounts**, and **open periods** — the GL-phase gates — vs the implementation checklist. |
+| `get_setup_guidance` | Baked-in **foundation setup map** — per-screen prerequisites, required fields, validation gotchas, correct order, which plane to drive it, and how to verify (System→GL→Common→CA→AP/AR→Tax→Currency). `screen_id=<ID>` for one screen, `area=<CA\|GL\|…>` for an area in order, or empty for the overview + cross-cutting rules. Read-only; the documented layer — recompute required-fields live per-instance. |
 
 **Write**
 
@@ -497,7 +498,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.19 — 63 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.20 — 64 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
 discovery), the **screen-based SOAP engine** (context/master-detail/wizard screens REST
 can't), and the **modern UI-screen plane** (`ui_get_structure` + `ui_screen_action` — the

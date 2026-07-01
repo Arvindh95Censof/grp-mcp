@@ -45,6 +45,18 @@ mcp = FastMCP("grp-mcp", instructions=_KB_FIRST_POLICY)
 
 _config: Config | None = None
 _clients: dict[str, AcumaticaClient] = {}
+_setup_map_cache: dict | None = None
+
+
+def _setup_map() -> dict:
+    """Load the bundled foundation setup map (documented layer). Cached."""
+    global _setup_map_cache
+    if _setup_map_cache is None:
+        from pathlib import Path
+
+        p = Path(__file__).resolve().parent / "setup_map.json"
+        _setup_map_cache = json.loads(p.read_text(encoding="utf-8"))
+    return _setup_map_cache
 
 
 def _cfg() -> Config:
@@ -2361,6 +2373,58 @@ async def _probe_exists(client, dac: str, key: str):
         return len(vals) > 0
     except Exception:
         return None
+
+
+@mcp.tool()
+def get_setup_guidance(screen_id: str | None = None, area: str | None = None) -> Any:
+    """Baked-in Acumatica FOUNDATION setup map — prereqs/required-fields/gotchas/order per screen.
+
+    The documented, version-stable knowledge for standing up the financial foundation
+    (System/Company -> GL -> Common -> CA -> AP/AR -> Tax -> Currency), distilled from the
+    Acumatica KB + proven experience. Consult it BEFORE driving any setup screen so you know
+    the prerequisites, required fields, validation gotchas, correct order, which grp-mcp
+    tool/plane to use, and how to verify — instead of hitting a screen cold and eating a
+    generic error. This is the machine-readable companion to the KB-first policy.
+
+    screen_id: e.g. "CA101000" -> that screen's full guidance + the cross-cutting rules.
+    area:      e.g. "CA" | "GL" | "AP" -> all screens in that area, in setup order.
+    (both omitted) -> overview: scope, cross-cutting rules, canonical order, screen index.
+
+    IMPORTANT — two layers: the returned prereqs/order/gotchas are DOCUMENTED (trust them),
+    but the required-field lists and what's actually configured/licensed are INSTANCE-SPECIFIC
+    — always recompute live with ui_get_structure(<screen>) / run_dac_odata before writing.
+    Read-only, no API session. Scope is the financial foundation only (not Distribution/
+    Projects/Manufacturing/etc. nor the transactional layer).
+    """
+    m = _setup_map()
+    live_reminder = m["layers"]["live"]
+    if screen_id:
+        sid = screen_id.upper()
+        sc = m["screens"].get(sid)
+        if not sc:
+            return {"error": f"'{sid}' is not in the foundation setup map (scope: {m['scope']})",
+                    "covered_screens": sorted(m["screens"]),
+                    "tip": "For screens outside the map, use ui_get_structure + screen_get_schema + KB (search_kb)."}
+        return {"screen_id": sid, **sc,
+                "cross_cutting_rules": m["cross_cutting_rules"], "recompute_live": live_reminder}
+    if area:
+        a = area.upper()
+        scr = [(k, v) for k, v in m["screens"].items() if str(v.get("area", "")).upper() == a]
+        if not scr:
+            return {"error": f"no area '{area}'",
+                    "areas": sorted({v["area"] for v in m["screens"].values()})}
+        scr.sort(key=lambda kv: kv[1].get("order", 999))
+        return {"area": area, "screens": [{"screen_id": k, **v} for k, v in scr],
+                "recompute_live": live_reminder}
+    idx = sorted(m["screens"].items(), key=lambda kv: kv[1].get("order", 999))
+    return {
+        "scope": m["scope"], "source": m["source"], "layers": m["layers"],
+        "cross_cutting_rules": m["cross_cutting_rules"],
+        "canonical_order": m["canonical_order"],
+        "screens": [{"screen_id": k, "name": v["name"], "area": v["area"], "order": v["order"]}
+                    for k, v in idx],
+        "usage": "Call with screen_id=<ID> for a screen's full guidance, or area=<CA|GL|AP|...> for an area in order.",
+    }
 
 
 @mcp.tool()
