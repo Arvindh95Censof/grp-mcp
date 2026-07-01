@@ -101,9 +101,10 @@ def _require_write(instance: str | None) -> None:
         )
 
 
-# Modern UI-screen actions that DELETE data — held to the stricter allow_delete
-# gate (not just allow_write) so the /ui/screen/ plane can't sidestep it.
-_DESTRUCTIVE_UI_ACTIONS = frozenset({"Delete", "DeleteRow", "DeleteDetail", "DeleteAll"})
+# Screen/UI actions that DELETE data — held to the stricter allow_delete gate (not
+# just allow_write) so neither the classic screen SOAP nor the modern /ui/screen/
+# plane can sidestep it. Covers a record Delete AND detail-row deletes.
+_DESTRUCTIVE_ACTIONS = frozenset({"Delete", "DeleteRow", "DeleteDetail", "DeleteAll"})
 
 
 def _require_delete(instance: str | None) -> None:
@@ -855,7 +856,7 @@ async def ui_screen_action(
     _require_write(instance)
     # A destructive action deletes data — hold it to the stricter allow_delete gate,
     # so the modern plane can't sidestep it (parity with delete_entity).
-    if action in _DESTRUCTIVE_UI_ACTIONS:
+    if action in _DESTRUCTIVE_ACTIONS:
         _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -950,9 +951,12 @@ async def screen_submit(
     session so it never holds an API seat at idle (trial = 2 seats — always frees).
     """
     _require_write(instance)
-    # A delete_row destroys a detail row — hold it to the stricter allow_delete gate
-    # (dry_run drops committing commands, so it never actually deletes).
-    if not dry_run and any("delete_row" in c for c in commands):
+    # A delete_row OR a record-level Delete action destroys data — hold it to the
+    # stricter allow_delete gate (dry_run drops committing commands, never deletes).
+    if not dry_run and any(
+        "delete_row" in c or c.get("action") in _DESTRUCTIVE_ACTIONS
+        for c in commands if isinstance(c, dict)
+    ):
         _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -1471,6 +1475,69 @@ async def manage_financial_periods(
                      "to": "True" if reopen_in_subledgers else "False"})
     cmds.append({"action": "ProcessAll"})
     async with ScreenClient(inst, "GL503000") as s:
+        return await s.submit(cmds, auto_answer="Yes")
+
+
+@mcp.tool()
+async def create_numbering_sequence(
+    numbering_id: str,
+    description: str,
+    start_number: str = "000001",
+    end_number: str = "999999",
+    numbering_step: int = 1,
+    warning_number: str | None = None,
+    start_date: str | None = None,
+    new_number_symbol: str | None = None,
+    manual_numbering: bool = False,
+    instance: str | None = None,
+) -> Any:
+    """Create a numbering sequence (CS201010) — header + one subsequence.
+
+    Numbering sequences auto-generate IDs for documents (GL batches, invoices,
+    bills, payments, transfers, allocations, schedules, …) and for auto-numbered
+    segmented-key segments. A Common-Settings foundation screen — no module
+    prerequisite; typically set up before the modules that reference it.
+
+    numbering_id: unique ID, <=10 alphanumeric chars.
+    description:  <=30 chars.
+    start_number / end_number / warning_number: alphanumeric strings, processed
+        as strings with the SAME length (<=15) and same prefix — keep leading
+        zeros (e.g. "000001"). end >= start; warning (if given) >= start.
+    numbering_step: increment added to the rightmost numeric portion (default 1).
+    start_date:   M/D/YYYY the subsequence takes effect (optional).
+    new_number_symbol: placeholder shown until a number is assigned (e.g. "<NEW>").
+    manual_numbering: True = users type document numbers themselves (no auto-gen);
+        the subsequence range is then irrelevant.
+
+    Creates the header + one non-branch subsequence in a single Save. For
+    branch-split subsequences (different prefix/range per branch), use screen_submit
+    with extra NumberingSequenceDetails rows. Requires allow_write. Verify with
+    run_dac_odata('Numbering', filter="NumberingID eq '<id>'"). (KB: Numbering
+    Sequences / Use of Numbering Sequences.)
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    cmds: list[dict] = [
+        {"set": "NumberingID", "to": numbering_id},
+        {"set": "Description", "to": description},
+    ]
+    if manual_numbering:
+        cmds.append({"set": "ManualNumbering", "to": "True"})
+    if new_number_symbol:
+        cmds.append({"set": "NewNumberSymbol", "to": new_number_symbol})
+    D = "NumberingSequenceDetails"
+    cmds.append({"new_row": D})
+    cmds += [
+        {"set": f"{D}.StartNumber", "to": str(start_number)},
+        {"set": f"{D}.EndNumber", "to": str(end_number)},
+        {"set": f"{D}.NumberingStep", "to": str(numbering_step)},
+    ]
+    if warning_number:
+        cmds.append({"set": f"{D}.WarningNumber", "to": str(warning_number)})
+    if start_date:
+        cmds.append({"set": f"{D}.StartDate", "to": str(start_date)})
+    cmds.append({"action": "Save"})
+    async with ScreenClient(inst, "CS201010") as s:
         return await s.submit(cmds, auto_answer="Yes")
 
 

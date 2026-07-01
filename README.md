@@ -88,6 +88,7 @@ one confirmed platform gap), so an agent can read and write almost anything:
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
 | `set_gl_preferences` | Set GL Preferences (GL102000): Retained Earnings + YTD Net Income system accounts (Liability) + posting flags → Save. The GL-phase keystone for posting. |
 | `chart_of_accounts` | Create Chart of Accounts rows (GL202500) in one transaction (recipe over screen_insert_rows; dialog auto-answered). |
+| `create_numbering_sequence` | Create a numbering sequence (CS201010): header + one subsequence (start/end/warning/step) → Save. Foundation prerequisite — auto-generates document IDs (GL batches, invoices, bills, …) and auto-numbered key segments. |
 | `create_segmented_key` | Create a segmented key + its segments on Segment Keys (CS202000) — the prerequisite for `set_segment_value`. |
 | `set_segment_value` | Add a value to a segment on Segment Values (CS203000) — navigates the header with a descriptor `set` so the value lands in the right segment. Requires the key to exist on CS202000 first. |
 | `delete_segmented_key` | Tear down a segmented key in the correct children-first order (values → segment → master); recovers orphaned keys by recreating the master. Single-segment keys only (multi-segment reported for UI). |
@@ -221,9 +222,10 @@ tools are sandboxed:
   `attach_file`, `attach_file_to_provider`, `screen_submit`, `ui_screen_action`)
   require `"allow_write": true`. **Deletes require the stricter
   `"allow_delete": true` across ALL planes** — not just `delete_entity`, but also
-  a `screen_submit` `delete_row`, `delete_segmented_key`, and a destructive
-  `ui_screen_action` (e.g. `action="Delete"`), so the screen/UI planes can't
-  sidestep the delete gate. Customization publish/import/unpublish require
+  a `screen_submit` `delete_row` **or record-level `Delete` action**,
+  `delete_segmented_key`, and a destructive `ui_screen_action` (e.g.
+  `action="Delete"`), so the screen/UI planes can't sidestep the delete gate.
+  Customization publish/import/unpublish require
   `"allow_publish": true`. **Default is read-only.**
 - **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
   `load_from_excel`) or write (`download_file`, `run_report`, `snapshot_entity`,
@@ -495,7 +497,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.19 — 62 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.19 — 63 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports), DAC + GI OData (incl. CSDL metadata / mandatory-field
 discovery), the **screen-based SOAP engine** (context/master-detail/wizard screens REST
 can't), and the **modern UI-screen plane** (`ui_get_structure` + `ui_screen_action` — the

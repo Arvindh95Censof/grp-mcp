@@ -94,8 +94,9 @@ def test_delete_gate_is_independent_of_write(monkeypatch):
         server._require_delete("d")
 
 
-def test_destructive_ui_actions_include_delete():
-    assert "Delete" in server._DESTRUCTIVE_UI_ACTIONS
+def test_destructive_actions_include_delete():
+    assert "Delete" in server._DESTRUCTIVE_ACTIONS
+    assert "DeleteRow" in server._DESTRUCTIVE_ACTIONS
 
 
 # ---- value wrapper ----------------------------------------------------------
