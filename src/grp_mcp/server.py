@@ -1848,62 +1848,98 @@ async def enable_features(
 
 
 @mcp.tool()
-async def activate_features(timeout_s: float = 180.0, instance: str | None = None) -> Any:
-    """Activate/install the staged feature set on CS100000 (the "Enable" button).
-
-    This is the apply step that enable_features (Save) does NOT do on its own: it
-    invokes the screen's RequestValidation action — the SOAP equivalent of the
-    "Enable" toolbar button — which validates the license, activates the selected
-    features, and RECOMPILES the site. ActivationStatus goes "Pending Activation"
-    -> "Validated".
-
-    The recompile briefly restarts the site (~1-3 min; in-flight requests 500
-    during it). This tool fires RequestValidation, then POLLS ActivationStatus
-    until it reads "Validated" (tolerating the restart errors) or `timeout_s`
-    elapses — so it returns a definitive activated=true/false, not just "submitted".
-    It activates whatever is currently staged, so set the intended flags
-    (enable_features) first. Requires allow_write.
-    """
-    _require_write(instance)
-    inst = _cfg().get(instance or _cfg().default)
-    poll_interval, deadline = 10.0, max(30.0, float(timeout_s))
-    fire = {"ok": None}
-    try:
-        # the recompile may kill this in-flight request — expected; the poll below
-        # is the source of truth, not this call's return.
-        async with ScreenClient(inst, "CS100000", timeout=poll_interval + 5) as s:
-            fire = await s.submit([{"action": "RequestValidation"}], auto_answer="Yes")
-    except Exception as e:  # noqa: BLE001 — recompile commonly drops the connection
-        fire = {"ok": None, "transport": str(e)[:160]}
-
-    status, elapsed = None, 0.0
-    while elapsed < deadline:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
+async def _activation_status(inst, poll_interval: float, budget: float) -> str | None:
+    """Poll CS100000 ActivationStatus for up to `budget` seconds, tolerating the
+    transient errors the site restart throws; return the last status seen (or
+    "Validated" as soon as observed)."""
+    elapsed, status = 0.0, None
+    while True:
         try:
             async with ScreenClient(inst, "CS100000", timeout=poll_interval) as s:
                 rows = (await s.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
             status = rows[0].get("Status") if rows else None
             if status == "Validated":
-                return {
-                    "activated": True,
-                    "activation_status": status,
-                    "waited_s": round(elapsed, 1),
-                    "fire_result": fire,
-                }
+                return status
         except Exception:  # noqa: BLE001 — site still recompiling; keep polling
             status = "unknown (site recompiling)"
+        if elapsed >= budget:
+            return status
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+
+async def activate_features(wait_seconds: float = 40.0, instance: str | None = None) -> Any:
+    """Activate/install the staged feature set on CS100000 (the "Enable" button) —
+    NON-BLOCKING (won't hang on the recompile).
+
+    The apply step enable_features (Save) does NOT do: it fires the "Enable" button
+    (via the MODERN UI plane's `requestValidation` command — the classic SOAP
+    RequestValidation action NREs on a large feature set), which validates the
+    license, activates the staged features, and RECOMPILES the site (~1-3 min). Unlike a customization publish, the
+    activation runs to completion SERVER-SIDE on its own — polling ActivationStatus
+    only OBSERVES it. So this fires RequestValidation, watches ActivationStatus for up
+    to `wait_seconds`, then returns:
+      • status "completed"  — ActivationStatus reached "Validated" in time;
+      • status "in_progress" — still recompiling; it WILL finish on its own. Poll
+        `activate_features_status()` until activated=true (do NOT re-fire this — a
+        second RequestValidation restarts the recompile).
+
+    Activates whatever is currently staged, so set the flags (enable_features) first.
+    wait_seconds clamped to [5, 120]. Requires allow_write.
+    """
+    _require_write(instance)
+    _require_range("wait_seconds", wait_seconds, 5, 120)
+    inst = _cfg().get(instance or _cfg().default)
+    poll_interval = 8.0
+    # Fire the Enable button via the MODERN UI-screen plane (command "requestValidation"),
+    # NOT the classic SOAP RequestValidation action: on a large feature set the SOAP
+    # submit replays every feature field and NREs ("Object reference not set ...
+    # ProjectAccounting", proven live 2026-07-02), leaving ActivationStatus stuck at
+    # "Pending Activation". The modern plane fires it as a plain command (no field
+    # replay) and returns a reloadPage redirect as the recompile starts. The recompile
+    # may drop this in-flight request — fine, activation proceeds server-side and we
+    # observe it via ActivationStatus.
+    fire: dict = {"ok": None}
+    try:
+        async with ScreenClient(inst, "CS100000", timeout=poll_interval + 5) as s:
+            await s.ui_bootstrap()
+            fire = await s.ui_command("requestValidation")
+    except Exception as e:  # noqa: BLE001 — recompile commonly drops the connection
+        fire = {"ok": None, "transport": str(e)[:160]}
+    status = await _activation_status(inst, poll_interval, wait_seconds)
+    activated = status == "Validated"
     return {
-        "activated": status == "Validated",
+        "activated": activated,
         "activation_status": status,
-        "waited_s": round(elapsed, 1),
+        "status": "completed" if activated else "in_progress",
         "fire_result": fire,
-        "note": (
-            "Did not observe 'Validated' within timeout_s — the recompile may still "
-            "be finishing. Re-check screen_get('CS100000', ['GeneralSettings."
-            "ActivationStatus']); raise timeout_s for big feature sets."
+        "note": None if activated else (
+            "Feature activation/recompile is still running server-side — it finishes "
+            "on its own (usually 1-3 min). Poll activate_features_status() until "
+            "activated=true; do NOT re-run activate_features (that restarts the recompile)."
         ),
     }
+
+
+@mcp.tool()
+async def activate_features_status(instance: str | None = None) -> Any:
+    """Check CS100000 feature-activation status — a single quick read (no recompile,
+    no polling loop). After activate_features returns status "in_progress", poll this
+    until activated=true.
+
+    Returns {activated, activation_status}. activated is True only when
+    ActivationStatus == "Validated". During the recompile the read can transiently
+    fail — reported as activation_status "unknown (site recompiling)", just poll again.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    try:
+        async with ScreenClient(inst, "CS100000", timeout=15) as s:
+            rows = (await s.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
+        status = rows[0].get("Status") if rows else None
+    except Exception as e:  # noqa: BLE001 — site still recompiling
+        return {"activated": False, "activation_status": "unknown (site recompiling)",
+                "error": str(e)[:160]}
+    return {"activated": status == "Validated", "activation_status": status}
 
 
 @mcp.tool()

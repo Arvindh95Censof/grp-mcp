@@ -96,7 +96,8 @@ write almost anything:
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
 | `enable_features` | Set feature flags on Enable/Disable Features (CS100000) + Save (stages them). Pass `activate=True` to also install them. |
-| `activate_features` | Activate/install the staged feature set (CS100000 RequestValidation = the "Enable" button) — recompiles the site, then polls ActivationStatus until "Validated" (returns activated=true/false). |
+| `activate_features` | Activate/install the staged feature set (CS100000 "Enable" button) — fires it via the **modern UI plane** (`requestValidation`; the classic SOAP action NREs on a large feature set), recompiles the site, then **non-blocking**: watches ActivationStatus for up to `wait_seconds` (default 40) and returns status `completed` \| `in_progress`. A long recompile finishes on its own — poll `activate_features_status`. |
+| `activate_features_status` | Quick single read of CS100000 ActivationStatus (no recompile) — poll after `activate_features` returns `in_progress` until activated=true. |
 | `create_financial_calendar` | Create the financial calendar (GL101000): first year → AutoFill → optional start date (`starts_on`, M/D/YYYY — set after AutoFill, dialog auto-answered) → Save. Fully SOAP, no UI. |
 | `generate_master_calendar` | Generate financial periods (GL201000 "Generate Calendar") for a year range. Classic SOAP exposes this action's tag but it's a no-op there; this recipe drives the modern UI-screen JSON protocol instead (same login session, no browser). |
 | `create_ledger` | Create a GL ledger (GL201500): LedgerID/Description/Type/Currency → Save. |
@@ -557,7 +558,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.32 — 73 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.33 — 74 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen
