@@ -324,6 +324,17 @@ class ScreenClient:
             j = None
         failed = resp.status_code >= 400
         if isinstance(j, dict):
+            # An unauthenticated / expired modern-plane session doesn't 401 with a
+            # clean error — the ASP.NET app answers 200/302 with a redirect body
+            # pointing at Login.aspx. Without this, that body parses as "no error,
+            # empty data" and the caller silently gets an empty structure/grid and
+            # misattributes the cause (proven: a bare _http.get without login() read
+            # as "the maintenance lockout is blocking the plane", 2026-07-02).
+            redir = j.get("redirect")
+            if isinstance(redir, str) and "Login.aspx" in redir:
+                return ("NOT AUTHENTICATED — the modern-plane session is missing or "
+                        "expired (server redirected to Login.aspx). Ensure login() ran "
+                        "first; through the MCP tools this is automatic.")
             if j.get("type") == "SetupNotEntered":
                 return ("PREREQUISITE NOT MET — this screen's module is not configured "
                         "yet (SetupNotEntered). Configure its Preferences/Setup form first.")
@@ -355,6 +366,8 @@ class ScreenClient:
         per-session rule instead (each tool uses only classic OR only modern),
         with a best-effort re-bootstrap in _ui_post if the two ever interleave.
         """
+        if not self._logged_in:
+            await self.login()
         vp = {v: {} for v in (views or [])}
         await self._http.post(
             self.ui_url,
@@ -397,6 +410,12 @@ class ScreenClient:
             raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
 
     async def _ui_post(self, payload: dict) -> httpx.Response:
+        # The modern plane rides the SOAP login cookie (same ASP.NET app). If no
+        # login has run this session, self-authenticate rather than silently
+        # bouncing to Login.aspx (which _ui_error would now flag, but self-healing
+        # is cheaper than erroring on a recoverable state).
+        if not self._logged_in:
+            await self.login()
         # Ensure a graph exists (fallback bootstrap). Re-bootstrap if a classic SOAP
         # op ran since (the planes keep separate graph state — interleaving them in
         # one session can collide, e.g. a 409 on Save). Callers editing an existing
@@ -703,6 +722,8 @@ class ScreenClient:
         fields. Use it to discover what ui_set_field/ui_command can drive on any
         screen — no browser capture needed. Read-only GET (stateless, no bootstrap).
         """
+        if not self._logged_in:
+            await self.login()
         resp = await self._http.get(self.ui_url + "/structure", headers={"Accept": "application/json"})
         err = self._ui_error(resp)
         if err:
@@ -870,6 +891,110 @@ class ScreenClient:
             raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
         return resp.json()
 
+    async def ui_grid_row_action(self, grid_view: str, row_key: dict, action: str,
+                                  parent: dict | None = None, confirm: bool = True) -> dict:
+        """Select an EXISTING grid row by key, then fire a screen-level ACTION on it.
+
+        Closes the one capability the classic SOAP plane structurally lacks: it can
+        navigate to a keyed MASTER record but cannot select an arbitrary existing
+        GRID row by key, so a "click this row, then hit a toolbar button" flow
+        (SM203520 Restore Snapshot; any process-a-selected-row screen) is
+        impossible there. The modern plane addresses a row via activeRowContexts
+        (GridActiveDataRow), which is what this drives.
+
+        grid_view: the grid container/view (from get_ui_structure `grids`, e.g.
+            "Snapshots" on SM203520).
+        row_key:   {keyField: value} identifying the row (key fields from
+            get_ui_structure grids[grid_view].key_fields, e.g. {"SnapshotID": ...}).
+        action:    the internal command to fire with that row active (from
+            get_ui_structure `actions`, e.g. "importSnapshotCommand").
+        parent:    MASTER-DETAIL / tenant-scoped screens — {"view", "key"} to load
+            the header record first (e.g. SM203520 {"view":"Companies",
+            "key":{"CompanyID":3}}); the grid + row are then addressed under it.
+            None for a top-level grid.
+        confirm:   auto-answer a 302 openDialog with OK (WebDialogResult.OK). Set
+            False to leave a confirmation dialog UN-answered (the action then only
+            opens the dialog and does NOT commit) — a safe "arm without firing".
+
+        Returns {ok, grid_view, row_key, action, status, dialog_view?, redirect?,
+        graph_is_dirty, messages}. `status` is "committed" (action ran / dialog
+        answered), "dialog_open" (confirm=False, dialog left open), or "redirected"
+        (server answered with a goTo — e.g. Restore redirects to SM203510 to run/
+        monitor; NOT an error, but not a synchronous completion either — verify the
+        downstream effect). Raises ScreenError on an explicit business/validation
+        error. Requires allow_write for a committing action.
+
+        PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+        """
+        # 1. load the header (and the grid) so the row is addressable.
+        if parent:
+            await self.ui_grid_read(grid_view, parent)
+        else:
+            await self.ui_bootstrap([grid_view])
+        active = [{"dataView": grid_view, "syncPosition": True,
+                    "dataKey": row_key, "resultType": "GridActiveDataRow"}]
+        views = {grid_view: {}}
+        if parent:
+            views[parent["view"]] = {}
+        # 2. fire the action with the row active.
+        resp = await self._http.post(self.ui_url, json={
+            "command": [{"name": action}], "data": [],
+            "controlsParams": {}, "activeRowContexts": active, "viewsParams": views,
+        }, headers=_UI_HEADERS)
+        dialog_view = None
+        status = "committed"
+        if resp.status_code == 302:
+            body = resp.json()
+            goto = None
+            for r in body.get("redirects", []):
+                s = r.get("settings", {})
+                if s.get("type") == "openDialog":
+                    dialog_view = s.get("viewName")
+                elif s.get("type") == "goTo":
+                    goto = r.get("url")
+            if dialog_view and not confirm:
+                return {"ok": True, "grid_view": grid_view, "row_key": row_key,
+                        "action": action, "status": "dialog_open",
+                        "dialog_view": dialog_view, "graph_is_dirty": None,
+                        "messages": []}
+            if dialog_view:
+                # answer OK — the real commit; keep the row active + dialogCallback.
+                resp = await self._http.post(self.ui_url, json={
+                    "command": [{"name": action}], "data": [],
+                    "dialogCallback": {"dialogResult": 1, "validateInput": False,
+                                        "viewName": dialog_view},
+                    "controlsParams": {}, "activeRowContexts": active, "viewsParams": views,
+                }, headers=_UI_HEADERS)
+            elif goto:
+                # a bare goTo (no dialog) — the action handed off to another screen.
+                err = self._ui_error(resp)
+                if err:
+                    raise ScreenError(f"ui_grid_row_action {action} on {self.screen_id}: {err}")
+                return {"ok": True, "grid_view": grid_view, "row_key": row_key,
+                        "action": action, "status": "redirected", "redirect": goto,
+                        "graph_is_dirty": None, "messages": []}
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_grid_row_action {action} on {self.screen_id}: {err}")
+        # a committing action can STILL answer with a post-commit goTo (e.g. Restore
+        # → SM203510 to run/monitor). Surface that honestly rather than as a plain OK.
+        redirect = None
+        j = {}
+        try:
+            j = resp.json()
+        except Exception:  # noqa: BLE001
+            j = {}
+        if resp.status_code == 302:
+            for r in j.get("redirects", []):
+                if r.get("settings", {}).get("type") == "goTo":
+                    redirect = r.get("url")
+                    status = "redirected"
+        return {"ok": True, "grid_view": grid_view, "row_key": row_key,
+                "action": action, "status": status, "redirect": redirect,
+                "dialog_view": dialog_view,
+                "graph_is_dirty": j.get("graphIsDirty"),
+                "messages": [m.get("message") for m in (j.get("messages") or [])]}
+
     # ---- modern-plane GRID editing (existing-row update) ----------------
     #
     # Editing an EXISTING grid row is NOT possible on the classic screen-SOAP
@@ -896,6 +1021,8 @@ class ScreenClient:
         targets it (and the child's parent-link id is auto-filled server-side).
         parent=None → a top-level grid. (Proven: CA202000 CashAccount→ETDetails.)
         """
+        if not self._logged_in:
+            await self.login()
         if parent:
             pv = parent["view"]
             await self._http.post(self.ui_url, json={

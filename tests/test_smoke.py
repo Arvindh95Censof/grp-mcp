@@ -170,6 +170,26 @@ def test_ui_error_500_title_detail():
     assert ScreenClient._ui_error(_Resp(500, {"title": "x", "detail": "y"})) == "Error: y"
 
 
+def test_ui_error_login_redirect_200_is_auth_error():
+    # an unauthenticated/expired modern-plane session answers 200 with a Login
+    # redirect body — must surface as a clear auth error, not silent None.
+    r = _Resp(200, {"redirect": "/2026R1/Frames/Login.aspx?ReturnUrl=%2f..."})
+    msg = ScreenClient._ui_error(r)
+    assert msg is not None and "NOT AUTHENTICATED" in msg
+
+
+def test_ui_error_login_redirect_302_is_auth_error():
+    r = _Resp(302, {"redirect": "/2026R1/Frames/Login.aspx"})
+    assert "NOT AUTHENTICATED" in ScreenClient._ui_error(r)
+
+
+def test_ui_error_non_login_redirect_not_flagged_as_auth():
+    # a goTo/other redirect (e.g. post-restore hand-off to SM203510) is NOT an
+    # auth failure — the Login-specific guard must not swallow it as one.
+    r = _Resp(200, {"redirect": "/Scripts/Screens/SalesDemo/SM203510.html"})
+    assert ScreenClient._ui_error(r) is None
+
+
 # ---- modern-plane GRID CRUD payload shapes ---------------------------------
 #
 # These lock the exact JSON the grid write path emits. The bugs they guard
@@ -196,7 +216,11 @@ class _FakeHTTP:
 
 
 def _client(screen: str = "GL202500") -> ScreenClient:
-    return ScreenClient(_inst(), screen)
+    s = ScreenClient(_inst(), screen)
+    # these tests unit-test payload SHAPING with a fake _http; mark the session
+    # authenticated so the self-heal login() guard (real network) stays a no-op.
+    s._logged_in = True
+    return s
 
 
 def _read_body(grid: str, columns, rows, key_names, qff=None) -> dict:
@@ -621,3 +645,58 @@ def test_snapshot_entity_default_path_respects_write_roots(monkeypatch):
     monkeypatch.delenv("GRP_MCP_CONNECTIONS", raising=False)
     with pytest.raises(PermissionError):
         asyncio.run(server.snapshot_entity("SomeEntity", instance="restricted"))
+
+
+# ---- ui_grid_row_action: select an existing grid row, then fire an action ----
+# The capability the classic SOAP plane structurally lacks (it cannot address an
+# existing grid row by key). Verify the row is made active via activeRowContexts
+# (GridActiveDataRow with the row key), the action fires, and a 302 openDialog is
+# auto-answered with a dialogCallback OK (dialogResult:1).
+
+def test_ui_grid_row_action_selects_row_and_answers_dialog():
+    s = _client("SM203520")
+    s._ui_booted = True  # skip the bootstrap network round-trip
+    calls = []
+
+    async def fake_post(url, json, headers=None):  # noqa: A002
+        calls.append(json)
+        # first command call -> a confirmation dialog would open (302)
+        if json.get("command") and "dialogCallback" not in json:
+            return _Resp(302, {"redirects": [
+                {"settings": {"type": "openDialog", "viewName": "SnapshotsHistory"}}]})
+        return _Resp(200, {"graphIsDirty": False, "messages": []})
+
+    s._http.post = fake_post
+    res = asyncio.run(s.ui_grid_row_action(
+        "Snapshots", {"SnapshotID": "abc"}, "importSnapshotCommand"))
+    fires = [c for c in calls if c.get("command")]
+    # the action fired with the row active as a GridActiveDataRow
+    arc = fires[0]["activeRowContexts"]
+    assert arc == [{"dataView": "Snapshots", "syncPosition": True,
+                    "dataKey": {"SnapshotID": "abc"}, "resultType": "GridActiveDataRow"}]
+    # the 302 openDialog was answered OK on the follow-up call, row still active
+    assert fires[-1]["dialogCallback"] == {
+        "dialogResult": 1, "validateInput": False, "viewName": "SnapshotsHistory"}
+    assert fires[-1]["activeRowContexts"] == arc
+    assert res["ok"] and res["status"] == "committed"
+
+
+def test_ui_grid_row_action_confirm_false_leaves_dialog_open():
+    """confirm=False must NOT answer the dialog — a safe arm-without-firing for a
+    destructive action."""
+    s = _client("SM203520")
+    s._ui_booted = True
+    calls = []
+
+    async def fake_post(url, json, headers=None):  # noqa: A002
+        calls.append(json)
+        if json.get("command"):
+            return _Resp(302, {"redirects": [
+                {"settings": {"type": "openDialog", "viewName": "SnapshotsHistory"}}]})
+        return _Resp(200, {})
+
+    s._http.post = fake_post
+    res = asyncio.run(s.ui_grid_row_action(
+        "Snapshots", {"SnapshotID": "abc"}, "importSnapshotCommand", confirm=False))
+    assert res["status"] == "dialog_open"
+    assert not any("dialogCallback" in c for c in calls)  # never committed

@@ -880,6 +880,73 @@ async def ui_get_structure(screen_id: str, instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+async def screen_capabilities(screen_id: str, instance: str | None = None) -> Any:
+    """Recommend WHICH plane/tool to drive a screen with — the router for "use JSON
+    or SOAP when needed" so you don't discover the right plane by trial-and-error.
+
+    Probes the modern `/structure` (views, grids, selectors, action inventory) and
+    derives, per operation shape, the tool to reach for and why. Encodes the
+    plane-by-shape decision rule (also in setup_map.json cross_cutting_rules):
+
+      - EDIT a keyed master record / bulk-append detail rows  -> classic SOAP
+        (screen_record / screen_insert_rows): simple, frees the API seat, and the
+        ONLY plane that works during a maintenance lockout (auth is per-call, not
+        the cookie/forms session the modern plane rides).
+      - SELECT an existing grid row / tree node, THEN act      -> modern
+        (ui_grid_row_action / ui_select_tree_node + ui_screen_action): SOAP
+        cannot address an existing grid row by key.
+      - DIALOG / process action (Generate Calendar, Restore)   -> modern
+        (ui_screen_action / ui_grid_row_action): the classic SOAP handler for
+        these is often a silent no-op.
+      - a field marked `selector`                              -> ui_resolve_selector
+        first (setting a selector's plain text does not bind).
+      - an entity already on the endpoint contract             -> REST
+        (create_or_update_entity / get_entity): no screen driving needed.
+
+    Returns {screen_id, primary_dac, grids, actions, selector_fields,
+    recommendations:[{operation, plane, tool, why}]}. Read-only GET. Advisory: the
+    documented rule is stable, but always confirm the live required/enabled state
+    with ui_get_structure before a write. (KB-first policy still applies.)
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+    grids = struct.get("grids") or {}
+    actions = [a["name"] for a in struct.get("actions") or []]
+    selectors = sorted({f["field"] for v in (struct.get("views") or {}).values()
+                        for f in v if f.get("selector")})
+    recs = []
+    if grids:
+        recs.append({"operation": "select an existing grid row then run an action on it",
+                     "plane": "modern", "tool": "ui_grid_row_action",
+                     "why": "SOAP cannot address an existing grid row by key; the modern "
+                            "plane selects it via activeRowContexts."})
+        recs.append({"operation": "read grid rows (live DB state)",
+                     "plane": "modern", "tool": "ui_read_grid",
+                     "why": "reflects the live grid the write tools see; clearSession forces a DB reload."})
+        recs.append({"operation": "edit an existing grid row in place",
+                     "plane": "modern", "tool": "ui_update_grid_row",
+                     "why": "row addressed by key; SOAP RowNumber does not move the cursor."})
+        recs.append({"operation": "append detail/grid rows in bulk",
+                     "plane": "SOAP", "tool": "screen_insert_rows",
+                     "why": "one Save commits N new rows; simplest for pure appends."})
+    recs.append({"operation": "edit a keyed master record (set fields + Save)",
+                 "plane": "SOAP", "tool": "screen_record",
+                 "why": "simple, idempotent, frees the API seat, and works during a maintenance lockout."})
+    recs.append({"operation": "fire a dialog / process action",
+                 "plane": "modern", "tool": "ui_screen_action (or ui_grid_row_action if row-scoped)",
+                 "why": "the classic SOAP handler for many dialog actions is a silent no-op; "
+                        "the real implementation is the modern JSON protocol."})
+    if selectors:
+        recs.append({"operation": f"set a selector/lookup field ({', '.join(selectors)})",
+                     "plane": "modern", "tool": "ui_resolve_selector (then pass its value)",
+                     "why": "setting a selector field's plain text does not bind."})
+    return {"screen_id": screen_id.upper(), "primary_dac": struct.get("primary_dac"),
+            "grids": {g: gd.get("key_fields") for g, gd in grids.items()},
+            "actions": actions, "selector_fields": selectors, "recommendations": recs}
+
+
+@mcp.tool()
 async def ui_resolve_selector(
     screen_id: str,
     view: str,
@@ -1047,6 +1114,80 @@ async def ui_screen_action(
         result = await s.ui_command(action)
     return {"screen_id": screen_id.upper(), "action": action, "set_fields": set_fields or [],
             "record_key": record_key, "tree_select": tree_select, "ok": True, "raw": result}
+
+
+@mcp.tool()
+async def ui_grid_row_action(
+    screen_id: str,
+    grid_view: str,
+    row_key: dict,
+    action: str,
+    parent: dict | None = None,
+    confirm: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Select an EXISTING grid row by key, then fire a screen-level ACTION on it —
+    the "click a row in the grid, then hit a toolbar button" flow.
+
+    Closes the one thing the classic screen-SOAP plane structurally CANNOT do: it
+    navigates to a keyed MASTER record fine, but cannot select an arbitrary
+    existing GRID row by key, so a process-the-selected-row action is impossible
+    there (proven live 2026-07-02: SM203520 Restore Snapshot faulted "A snapshot is
+    not selected" via SOAP because the Snapshots row could not be made active). The
+    modern plane addresses the row via activeRowContexts, which this drives.
+
+    grid_view: the grid container/view (from ui_get_structure `grids`, e.g.
+        "Snapshots" on SM203520).
+    row_key:   {keyField: value} identifying the row (keys from ui_get_structure
+        grids[grid_view].key_fields, e.g. {"SnapshotID": "459edf6a-..."}).
+    action:    the internal command to fire with that row active (from
+        ui_get_structure `actions`, e.g. "importSnapshotCommand").
+    parent:    tenant-scoped / master-detail screens — {"view", "key"} to load the
+        header first (e.g. SM203520 {"view":"Companies","key":{"CompanyID":3}} to
+        target the SalesDemo tenant). Omit for a top-level grid.
+    confirm:   auto-answer a confirmation dialog with OK (default True). False =
+        "arm without firing": the action opens its dialog but is NOT committed
+        (status "dialog_open") — a safe dry-run for a destructive action.
+
+    Returns {ok, status, ...}. status is "committed" (ran / dialog answered),
+    "dialog_open" (confirm=False), or "redirected" (server answered with a goTo —
+    e.g. Restore hands off to SM203510 to run/monitor; that is NOT a synchronous
+    completion, so verify the downstream effect yourself). Validates grid_view +
+    action against /structure first (both silently no-op if wrong on this
+    protocol). Requires allow_write for a committing action.
+
+    PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+
+    Example — restore a snapshot into the SalesDemo tenant on SM203520:
+        ui_grid_row_action("SM203520", grid_view="Snapshots",
+            row_key={"SnapshotID": "459edf6a-70e3-4d88-ae5d-235b761e34c9"},
+            action="importSnapshotCommand",
+            parent={"view": "Companies", "key": {"CompanyID": 3}})
+    """
+    if confirm:
+        _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        valid_actions = {a["name"] for a in struct["actions"]}
+        if action not in valid_actions:
+            raise ScreenError(
+                f"ui_grid_row_action: unknown action {action!r} on {screen_id.upper()}. "
+                f"Available: {sorted(valid_actions)}"
+            )
+        if grid_view not in struct["grids"]:
+            raise ScreenError(
+                f"ui_grid_row_action: unknown grid {grid_view!r} on {screen_id.upper()}. "
+                f"Grids: {sorted(struct['grids'])}"
+            )
+        if parent and parent.get("view") not in struct["views"]:
+            raise ScreenError(
+                f"ui_grid_row_action: unknown parent view {parent.get('view')!r} on "
+                f"{screen_id.upper()}. Views: {sorted(struct['views'])}"
+            )
+        result = await s.ui_grid_row_action(grid_view, row_key, action,
+                                            parent=parent, confirm=confirm)
+    return {"screen_id": screen_id.upper(), **result}
 
 
 @mcp.tool()

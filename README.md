@@ -82,6 +82,7 @@ write almost anything:
 | `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
 | `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
 | `ui_get_structure` | Discover a screen via the **modern UI-screen API** (`/ui/screen/<ID>/structure`): views → fields (type, required, readonly, enabled, **enum allowed-values**), the live action inventory (enabled/visible/confirmation), and grid key fields. Richer than screen_get_schema; a live workflow-aware preflight. Read-only, any Modern-UI screen. |
+| `screen_capabilities` | Recommend WHICH plane/tool to drive a screen with — the router for "use JSON or SOAP when needed". Probes `/structure` and returns, per operation shape (edit master, select-row-then-act, dialog action, selector field, on-contract entity), the tool to use and why. Encodes the plane-by-shape rule so you don't find the right plane by trial-and-error. Read-only. |
 | `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). `tree_select` selects a TREE node first (trees aren't grids); `record_key` scopes a keyed primary view to one record. Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). FORM-view fields only — for a GRID cell, use the grid tools below. |
 | `ui_resolve_selector` | Resolve a lookup/selector FORM field (per `ui_get_structure`'s `selector` marker) to its `{id, text}` value — the modern-plane equivalent of clicking the magnifier, searching, and picking a row. `pick` disambiguates duplicate titles (common across modules). Generalizes to any selector on any screen from its own `/structure` metadata. Read-only, no gate. |
 | `ui_tree_dialog_insert` | Add a child under a TREE node via its INSERT DIALOG — the full "select node → Insert → fill popup → OK → Save" flow (the capability behind adding an entity to a web-service endpoint, SM207060). Runs the real UI's 5-phase sequence in one call. Resolve selector fields with `ui_resolve_selector` first. `record_key` scopes a keyed primary view. Requires allow_write. |
@@ -90,6 +91,7 @@ write almost anything:
 | `ui_insert_grid_row` | Append a NEW row to a GRID on the modern UI-screen plane (`changes.inserted`). `parent` targets a CHILD grid under a header — the parent-linkage id is auto-filled server-side, so `values` needs only the child's own fields. Requires allow_write. |
 | `ui_update_grid_row` | Edit ONE **existing** GRID row in place on the modern UI-screen plane (`changes.modified`) — the capability classic screen SOAP lacks (its positional row selector is inert, see Known limitations). Matched by key; `parent` targets a CHILD grid under a header. Requires allow_write. |
 | `ui_delete_grid_row` | Delete an existing GRID row (matched by key) on the modern UI-screen plane (`changes.deleted`). `parent` targets a CHILD grid under a header. **Requires allow_delete.** |
+| `ui_grid_row_action` | Select an EXISTING grid row by key, then fire a screen-level ACTION on it (the "click a row → hit a toolbar button" flow) — closes the one thing classic SOAP structurally can't do (it can't address an existing grid row by key; proven: SM203520 Restore Snapshot faults "A snapshot is not selected" via SOAP). Auto-answers the confirmation dialog; `confirm=False` arms without committing; `parent` scopes a tenant/master. Returns an honest `status` (committed / dialog_open / redirected). Requires allow_write. |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |
@@ -543,16 +545,19 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.29 — 71 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.30 — 73 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen
 plane** (`ui_get_structure` + `ui_screen_action` for dialog actions classic SOAP can't reach,
 enum-value discovery, and live workflow-aware state — plus full **grid CRUD**,
 `ui_read_grid`/`ui_insert_grid_row`/`ui_update_grid_row`/`ui_delete_grid_row`, on top-level
-and master-detail grids; **tree + insert-dialog** screens via `ui_resolve_selector` +
+and master-detail grids; `ui_grid_row_action` to select an existing row then fire a toolbar
+action on it — the row-scoped action SOAP can't reach, e.g. SM203520 Restore Snapshot;
+**tree + insert-dialog** screens via `ui_resolve_selector` +
 `ui_tree_dialog_insert` + `ui_populate_endpoint_entity_fields`, e.g. creating a
-web-service-endpoint entity AND exposing its fields on SM207060 — end to end, no browser). On top sit setup recipes — `enable_features` + `activate_features`
+web-service-endpoint entity AND exposing its fields on SM207060 — end to end, no browser;
+and `screen_capabilities` to pick the right plane/tool per operation). On top sit setup recipes — `enable_features` + `activate_features`
 (install/recompile), `create_financial_calendar` (incl. start date), `create_ledger`,
 `create_numbering_sequence`, `create_segmented_key` → `set_segment_value`,
 `chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
