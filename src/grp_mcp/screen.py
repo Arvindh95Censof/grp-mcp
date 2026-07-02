@@ -56,6 +56,126 @@ class ScreenError(RuntimeError):
     pass
 
 
+def _tree_ancestor_values(ancestor_keys: list[dict] | None) -> list:
+    """The bare key VALUES of a node's ancestors (root → immediate parent), in order.
+    ancestor_keys items are single-field {keyField: value} dicts."""
+    return [next(iter(a.values())) for a in (ancestor_keys or [])]
+
+
+def _tree_active_row_context(tree_view: str, node_key: dict,
+                              ancestor_keys: list[dict] | None) -> dict:
+    """The `activeRowContexts` entry for selecting one TREE node (pure, unit-testable).
+
+    node_key is the node's own {keyField: value}; ancestor_keys is its ancestor path
+    (root → immediate parent). selectedNodeParentId is the IMMEDIATE parent's value
+    (None for a root node).
+    """
+    (kf, kv) = next(iter(node_key.items()))
+    anc = _tree_ancestor_values(ancestor_keys)
+    return {"dataView": tree_view, "syncPosition": True, "dataKey": {kf: kv},
+            "selectedNodeParentId": anc[-1] if anc else None,
+            "resultType": "TreeActiveDataRow"}
+
+
+def _tree_control_block(tree_view: str, node_key: dict, ancestor_keys: list[dict] | None,
+                         columns: list[str], key_fields: list[str]) -> dict:
+    """The `controlsParams.<tree_view>` echo a tree-node select/command needs.
+
+    A bare `{}` isn't enough — the server can't resolve the key field's CLR type
+    without the column list (proven live: "Cannot determine the param type of
+    <view>"). `columns`/`key_fields` come from ui_get_structure's `grids[tree_view]`.
+
+    `parameters` is the FULL ancestor path plus the node: [<ancestor values>, None,
+    <nodeValue>] (a root node — no ancestors — uses [nodeValue, None, nodeValue]).
+    A depth-2 node (e.g. a DETAIL collection under an entity) fails to select if only
+    its immediate parent is sent instead of the whole chain — proven live, 2026-07-02
+    (activeRowId came back null until the full [root, entity, None, detail] path was
+    used).
+    """
+    (kf, kv) = next(iter(node_key.items()))
+    anc = _tree_ancestor_values(ancestor_keys)
+    parameters = [*anc, None, kv] if anc else [kv, None, kv]
+    return {
+        "view": tree_view, "columns": columns or [], "treeKeys": key_fields or [kf],
+        "parameters": parameters,
+        "hideRootNode": True, "openedLayers": 1, "dynamic": True,
+        "syncPosition": True, "dataKey": {kf: kv},
+        "selectedNodeParentId": anc[-1] if anc else None, "refreshColumns": False,
+        "resultType": "TreeData",
+    }
+
+
+def _tree_context_views(view_names: list[str], tree_view: str, node_key: dict) -> dict:
+    """viewsParams for a tree node's "context" views (e.g. SelectedEndpoint on SM207060).
+
+    Omitting these still returns HTTP 200 with no error, but silently fails to
+    establish server-side selection state — proven live: a payload missing only
+    this was indistinguishable from success (200, no message) until the FOLLOWING
+    command also silently no-op'd. Heuristic: any /structure view named
+    "Selected*" other than the tree itself — holds for SM207060, unverified on
+    other tree screens (see ui_select_tree_node's select_command note).
+    """
+    (kf, kv) = next(iter(node_key.items()))
+    return {v: {"parameters": {kf: kv}} for v in view_names
+            if v.startswith("Selected") and v != tree_view}
+
+
+def _selector_meta(field_state: dict) -> dict | None:
+    """Extract a selector (lookup) field's query metadata from its raw /structure
+    fieldState, or None if the field isn't a selector (pure, unit-testable).
+
+    Reverse-engineered live (2026-07-02, SM207060 CreateEntityView.ScreenID +
+    PopulateFilterView.Container): a selector field carries what's needed to query
+    its OWN grid sub-endpoint —
+      • `graph` isn't given directly, but `fieldDacName` follows .NET's `Outer+Inner`
+        nested-class convention and its outer part IS the grid query's graph class
+        (confirmed: "PX.Api.ContractBased.UI.EntityConfigurationMaint+EntityDescription
+        InsertModel" -> "PX.Api.ContractBased.UI.EntityConfigurationMaint"). Some
+        selectors (Container) omit fieldDacName -> graph None here; the caller fills
+        it from a sibling selector's graph (all selectors on a screen share it).
+      • `fieldList`/`headerList` name the grid columns — but some selectors (Container)
+        omit them; fall back to [valueField, descriptionName], which are always the
+        real value + display columns (proven: Container returns mappedObject +
+        displayName == its valueField + descriptionName).
+    """
+    if not field_state.get("selectorMode"):
+        return None
+    fdac = field_state.get("fieldDacName") or ""
+    value_field = field_state.get("valueField")
+    desc = field_state.get("descriptionName")
+    columns = field_state.get("fieldList") or [c for c in (value_field, desc) if c]
+    return {
+        "view": field_state.get("viewName"),
+        "graph": fdac.split("+")[0] if fdac else None,
+        "value_field": value_field,
+        "search_field": desc,
+        "columns": columns,
+        "headers": field_state.get("headerList") or [],
+    }
+
+
+def _selector_grid_payload(sel: dict, field: str, data_view: str, search: str,
+                            active_row_contexts: list | None = None) -> dict:
+    """The POST body for a selector field's grid sub-endpoint (pure, unit-testable).
+
+    sel: one field's `selector` metadata (from _selector_meta / get_ui_structure).
+    """
+    payload = {
+        "view": sel["view"],
+        "columns": [{"field": c} for c in sel["columns"]],
+        "generateColumns": 0, "retrieveMode": 0, "pagerMode": 1, "startRow": 0,
+        "searchField": sel["search_field"], "pageSize": 20,
+        "preserveSortsAndFilters": False, "showNoteFiles": 1, "suppressAutoHide": True,
+        "refreshFilters": False, "suppressStoredFilters": False,
+        "fastFilterByAllFields": True, "fastFilter": search, "filterRows": [],
+        "isRequestOwner": True, "graph": sel["graph"],
+        "dataField": field, "dataView": data_view,
+    }
+    if active_row_contexts:
+        payload["activeRowContexts"] = active_row_contexts
+    return payload
+
+
 class ScreenClient:
     """One screen-based SOAP session, bound to a single screen.
 
@@ -71,6 +191,9 @@ class ScreenClient:
         self._tree: ET.Element | None = None
         self._ui_booted = False
         self._classic_used = False  # guard: don't mix classic + modern graph state
+        self._active_tree_row: dict | None = None  # see ui_select_tree_node
+        self._active_tree_controls: dict | None = None
+        self._active_tree_context_views: dict | None = None
 
     @property
     def url(self) -> str:
@@ -241,6 +364,37 @@ class ScreenClient:
         )
         self._ui_booted = True
         self._classic_used = False
+        self._active_tree_row = None  # a fresh graph has no node selected
+        self._active_tree_controls: dict | None = None
+        self._active_tree_context_views: dict | None = None
+
+    async def ui_navigate_record(self, view: str, key: dict) -> None:
+        """Select a SPECIFIC EXISTING record on `view` by its key field(s) — the
+        modern-plane equivalent of opening a screen already scoped to one row (e.g.
+        SM207060's Endpoint header: InterfaceName + GateVersion).
+
+        ui_bootstrap alone only LOADS a view; it does not select which record. A
+        screen with a single, always-current record (most Preferences/Setup forms)
+        doesn't need this. A screen whose primary view is itself keyed to a specific
+        record — SM207060 being the proven case — silently operates on no/wrong
+        record without it (proven live, 2026-07-02: without navigating Endpoint to
+        the target InterfaceName/GateVersion first, InsertNew opened a dialog fine
+        but committing it failed with "The Insert button is disabled" — the graph
+        never actually had a valid endpoint loaded).
+
+        Composite keys are navigated field-by-field, in `key`'s iteration order —
+        the same technique ui_grid_read uses for a master-detail parent (some
+        screens only resolve on the LAST field of a composite key).
+        """
+        for f, v in key.items():
+            resp = await self._ui_post({
+                "data": [{"viewName": view, "fieldName": f, "value": str(v),
+                          "rowId": "", "changeType": 5}],
+                "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+            })
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
 
     async def _ui_post(self, payload: dict) -> httpx.Response:
         # Ensure a graph exists (fallback bootstrap). Re-bootstrap if a classic SOAP
@@ -249,7 +403,296 @@ class ScreenClient:
         # record should call ui_bootstrap([views]) FIRST so the record loads.
         if not self._ui_booted or self._classic_used:
             await self.ui_bootstrap()
+        # A selected TREE node (ui_select_tree_node) is context every subsequent
+        # command needs — BOTH activeRowContexts AND the tree's own controlsParams
+        # block. The browser resends both on every request for as long as the node
+        # stays "active"; a bare activeRowContexts alone still silently no-ops
+        # (proven live: InsertNew stayed a no-op — graphIsDirty:false — until the
+        # full EntityTree controlsParams echo was added too, SM207060, 2026-07-02).
+        # Auto-attach unless the caller already named this dataView/view.
+        if self._active_tree_row is not None:
+            existing = payload.get("activeRowContexts") or []
+            if not any(c.get("dataView") == self._active_tree_row["dataView"] for c in existing):
+                payload = {**payload, "activeRowContexts": [self._active_tree_row, *existing]}
+        if self._active_tree_controls is not None:
+            cp = dict(payload.get("controlsParams") or {})
+            for view, block in self._active_tree_controls.items():
+                cp.setdefault(view, block)
+            payload = {**payload, "controlsParams": cp}
+        # The node's "context" views (Selected* → {parameters:{Key}}) also ride on
+        # EVERY later command while a node is selected — the browser resends them on
+        # the field-sets, the dialog commit, AND the final Save (proven live: without
+        # them the dialog-commit stages nothing, so the trailing Save persists an
+        # empty graph — SM207060 capture, 2026-07-02). setdefault: caller wins.
+        if self._active_tree_context_views is not None:
+            vp = dict(payload.get("viewsParams") or {})
+            for view, block in self._active_tree_context_views.items():
+                vp.setdefault(view, block)
+            payload = {**payload, "viewsParams": vp}
         return await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
+
+    async def ui_select_tree_node(self, tree_view: str, node_key: dict,
+                                   parent_key: dict | None = None,
+                                   ancestor_keys: list[dict] | None = None,
+                                   select_command: str = "EnablePopulate") -> dict:
+        """Make a TREE node the active row — the modern-plane equivalent of clicking it.
+
+        The capability classic screen-SOAP and the flat-grid CRUD tools both lack:
+        a hierarchical tree control (e.g. SM207060's EntityTree — Endpoint structure)
+        isn't a normal data grid, so ui_insert_grid_row/etc. throw a server-side
+        null-reference against it (proven live, 2026-07-02). Trees are addressed by
+        `activeRowContexts` instead — reverse-engineered from a live browser capture
+        of the SM207060 "Create Entity" flow.
+
+        Once selected, the node stays the active row for every subsequent
+        ui_set_field/ui_command call on THIS client (auto-attached in _ui_post) —
+        mirroring how the browser keeps resending the same context while a node is
+        selected. Call again with a different node_key to move the selection; call
+        with node_key=None (or start a fresh ui_bootstrap) to clear it.
+
+        tree_view:  the tree control's view name (from ui_get_structure `grids`,
+            e.g. "EntityTree" on SM207060).
+        node_key:   {keyField: value} identifying the node — from a row returned by
+            ui_read_grid(tree_view), e.g. {"Key": "ROOT#GRPMCP"}.
+        parent_key: the node's immediate PARENT key dict, or omit for a root-level
+            node. Fine for a depth-1 node (child of root, e.g. an endpoint entity).
+            (Distinct from ui_read_grid's `parent` — that addresses a different,
+            master-detail grid; this re-selects a row WITHIN this tree.)
+        ancestor_keys: the FULL ancestor path as a list of key dicts, root →
+            immediate parent, for a DEEPER node (e.g. a detail collection at depth 2:
+            [{"Key": root}, {"Key": entity}]). Required beyond depth 1 — the server
+            rejects the selection (activeRowId comes back null) if only the immediate
+            parent is sent. Takes precedence over parent_key when both are given.
+        select_command: the command that establishes the selection server-side.
+            "EnablePopulate" is what the browser actually fires for SM207060's
+            EntityTree (captured live — it's the graph's own selection-changed
+            handler, not a generic framework primitive, so it likely differs on
+            OTHER tree screens). If a tree on a different screen doesn't respond,
+            check that screen's `actions` (ui_get_structure) for its own
+            selection-handler name and pass it here.
+        """
+        if ancestor_keys is None:
+            ancestor_keys = [parent_key] if parent_key else []
+        ctx = _tree_active_row_context(tree_view, node_key, ancestor_keys)
+        # Pull the real columns/key_fields from /structure — needed for the
+        # controlsParams echo below (cached and auto-attached to every later
+        # command in this selection by _ui_post, alongside `ctx`).
+        struct = await self.get_ui_structure()
+        tree_meta = struct["grids"].get(tree_view) or {}
+        block = _tree_control_block(tree_view, node_key, ancestor_keys,
+                                     tree_meta.get("columns"), tree_meta.get("key_fields"))
+        context_views = _tree_context_views(list(struct["views"]), tree_view, node_key)
+        resp = await self._ui_post({
+            "command": [{"name": select_command}], "data": [],
+            "controlsParams": {tree_view: block},
+            "activeRowContexts": [ctx], "viewsParams": context_views,
+        })
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_select_tree_node {tree_view} on {self.screen_id}: {err}")
+        self._active_tree_row = ctx
+        self._active_tree_controls = {tree_view: block}
+        self._active_tree_context_views = context_views
+        return resp.json()
+
+    async def ui_tree_dialog_insert(self, tree_view: str, node_key: dict,
+                                     open_action: str, dialog_view: str,
+                                     fields: list[dict], parent_key: dict | None = None,
+                                     save: bool = True) -> dict:
+        """Add a child under a TREE node via its INSERT DIALOG — select node, open the
+        dialog, fill it, commit it, and (by default) Save. The end-to-end capability
+        behind adding an entity to a web-service endpoint (SM207060), and the general
+        shape for any "click a tree node → Insert → fill a popup → OK → Save" screen.
+
+        Reverse-engineered from a full live browser capture (2026-07-02, SM207060
+        adding DataProvider to a fresh endpoint) — the exact 5-phase sequence the UI
+        actually performs, which no single ui_command call reproduces:
+          1. select the tree node (establishes the active-row + Selected* context
+             that every following call must carry — done via ui_select_tree_node,
+             then auto-attached by _ui_post);
+          2. fire `open_action` once to OPEN a blank dialog;
+          3. Repaint to load `dialog_view`'s fields into the graph;
+          4. set each dialog field (a SELECTOR field's value must be its resolved
+             {id,text} dict — see ui_resolve_selector);
+          5. fire `open_action` AGAIN with dialogCallback OK to COMMIT the dialog
+             (this only STAGES the node — graphIsDirty becomes true), then a
+             SEPARATE Save to PERSIST it. Missing the trailing Save was why earlier
+             attempts "succeeded" (200, no error) yet nothing appeared.
+
+        tree_view/node_key/parent_key: as ui_select_tree_node (e.g. "EntityTree",
+            {"Key": "ROOT#GRPMCP"}).
+        open_action: the tree's insert command (e.g. "InsertNew" on SM207060).
+        dialog_view: the popup's view name (e.g. "CreateEntityView" on SM207060).
+        fields:      [{"field": <name>, "value": <value-or-{id,text}>}] to fill in
+            the dialog. Resolve any selector field first with ui_resolve_selector.
+        save:        commit to the DB (default True). False leaves the node staged
+            in the graph only — rarely wanted.
+
+        Requires the record already navigated if the screen's primary view is keyed
+        (see ui_navigate_record). Verify the result with the entity/contract API.
+        """
+        await self.ui_select_tree_node(tree_view, node_key, parent_key)
+        # OPEN — fire once; the dialog opens (auto-attached tree context rides along).
+        await self._ui_post({
+            "command": [{"name": open_action}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        # REPAINT — load the dialog view's fields into the graph (the browser does
+        # this before it can fill them; without it the field-sets hit nothing).
+        await self._ui_post({
+            "command": [{"name": "Repaint"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {dialog_view: {}},
+        })
+        # FILL — set each dialog field (selector values pass through as {id,text}).
+        for f in fields:
+            await self.ui_set_field(dialog_view, f["field"], f["value"])
+        # COMMIT the dialog (dialogResult OK) — STAGES the node (graphIsDirty:true).
+        commit = await self._ui_post({
+            "command": [{"name": open_action}], "data": [],
+            "dialogCallback": {"dialogResult": 1, "validateInput": False, "viewName": dialog_view},
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        err = self._ui_error(commit)
+        if err:
+            raise ScreenError(f"ui_tree_dialog_insert commit on {self.screen_id}: {err}")
+        result = commit.json()
+        if not save:
+            return result
+        # PERSIST — a SEPARATE Save (the commit only staged the node in the graph).
+        save_resp = await self._ui_post({
+            "command": [{"name": "Save"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        err = self._ui_error(save_resp)
+        if err:
+            raise ScreenError(f"ui_tree_dialog_insert save on {self.screen_id}: {err}")
+        return save_resp.json()
+
+    def _tree_row_by_title(self, tree_resp: dict, tree_view: str, title: str) -> dict | None:
+        """Find a tree row whose Title matches `title` in a select/read response, and
+        return {key_field: value} for it (or None). Matches either the full Title or,
+        for a detail node whose Title is "<Collection>: <Type>[]", its collection name
+        before the colon (so "CompaniesDetails" finds "CompaniesDetails: CompaniesDetail[]").
+        Titles inherited from a base endpoint carry a trailing ' ↓'/'↑' marker —
+        stripped before matching."""
+        rows = ((tree_resp.get("controlsData") or {}).get(tree_view) or {}).get("rows") or []
+        want = title.strip()
+        for r in rows:
+            cells = r.get("cells") or {}
+            t = ((cells.get("Title") or {}).get("value") or "").strip().rstrip("↓↑").strip()
+            if t == want or t.split(":", 1)[0].strip() == want:
+                return {"Key": (cells.get("Key") or {}).get("value")}
+        return None
+
+    async def ui_populate_entity_fields(self, root_node_key: dict, entity_object_name: str,
+                                         data_view: str, data_view_pick: dict | None = None,
+                                         detail_title: str | None = None,
+                                         save: bool = True) -> dict:
+        """Populate an endpoint entity's FIELDS from one of its screen data views —
+        SM207060's "select the entity → Populate → pick the Object → Select All → OK
+        → Save" flow. Turns an entity SHELL (added by ui_tree_dialog_insert, which
+        only creates the node + its detail collections) into one with real scalar
+        fields exposed on the contract.
+
+        Reverse-engineered + proven live from a full browser capture (2026-07-02,
+        DataProvider ← "Provider Summary", field_count 1 → 5; detail path also
+        captured 2026-07-02). Same select→open→repaint→fill→commit→Save skeleton as
+        ui_tree_dialog_insert, plus wrinkles unique to this flow:
+          • the node selected is the ENTITY node (not the endpoint root) — found here
+            by its Title (== ObjectName) among the root's expanded children — or, with
+            `detail_title`, a DETAIL-collection node one level deeper (selected with
+            its full ancestor path root→entity→detail; a depth-2 node won't select
+            with only its immediate parent);
+          • the dialog's data-view selector (`Container`) is scoped to the SELECTED
+            node — its lookup only returns that node's views, so it's resolved
+            in-session with the node active (ui_resolve_selector rides the active tree
+            row onto the query), not standalone; and a `SelectAll` command (tick every
+            field's Populate box) fires between setting `Container` and committing.
+
+        root_node_key:      the endpoint's root tree node, e.g. {"Key": "ROOT#GRPMCP"}.
+        entity_object_name: the entity's ObjectName as shown in the tree (e.g.
+            "DataProvider") — used to locate its node.
+        data_view:          the data view to pull fields from, matched by its display
+            name (e.g. "Provider Summary"); `data_view_pick` disambiguates if >1 match.
+        detail_title:       to populate a nested DETAIL collection instead of the
+            top-level entity, its collection name (e.g. "CompaniesDetails" matches the
+            "CompaniesDetails: CompaniesDetail[]" node); omit for the top-level entity.
+        save:               persist (default True).
+
+        Requires the endpoint record already navigated (ui_navigate_record on
+        Endpoint) and allow_write. Verify with get_entity_schema (field_count).
+        """
+        # 1. select ROOT — expands the tree so the entity/detail nodes (+ keys) list.
+        root_resp = await self.ui_select_tree_node("EntityTree", root_node_key)
+        entity_key = self._tree_row_by_title(root_resp, "EntityTree", entity_object_name)
+        if entity_key is None or not entity_key.get("Key"):
+            raise ScreenError(
+                f"ui_populate_entity_fields: entity {entity_object_name!r} not found "
+                f"under {root_node_key} on {self.screen_id}."
+            )
+        # 2. select the target node — the entity, or (for detail_title) a detail node
+        #    one level deeper. Either way it becomes active so the Container lookup is
+        #    scoped to it. The browser selects entity THEN detail; a detail needs its
+        #    FULL ancestor path (root→entity) or it won't select (activeRowId null).
+        await self.ui_select_tree_node("EntityTree", entity_key, parent_key=root_node_key)
+        if detail_title is not None:
+            detail_key = self._tree_row_by_title(root_resp, "EntityTree", detail_title)
+            if detail_key is None or not detail_key.get("Key"):
+                raise ScreenError(
+                    f"ui_populate_entity_fields: detail {detail_title!r} not found "
+                    f"under entity {entity_object_name!r} on {self.screen_id}."
+                )
+            await self.ui_select_tree_node("EntityTree", detail_key,
+                                            ancestor_keys=[root_node_key, entity_key])
+        # 3. open the Populate dialog.
+        await self._ui_post({
+            "command": [{"name": "PopulateFields"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        # 4. Repaint to load the filter view's fields.
+        await self._ui_post({
+            "command": [{"name": "Repaint"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {"PopulateFilterView": {}},
+        })
+        # 5. resolve + set the (entity-scoped) Container data-view selector.
+        resolved = await self.ui_resolve_selector("PopulateFilterView", "Container",
+                                                   data_view, data_view_pick)
+        if "value" not in resolved:
+            raise ScreenError(
+                f"ui_populate_entity_fields: data view {data_view!r} for "
+                f"{entity_object_name!r} matched {resolved['row_count']} rows "
+                f"(need exactly 1) — rows: {resolved['rows']}"
+            )
+        await self.ui_set_field("PopulateFilterView", "Container", resolved["value"])
+        # 6. SelectAll — tick every field's Populate box.
+        sa = await self._ui_post({
+            "command": [{"name": "SelectAll"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        err = self._ui_error(sa)
+        if err:
+            raise ScreenError(f"ui_populate_entity_fields SelectAll on {self.screen_id}: {err}")
+        # 7. commit the dialog (dialogResult OK) — stages the field mappings.
+        commit = await self._ui_post({
+            "command": [{"name": "PopulateFields"}], "data": [],
+            "dialogCallback": {"dialogResult": 1, "validateInput": False,
+                                "viewName": "PopulateFilterView"},
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        err = self._ui_error(commit)
+        if err:
+            raise ScreenError(f"ui_populate_entity_fields commit on {self.screen_id}: {err}")
+        if not save:
+            return commit.json()
+        # 8. Save.
+        save_resp = await self._ui_post({
+            "command": [{"name": "Save"}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
+        })
+        err = self._ui_error(save_resp)
+        if err:
+            raise ScreenError(f"ui_populate_entity_fields save on {self.screen_id}: {err}")
+        return save_resp.json()
 
     async def get_ui_structure(self) -> dict:
         """Read the modern UI-screen `/structure` — the schema/metadata endpoint.
@@ -282,6 +725,7 @@ class ScreenClient:
                     "enabled": st.get("enabled", True) is not False,
                     "options": ([{"value": o.get("value"), "text": o.get("text")} for o in opts]
                                 if opts else None),
+                    "selector": _selector_meta(st),
                 })
             views[vname] = out
         actions = [
@@ -297,26 +741,103 @@ class ScreenClient:
             for cname, cd in (d.get("controlsData") or {}).items()
             if isinstance(cd, dict) and cd.get("dataKeyNames")
         }
+        # Screen graph class: the grid sub-endpoint each selector queries needs it,
+        # but some selectors omit fieldDacName. All selectors on a screen share the
+        # same graph, so take the first one that DOES carry it as the screen default.
+        screen_graph = None
+        for fields in views.values():
+            for f in fields:
+                g = (f.get("selector") or {}).get("graph")
+                if g:
+                    screen_graph = g
+                    break
+            if screen_graph:
+                break
         return {"screen_id": self.screen_id, "primary_dac": d.get("primaryDacName"),
-                "views": views, "actions": actions, "grids": grids}
+                "screen_graph": screen_graph, "views": views, "actions": actions, "grids": grids}
 
-    async def ui_set_field(self, view: str, field: str, value: str) -> None:
+    async def ui_set_field(self, view: str, field: str, value) -> None:
         """Set one field via the modern UI-screen protocol (see class docstring above).
 
         Value formats: strings/enums = the raw code (for enums use the option
         `value`, not its display text — see get_ui_structure); booleans = "true"/
-        "false". The set lands in the graph working state; a following ui_command
-        ("Save" or a screen action) commits it. Do NOT interleave with classic
-        get_schema/export/submit on the same session (separate graph state).
+        "false"; a SELECTOR field (see ui_resolve_selector) takes its resolved
+        `{"id": ..., "text": ...}` dict UNCHANGED — stringifying it is wrong (proven
+        live, 2026-07-02: CreateEntityView.ScreenID needs the object form, not its
+        plain ScreenIDValue string). The set lands in the graph working state; a
+        following ui_command ("Save" or a screen action) commits it. Do NOT
+        interleave with classic get_schema/export/submit on the same session
+        (separate graph state).
         """
+        v = value if isinstance(value, (dict, bool)) else str(value)
         resp = await self._ui_post({
-            "data": [{"viewName": view, "fieldName": field, "value": str(value),
+            "data": [{"viewName": view, "fieldName": field, "value": v,
                        "rowId": "", "changeType": 5}],
             "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
         })
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_set_field {view}.{field} on {self.screen_id}: {err}")
+
+    async def ui_resolve_selector(self, view: str, field: str, search: str,
+                                   pick: dict | None = None) -> dict:
+        """Resolve a lookup/selector FORM field to its `{id, text}` value — the modern
+        plane's equivalent of clicking the magnifier, typing a search, and picking a
+        row (e.g. CreateEntityView.ScreenID on SM207060). No browser capture needed
+        per field: a selector's /structure fieldState carries everything required to
+        query its OWN grid sub-endpoint, so this generalizes to ANY selector field on
+        ANY screen (reverse-engineered + proven live, 2026-07-02).
+
+        search: free-text match against the field's own search column (its `text`,
+            e.g. a screen's Title).
+        pick:   optional {column: value} to disambiguate when `search` alone matches
+            multiple rows — Acumatica routinely has duplicate titles across modules
+            (e.g. "Companies" matches both a Generic Inquiry, CS1015PL — NOT a valid
+            entity source — and the real maintenance screen, CS101500). ALWAYS check
+            `rows` before trusting `value` when more than one comes back.
+
+        Returns {view, field, search, row_count, rows, value?}. `value` (the
+        {id,text} ready for ui_set_field) is present only when exactly one row
+        matches — otherwise inspect `rows` and re-call with `pick`.
+        """
+        struct = await self.get_ui_structure()
+        fmeta = next((f for f in struct["views"].get(view, []) if f["field"] == field), None)
+        if fmeta is None:
+            raise ScreenError(f"ui_resolve_selector: {view}.{field} not found on {self.screen_id}")
+        sel = fmeta.get("selector")
+        if not sel:
+            raise ScreenError(
+                f"ui_resolve_selector: {view}.{field} on {self.screen_id} is not a "
+                f"selector field — set it directly via ui_set_field instead."
+            )
+        # Some selectors omit their own graph (no fieldDacName) — fall back to the
+        # screen graph (shared across all its selectors). Without a graph the grid
+        # query runs but returns UNFILTERED rows (proven live: Container returned all
+        # 8 views instead of the 1 matched).
+        if not sel.get("graph"):
+            sel = {**sel, "graph": struct.get("screen_graph")}
+        # This sub-endpoint doesn't take the tenant-prefixed ui_url (404s there,
+        # proven live) — always the bare base_url form, unlike every other modern-
+        # plane call in this class.
+        grid_url = self.instance.base_url.rstrip("/") + f"/ui/screen/{self.screen_id}/grid"
+        active_rows = [self._active_tree_row] if self._active_tree_row is not None else None
+        payload = _selector_grid_payload(sel, field, view, search, active_rows)
+        resp = await self._http.post(grid_url, json=payload, headers=_UI_HEADERS)
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_resolve_selector {view}.{field} on {self.screen_id}: {err}")
+        body = resp.json()
+        cols = sel["columns"]
+        rows = [{c: (r.get("cells") or {}).get(c, {}).get("value") for c in cols}
+                for r in (body.get("rows") or [])]
+        if pick:
+            rows = [r for r in rows if all(str(r.get(k)) == str(v) for k, v in pick.items())]
+        result = {"view": view, "field": field, "search": search,
+                  "row_count": len(rows), "rows": rows}
+        if len(rows) == 1:
+            vf, df = sel["value_field"], sel["search_field"]
+            result["value"] = {"id": rows[0].get(vf), "text": rows[0].get(df)}
+        return result
 
     async def ui_command(self, name: str) -> dict:
         """Fire a modern UI-screen command; auto-answers OK if it opens a dialog.
@@ -381,13 +902,19 @@ class ScreenClient:
                 "isFirstRequest": True, "data": [], "controlsParams": {},
                 "activeRowContexts": [], "viewsParams": {pv: {}}, "clearSession": True,
             }, headers=_UI_HEADERS)
-            (pf, pval), = parent["key"].items()
-            resp = await self._http.post(self.ui_url, json={
-                "data": [{"viewName": pv, "fieldName": pf, "value": str(pval),
-                          "rowId": "", "changeType": 5}],
-                "controlsParams": {}, "activeRowContexts": [],
-                "viewsParams": {pv: {}, grid_view: {}},
-            }, headers=_UI_HEADERS)
+            # composite header keys (e.g. SM207060 InterfaceName+GateVersion) are
+            # navigated field-by-field, like the browser commits them; the child
+            # grid is co-requested only on the LAST set, once the record is current.
+            key_items = list(parent["key"].items())
+            resp = None
+            for i, (pf, pval) in enumerate(key_items):
+                last = i == len(key_items) - 1
+                resp = await self._http.post(self.ui_url, json={
+                    "data": [{"viewName": pv, "fieldName": pf, "value": str(pval),
+                              "rowId": "", "changeType": 5}],
+                    "controlsParams": {}, "activeRowContexts": [],
+                    "viewsParams": ({pv: {}, grid_view: {}} if last else {pv: {}}),
+                }, headers=_UI_HEADERS)
         else:
             resp = await self._http.post(self.ui_url, json={
                 "isFirstRequest": True, "data": [], "controlsParams": {},

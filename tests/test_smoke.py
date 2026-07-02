@@ -348,6 +348,244 @@ def test_same_origin_rejects_cross_origin():
     assert not _is_same_origin({"Origin": "https://evil.com"}, "http://127.0.0.1:8765")
 
 
+# ---- TREE node selection (ui_select_tree_node) ------------------------------
+# A tree control (e.g. SM207060's EntityTree) isn't a normal data grid — it needs
+# its own activeRowContexts/controlsParams/viewsParams shape. These three pure
+# builders were derived by bisecting a live browser capture; lock the exact shape
+# down since a silently-wrong field here produces a 200 with no error, not a
+# visible failure (proven live, 2026-07-02).
+
+def test_tree_active_row_context_root_node():
+    from grp_mcp.screen import _tree_active_row_context
+    ctx = _tree_active_row_context("EntityTree", {"Key": "ROOT#GRPMCP"}, None)
+    assert ctx == {
+        "dataView": "EntityTree", "syncPosition": True,
+        "dataKey": {"Key": "ROOT#GRPMCP"},
+        "selectedNodeParentId": None, "resultType": "TreeActiveDataRow",
+    }
+
+
+def test_tree_active_row_context_child_node():
+    from grp_mcp.screen import _tree_active_row_context
+    ctx = _tree_active_row_context(
+        "EntityTree", {"Key": "ENT#Companies"}, [{"Key": "ROOT#GRPMCP"}])
+    assert ctx["selectedNodeParentId"] == "ROOT#GRPMCP"
+
+
+def test_tree_active_row_context_detail_node_uses_immediate_parent():
+    from grp_mcp.screen import _tree_active_row_context
+    # depth-2 detail node: ancestors root -> entity; parent is the entity
+    ctx = _tree_active_row_context(
+        "EntityTree", {"Key": "GRPMCP/25.200.001#E/2690/1/2691"},
+        [{"Key": "ROOT#GRPMCP"}, {"Key": "GRPMCP/25.200.001#E/2690"}])
+    assert ctx["selectedNodeParentId"] == "GRPMCP/25.200.001#E/2690"
+
+
+def test_tree_control_block_root_parameters():
+    from grp_mcp.screen import _tree_control_block
+    block = _tree_control_block(
+        "EntityTree", {"Key": "ROOT#GRPMCP"}, None,
+        columns=["Key", "Title", "Icon", "IconColor"], key_fields=["Key"])
+    assert block["columns"] == ["Key", "Title", "Icon", "IconColor"]
+    assert block["treeKeys"] == ["Key"]
+    assert block["parameters"] == ["ROOT#GRPMCP", None, "ROOT#GRPMCP"]
+    assert block["selectedNodeParentId"] is None
+
+
+def test_tree_control_block_entity_parameters_full_path():
+    from grp_mcp.screen import _tree_control_block
+    # depth-1 entity: [root, None, entity] (matches the live browser payload)
+    block = _tree_control_block(
+        "EntityTree", {"Key": "GRPMCP/25.200.001#E/2690"}, [{"Key": "ROOT#GRPMCP"}],
+        columns=["Key"], key_fields=["Key"])
+    assert block["parameters"] == ["ROOT#GRPMCP", None, "GRPMCP/25.200.001#E/2690"]
+    assert block["selectedNodeParentId"] == "ROOT#GRPMCP"
+
+
+def test_tree_control_block_detail_parameters_full_path():
+    from grp_mcp.screen import _tree_control_block
+    # depth-2 detail: [root, entity, None, detail] — the whole chain, not just parent
+    block = _tree_control_block(
+        "EntityTree", {"Key": "GRPMCP/25.200.001#E/2690/1/2691"},
+        [{"Key": "ROOT#GRPMCP"}, {"Key": "GRPMCP/25.200.001#E/2690"}],
+        columns=["Key"], key_fields=["Key"])
+    assert block["parameters"] == [
+        "ROOT#GRPMCP", "GRPMCP/25.200.001#E/2690", None,
+        "GRPMCP/25.200.001#E/2690/1/2691"]
+    assert block["selectedNodeParentId"] == "GRPMCP/25.200.001#E/2690"
+
+
+def test_tree_control_block_falls_back_to_key_field_when_metadata_missing():
+    from grp_mcp.screen import _tree_control_block
+    block = _tree_control_block(
+        "EntityTree", {"Key": "ROOT#GRPMCP"}, None, columns=None, key_fields=None)
+    assert block["columns"] == []
+    assert block["treeKeys"] == ["Key"]
+
+
+def test_tree_context_views_picks_selected_star_only():
+    from grp_mcp.screen import _tree_context_views
+    views = ["Endpoint", "SelectedEndpoint", "SelectedEntity", "SelectedAction",
+             "EntityTree", "CreateEntityView"]
+    ctx_views = _tree_context_views(views, "EntityTree", {"Key": "ROOT#GRPMCP"})
+    assert ctx_views == {
+        "SelectedEndpoint": {"parameters": {"Key": "ROOT#GRPMCP"}},
+        "SelectedEntity": {"parameters": {"Key": "ROOT#GRPMCP"}},
+        "SelectedAction": {"parameters": {"Key": "ROOT#GRPMCP"}},
+    }
+
+
+def test_tree_context_views_excludes_the_tree_itself():
+    from grp_mcp.screen import _tree_context_views
+    # a pathological tree view name starting with "Selected" must not self-select
+    ctx_views = _tree_context_views(
+        ["SelectedTree"], "SelectedTree", {"Key": "X"})
+    assert ctx_views == {}
+
+
+def test_ui_post_auto_attaches_active_tree_row_and_controls():
+    """_ui_post must merge the cached tree selection into every later call unless
+    the caller already named that dataView/view — this is what lets InsertNew
+    (fired via plain ui_command) see the node ui_select_tree_node selected."""
+    s = _client("SM207060")
+    s._ui_booted = True  # skip network bootstrap
+    ctx = {"dataView": "EntityTree", "syncPosition": True,
+           "dataKey": {"Key": "ROOT#GRPMCP"}, "selectedNodeParentId": None,
+           "resultType": "TreeActiveDataRow"}
+    block = {"view": "EntityTree", "dataKey": {"Key": "ROOT#GRPMCP"}}
+    s._active_tree_row = ctx
+    s._active_tree_controls = {"EntityTree": block}
+
+    captured = {}
+
+    async def fake_post(url, json, headers):
+        captured.update(json)
+        return _Resp(200, {})
+
+    s._http.post = fake_post
+    asyncio.run(s._ui_post({"command": [{"name": "InsertNew"}], "data": [],
+                             "controlsParams": {}, "activeRowContexts": [],
+                             "viewsParams": {}}))
+    assert captured["activeRowContexts"] == [ctx]
+    assert captured["controlsParams"]["EntityTree"] == block
+
+
+def test_ui_post_does_not_override_caller_supplied_tree_context():
+    """If the caller already names the SAME dataView explicitly, don't stomp it."""
+    s = _client("SM207060")
+    s._ui_booted = True
+    s._active_tree_row = {"dataView": "EntityTree", "dataKey": {"Key": "ROOT#GRPMCP"}}
+    s._active_tree_controls = {"EntityTree": {"view": "EntityTree"}}
+
+    captured = {}
+
+    async def fake_post(url, json, headers):
+        captured.update(json)
+        return _Resp(200, {})
+
+    s._http.post = fake_post
+    caller_ctx = [{"dataView": "EntityTree", "dataKey": {"Key": "ENT#Companies"}}]
+    asyncio.run(s._ui_post({"activeRowContexts": caller_ctx, "controlsParams": {}}))
+    assert captured["activeRowContexts"] == caller_ctx
+
+
+def test_ui_post_auto_attaches_tree_context_views():
+    """The Selected* context viewsParams must ride on every later command too — this
+    is what lets a dialog commit STAGE the node (without them the trailing Save
+    persists an empty graph). Proven load-bearing live (SM207060, 2026-07-02)."""
+    s = _client("SM207060")
+    s._ui_booted = True
+    s._active_tree_context_views = {
+        "SelectedEndpoint": {"parameters": {"Key": "ROOT#GRPMCP"}},
+        "SelectedEntity": {"parameters": {"Key": "ROOT#GRPMCP"}},
+    }
+    captured = {}
+
+    async def fake_post(url, json, headers):
+        captured.update(json)
+        return _Resp(200, {})
+
+    s._http.post = fake_post
+    asyncio.run(s._ui_post({"command": [{"name": "Save"}], "viewsParams": {}}))
+    assert captured["viewsParams"]["SelectedEndpoint"] == {"parameters": {"Key": "ROOT#GRPMCP"}}
+    assert captured["viewsParams"]["SelectedEntity"] == {"parameters": {"Key": "ROOT#GRPMCP"}}
+
+
+# ---- selector (lookup) field resolution (ui_resolve_selector) ---------------
+# A selector field's /structure fieldState carries everything to query its own
+# grid sub-endpoint — no browser capture per field. Lock the extraction + payload.
+
+def test_selector_meta_extracts_graph_from_field_dac_name():
+    from grp_mcp.screen import _selector_meta
+    # the real SM207060 CreateEntityView.ScreenID shape (trimmed)
+    st = {"selectorMode": 33, "viewName": "_EntityDescriptionInsertModelScreenID_X",
+          "fieldDacName": "PX.Api.ContractBased.UI.EntityConfigurationMaint+EntityDescriptionInsertModel",
+          "valueField": "screenID", "descriptionName": "title",
+          "fieldList": ["title", "screenID"], "headerList": ["Title", "Screen ID"]}
+    sel = _selector_meta(st)
+    assert sel["graph"] == "PX.Api.ContractBased.UI.EntityConfigurationMaint"
+    assert sel["value_field"] == "screenID"
+    assert sel["search_field"] == "title"
+    assert sel["columns"] == ["title", "screenID"]
+
+
+def test_selector_meta_none_for_non_selector():
+    from grp_mcp.screen import _selector_meta
+    assert _selector_meta({"typeName": "String"}) is None
+    assert _selector_meta({"selectorMode": 0}) is None
+
+
+def test_selector_grid_payload_shape():
+    from grp_mcp.screen import _selector_grid_payload
+    sel = {"view": "_V", "graph": "PX.Foo", "value_field": "screenID",
+           "search_field": "title", "columns": ["title", "screenID"], "headers": []}
+    p = _selector_grid_payload(sel, "ScreenID", "CreateEntityView", "Companies")
+    assert p["view"] == "_V"
+    assert p["graph"] == "PX.Foo"
+    assert p["dataField"] == "ScreenID"
+    assert p["dataView"] == "CreateEntityView"
+    assert p["fastFilter"] == "Companies"
+    assert p["searchField"] == "title"
+    assert p["columns"] == [{"field": "title"}, {"field": "screenID"}]
+    assert "activeRowContexts" not in p  # omitted when none passed
+
+
+def test_selector_grid_payload_includes_active_row_contexts_when_given():
+    from grp_mcp.screen import _selector_grid_payload
+    sel = {"view": "_V", "graph": "g", "value_field": "v", "search_field": "s",
+           "columns": ["s"], "headers": []}
+    arc = [{"dataView": "EntityTree", "dataKey": {"Key": "ROOT#X"}}]
+    p = _selector_grid_payload(sel, "F", "DV", "q", arc)
+    assert p["activeRowContexts"] == arc
+
+
+def test_selector_meta_falls_back_columns_when_field_list_absent():
+    """Some selectors (SM207060 PopulateFilterView.Container) omit fieldList AND
+    fieldDacName — columns must fall back to [valueField, descriptionName], else the
+    grid query returns unfiltered/unreadable rows (proven live: 8 empty {} rows)."""
+    from grp_mcp.screen import _selector_meta
+    st = {"selectorMode": 16, "viewName": "_PopulateFilterContainer_X",
+          "valueField": "mappedObject", "descriptionName": "displayName"}
+    sel = _selector_meta(st)
+    assert sel["graph"] is None                       # no fieldDacName -> caller fills it
+    assert sel["columns"] == ["mappedObject", "displayName"]
+    assert sel["value_field"] == "mappedObject"
+    assert sel["search_field"] == "displayName"
+
+
+def test_tree_row_by_title_matches_and_strips_inheritance_marker():
+    s = _client("SM207060")
+    resp = {"controlsData": {"EntityTree": {"rows": [
+        {"cells": {"Title": {"value": "Endpoint"}, "Key": {"value": "ROOT#GRPMCP"}}},
+        {"cells": {"Title": {"value": "DataProvider"}, "Key": {"value": "GRPMCP/25.200.001#E/2692"}}},
+        {"cells": {"Title": {"value": "Account ↓"}, "Key": {"value": "Default/24.200.001#E/12887"}}},
+    ]}}}
+    assert s._tree_row_by_title(resp, "EntityTree", "DataProvider") == {"Key": "GRPMCP/25.200.001#E/2692"}
+    # inherited node ('Account ↓') matched by its bare title
+    assert s._tree_row_by_title(resp, "EntityTree", "Account") == {"Key": "Default/24.200.001#E/12887"}
+    assert s._tree_row_by_title(resp, "EntityTree", "Nonexistent") is None
+
+
 def test_same_origin_falls_back_to_referer_when_origin_absent():
     from grp_mcp.ui import _is_same_origin
     assert _is_same_origin(

@@ -853,8 +853,12 @@ async def ui_get_structure(screen_id: str, instance: str | None = None) -> Any:
 
     The richer, modern-plane counterpart to screen_get_schema. Returns:
       views:   {ViewName: [{field, label, type, required, readonly, enabled,
-                            options}]} — `options` lists a fixed-enum field's
-               allowed values as [{value, text}] (SET the `value`, not `text`).
+                            options, selector}]} — `options` lists a fixed-enum
+               field's allowed values as [{value, text}] (SET the `value`, not
+               `text`). `selector` is non-null on a LOOKUP field (e.g. SM207060
+               CreateEntityView.ScreenID) — pass it to ui_resolve_selector rather
+               than guessing a raw value; setting a selector field's plain text
+               directly does not work (proven live).
       actions: [{name, label, enabled, visible, confirm}] — the live action
                inventory; `confirm` is the dialog text an action will pop.
       grids:   {GridName: {key_fields, columns}} — key_fields are the row-key
@@ -876,10 +880,58 @@ async def ui_get_structure(screen_id: str, instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+async def ui_resolve_selector(
+    screen_id: str,
+    view: str,
+    field: str,
+    search: str,
+    pick: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Resolve a lookup/selector FORM field to its `{id, text}` value.
+
+    The modern-plane equivalent of clicking a field's magnifier, typing a search,
+    and picking a row — needed before ui_screen_action can set a SELECTOR field
+    (per ui_get_structure's `selector` marker; e.g. SM207060 CreateEntityView's
+    ScreenID). Setting a selector field's plain text directly does not work.
+    No browser capture needed per field — a selector's own /structure metadata
+    carries everything needed to query it, so this works on ANY selector field
+    on ANY screen (reverse-engineered + proven live, 2026-07-02).
+
+    search: free-text match against the field's own search column (its display
+        text, e.g. a screen's Title).
+    pick:   optional {column: value} to disambiguate when `search` alone matches
+        multiple rows — Acumatica routinely has duplicate titles across modules
+        (e.g. "Companies" matches both a Generic Inquiry, CS1015PL — NOT usable as
+        an entity source — and the real maintenance screen, CS101500). ALWAYS
+        check `rows` before trusting `value` when more than one row comes back;
+        picking the wrong one fails a downstream entity-add silently.
+
+    Returns {view, field, search, row_count, rows, value?}. `value` (ready to pass
+    straight into ui_screen_action's set_fields) is present only when exactly one
+    row matches. Read-only (no gate) — this only queries, never sets anything.
+
+    Example — resolve then set (two calls, same screen; see ui_screen_action for
+    why selection state needs tree_select on the SAME call as the set/action):
+        r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
+                                 search="Companies", pick={"screenID": "CS101500"})
+        ui_screen_action("SM207060", action="InsertNew",
+            tree_select={"view": "EntityTree", "key": {"Key": "ROOT#GRPMCP"}},
+            set_fields=[{"view": "CreateEntityView", "field": "ObjectName", "value": "Companies"},
+                        {"view": "CreateEntityView", "field": "ScreenID", "value": r["value"]}])
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.ui_resolve_selector(view, field, search, pick)
+
+
+@mcp.tool()
 async def ui_screen_action(
     screen_id: str,
     action: str,
     set_fields: list[dict] | None = None,
+    tree_select: dict | None = None,
+    record_key: dict | None = None,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
@@ -890,10 +942,28 @@ async def ui_screen_action(
     (set fields + action="Save"). Reuses the same login session as the rest of the
     engine — no browser, no separate auth.
 
-    set_fields: optional list of {"view": <ViewName>, "field": <FieldName>,
+    set_fields:  optional list of {"view": <ViewName>, "field": <FieldName>,
         "value": <value>} — from ui_get_structure. For enum fields pass the option
         `value` (not its display text); booleans are "true"/"false".
-    action:     the internal command to fire after setting (from ui_get_structure
+    tree_select: optional {"view": <TreeView>, "key": {keyField: value},
+        "parent_key": {keyField: value} (omit for a root-level node)} — selects a
+        node in a TREE control (e.g. SM207060's EntityTree) before set_fields/action
+        run, the modern-plane equivalent of clicking it. Trees aren't normal data
+        grids (ui_insert_grid_row etc. throw a null-reference against one); an
+        action like "InsertNew" that depends on a selected tree node silently
+        no-ops without this. `key`/`parent_key` come from ui_read_grid(tree_view)
+        rows. Selection stays active for set_fields + action in THIS call only
+        (each ui_screen_action call is its own fresh session).
+    record_key:  optional {"view": <ViewName>, "key": {keyField: value}} — selects
+        a SPECIFIC EXISTING record before tree_select/set_fields/action run. Needed
+        whenever the screen's PRIMARY view is itself keyed to one record instead of
+        being a single always-current one (e.g. SM207060's Endpoint header —
+        InterfaceName + GateVersion identify WHICH endpoint you're editing).
+        Omitting this on such a screen doesn't error — the dialog can still open —
+        but committing later fails opaquely ("The Insert button is disabled", proven
+        live) because the graph never actually loaded a valid record. Most
+        Preferences/Setup screens don't need this (nothing to select).
+    action:      the internal command to fire after setting (from ui_get_structure
         `actions`), e.g. "Save" to commit a record edit, or a screen action like
         "generateYears". If the action opens a confirmation dialog it's
         auto-answered OK.
@@ -913,6 +983,11 @@ async def ui_screen_action(
     Example — edit a record: set fields, then Save:
         ui_screen_action("GL102000", action="Save",
             set_fields=[{"view":"GLSetupRecord","field":"ConsolidatedPosting","value":"true"}])
+    Example — insert a node under a selected TREE row (SM207060 Endpoint Structure —
+    record_key selects WHICH endpoint; tree_select then selects its root node):
+        ui_screen_action("SM207060", action="InsertNew",
+            record_key={"view":"Endpoint","key":{"InterfaceName":"GRPMCP","GateVersion":"25.200.001"}},
+            tree_select={"view":"EntityTree","key":{"Key":"ROOT#GRPMCP"}})
     """
     _require_write(instance)
     # A destructive action deletes data — hold it to the stricter allow_delete gate,
@@ -933,6 +1008,11 @@ async def ui_screen_action(
             )
         valid_fields = {(v, f["field"]) for v, fs in struct["views"].items() for f in fs}
         grid_cols = {(g, c) for g, gd in struct["grids"].items() for c in (gd.get("columns") or [])}
+        if record_key and record_key["view"] not in struct["views"]:
+            raise ScreenError(
+                f"ui_screen_action: unknown view {record_key['view']!r} on "
+                f"{screen_id.upper()} (record_key). Views: {sorted(struct['views'])}"
+            )
         for f in (set_fields or []):
             if (f["view"], f["field"]) in valid_fields:
                 continue
@@ -954,12 +1034,165 @@ async def ui_screen_action(
         # company" if FiscalYear, the primary view, isn't loaded).
         primary = next(iter(struct["views"]), None)
         load = {f["view"] for f in (set_fields or [])} | ({primary} if primary else set())
+        if record_key:
+            load.add(record_key["view"])
         await s.ui_bootstrap(sorted(load))
+        if record_key:
+            await s.ui_navigate_record(record_key["view"], record_key["key"])
+        if tree_select:
+            await s.ui_select_tree_node(tree_select["view"], tree_select["key"],
+                                         tree_select.get("parent_key"))
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
         result = await s.ui_command(action)
-    return {"screen_id": screen_id.upper(), "action": action,
-            "set_fields": set_fields or [], "ok": True, "raw": result}
+    return {"screen_id": screen_id.upper(), "action": action, "set_fields": set_fields or [],
+            "record_key": record_key, "tree_select": tree_select, "ok": True, "raw": result}
+
+
+@mcp.tool()
+async def ui_tree_dialog_insert(
+    screen_id: str,
+    tree_view: str,
+    node_key: dict,
+    open_action: str,
+    dialog_view: str,
+    fields: list[dict],
+    parent_key: dict | None = None,
+    record_key: dict | None = None,
+    save: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Add a child under a TREE node via its INSERT DIALOG — the full "click a tree
+    node → Insert → fill a popup → OK → Save" flow that no single ui_screen_action
+    call reproduces. The end-to-end capability behind adding an entity to a
+    web-service endpoint (SM207060); generalizes to any tree+insert-dialog screen.
+
+    Reverse-engineered + proven live from a full browser capture (2026-07-02): the
+    UI performs a 5-phase sequence — select node, OPEN the dialog, Repaint to load
+    its fields, FILL them, then COMMIT the dialog (which only STAGES the node) plus
+    a SEPARATE Save to PERSIST. This tool runs all of it in one session.
+
+    tree_view/node_key/parent_key: identify the tree + node to insert under (from
+        ui_read_grid; e.g. "EntityTree", {"Key": "ROOT#GRPMCP"}). parent_key omitted
+        for a root-level node.
+    open_action: the tree's insert command (from ui_get_structure `actions`; e.g.
+        "InsertNew" on SM207060).
+    dialog_view: the popup view name (e.g. "CreateEntityView" on SM207060).
+    fields:      [{"field": <name>, "value": <value>}] to fill the dialog. For a
+        SELECTOR field (per ui_get_structure's `selector` marker; e.g. ScreenID)
+        resolve it FIRST with ui_resolve_selector and pass its `value` ({id,text})
+        here unchanged. A required-looking field the server fills itself at commit
+        (e.g. SM207060's EntityType, resolved from ScreenID) can be omitted.
+    record_key:  {"view": <ViewName>, "key": {...}} if the screen's primary view is
+        keyed to a specific record (SM207060's Endpoint: InterfaceName+GateVersion)
+        — REQUIRED there, else the commit fails "Insert button is disabled".
+    save:        persist to the DB (default True).
+
+    Requires allow_write. Verify the result with get_entity_schema/list_entities
+    (contract) — not just the tool's own response.
+
+    PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+
+    Example — add the Companies entity to endpoint GRPMCP on SM207060:
+        r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
+                                 search="Companies", pick={"screenID": "CS101500"})
+        ui_tree_dialog_insert("SM207060", tree_view="EntityTree",
+            node_key={"Key": "ROOT#GRPMCP"}, open_action="InsertNew",
+            dialog_view="CreateEntityView",
+            record_key={"view": "Endpoint",
+                        "key": {"InterfaceName": "GRPMCP", "GateVersion": "25.200.001"}},
+            fields=[{"field": "ObjectName", "value": "Companies"},
+                    {"field": "ScreenID", "value": r["value"]}])
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        if dialog_view not in struct["views"]:
+            raise ScreenError(
+                f"ui_tree_dialog_insert: unknown dialog_view {dialog_view!r} on "
+                f"{screen_id.upper()}. Views: {sorted(struct['views'])}"
+            )
+        if open_action not in {a["name"] for a in struct["actions"]}:
+            raise ScreenError(
+                f"ui_tree_dialog_insert: unknown open_action {open_action!r} on "
+                f"{screen_id.upper()}. Actions: {sorted(a['name'] for a in struct['actions'])}"
+            )
+        load = {dialog_view} | ({record_key["view"]} if record_key else set())
+        primary = next(iter(struct["views"]), None)
+        if primary:
+            load.add(primary)
+        await s.ui_bootstrap(sorted(load))
+        if record_key:
+            await s.ui_navigate_record(record_key["view"], record_key["key"])
+        result = await s.ui_tree_dialog_insert(
+            tree_view, node_key, open_action, dialog_view, fields,
+            parent_key=parent_key, save=save)
+    return {"screen_id": screen_id.upper(), "tree_view": tree_view, "node_key": node_key,
+            "dialog_view": dialog_view, "fields": fields, "saved": save, "ok": True,
+            "graph_is_dirty": result.get("graphIsDirty")}
+
+
+@mcp.tool()
+async def ui_populate_endpoint_entity_fields(
+    endpoint_name: str,
+    endpoint_version: str,
+    entity_object_name: str,
+    data_view: str,
+    data_view_pick: dict | None = None,
+    detail_title: str | None = None,
+    save: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Populate a web-service-endpoint entity's FIELDS from one of its screen data
+    views (SM207060's "select entity → Populate → pick Object → Select All → OK →
+    Save"). `ui_tree_dialog_insert` adds an entity SHELL; this fills in the scalar
+    fields of the picked view so they show on the contract.
+
+    Proven live (2026-07-02): ImportScenarios ← "Scenario Summary" took field_count
+    1 → 20 (Name, Provider, SyncType, …); GenInquiry ← "Data Sources" 1 → 7.
+
+    endpoint_name/endpoint_version: the endpoint the entity lives on (e.g. "GRPMCP",
+        "25.200.001") — its header record is navigated first (required, else the
+        Populate context is wrong).
+    entity_object_name: the entity's ObjectName as shown in the tree (e.g.
+        "DataProvider") — used to locate its node under the root.
+    data_view:      the data view to pull fields from, matched by display name (e.g.
+        "Provider Summary"). The lookup is scoped to the SELECTED node's views,
+        resolved in-session automatically.
+    data_view_pick: optional {column: value} to disambiguate if >1 view matches
+        (data-view display names can repeat, e.g. two "Details").
+    detail_title:   to populate a nested DETAIL COLLECTION instead of the top-level
+        entity, its collection name (e.g. "CompaniesDetails" for the
+        "CompaniesDetails: CompaniesDetail[]" node). The detail node is selected with
+        its full ancestor path (root→entity→detail) — a depth-2 node the plain tree
+        selector previously couldn't reach (fixed 2026-07-02). Omit for the entity.
+    save:           persist (default True).
+
+    Requires allow_write. Verify with get_entity_schema (field_count jumps).
+    Adds fields from ONE view; call again per view for a multi-view entity/detail.
+
+    Example:
+        ui_populate_endpoint_entity_fields("GRPMCP", "25.200.001",
+            entity_object_name="DataProvider", data_view="Provider Summary")
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, "SM207060") as s:
+        struct = await s.get_ui_structure()
+        primary = next(iter(struct["views"]), None)
+        load = {"PopulateFilterView", "Endpoint"} | ({primary} if primary else set())
+        await s.ui_bootstrap(sorted(load))
+        await s.ui_navigate_record("Endpoint", {"InterfaceName": endpoint_name,
+                                                 "GateVersion": endpoint_version})
+        result = await s.ui_populate_entity_fields(
+            root_node_key={"Key": f"ROOT#{endpoint_name}"},
+            entity_object_name=entity_object_name,
+            data_view=data_view, data_view_pick=data_view_pick,
+            detail_title=detail_title, save=save)
+    return {"endpoint": f"{endpoint_name}/{endpoint_version}", "entity": entity_object_name,
+            "detail_title": detail_title, "data_view": data_view, "saved": save, "ok": True,
+            "graph_is_dirty": result.get("graphIsDirty")}
 
 
 @mcp.tool()

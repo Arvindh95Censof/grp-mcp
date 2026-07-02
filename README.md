@@ -82,7 +82,10 @@ write almost anything:
 | `screen_record` | Create (`insert=True`) or edit one record on a master screen by key — idempotent setup helper over the SOAP engine. |
 | `screen_preflight` | Check intended fields against a DAC's mandatory fields (OData CSDL), system columns filtered out — catch missing required fields before a Save fault. |
 | `ui_get_structure` | Discover a screen via the **modern UI-screen API** (`/ui/screen/<ID>/structure`): views → fields (type, required, readonly, enabled, **enum allowed-values**), the live action inventory (enabled/visible/confirmation), and grid key fields. Richer than screen_get_schema; a live workflow-aware preflight. Read-only, any Modern-UI screen. |
-| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). FORM-view fields only — for a GRID cell, use the grid tools below. |
+| `ui_screen_action` | Drive a screen via the **modern UI-screen API** — set fields, then fire an action (auto-answers confirmation dialogs). Reaches dialog actions classic SOAP can't (e.g. GL201000 Generate Calendar) and plain record edits (action="Save"). `tree_select` selects a TREE node first (trees aren't grids); `record_key` scopes a keyed primary view to one record. Preflights action + field names against `/structure`; surfaces the screen's own `messages[]` errors. Requires allow_write (a destructive action also requires allow_delete). FORM-view fields only — for a GRID cell, use the grid tools below. |
+| `ui_resolve_selector` | Resolve a lookup/selector FORM field (per `ui_get_structure`'s `selector` marker) to its `{id, text}` value — the modern-plane equivalent of clicking the magnifier, searching, and picking a row. `pick` disambiguates duplicate titles (common across modules). Generalizes to any selector on any screen from its own `/structure` metadata. Read-only, no gate. |
+| `ui_tree_dialog_insert` | Add a child under a TREE node via its INSERT DIALOG — the full "select node → Insert → fill popup → OK → Save" flow (the capability behind adding an entity to a web-service endpoint, SM207060). Runs the real UI's 5-phase sequence in one call. Resolve selector fields with `ui_resolve_selector` first. `record_key` scopes a keyed primary view. Requires allow_write. |
+| `ui_populate_endpoint_entity_fields` | Fill an endpoint entity's scalar FIELDS from one of its screen data views (SM207060 "select entity → Populate → pick Object → Select All → OK → Save"). `ui_tree_dialog_insert` adds only the entity shell; this exposes its fields on the contract (entity-scoped data-view lookup resolved automatically; `data_view_pick` disambiguates). Requires allow_write. |
 | `ui_read_grid` | Read GRID rows via the **modern UI-screen plane** — the read peer of the grid CRUD below. Returns each row flattened to `{field: value}` + its `_rowId`, live per-cell state (enum options, readonly), and the grid's key fields. `parent` reads a CHILD grid under a header (master-detail). Read-only, no gate. |
 | `ui_insert_grid_row` | Append a NEW row to a GRID on the modern UI-screen plane (`changes.inserted`). `parent` targets a CHILD grid under a header — the parent-linkage id is auto-filled server-side, so `values` needs only the child's own fields. Requires allow_write. |
 | `ui_update_grid_row` | Edit ONE **existing** GRID row in place on the modern UI-screen plane (`changes.modified`) — the capability classic screen SOAP lacks (its positional row selector is inert, see Known limitations). Matched by key; `parent` targets a CHILD grid under a header. Requires allow_write. |
@@ -540,14 +543,16 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.25 — 68 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.29 — 71 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen
 plane** (`ui_get_structure` + `ui_screen_action` for dialog actions classic SOAP can't reach,
 enum-value discovery, and live workflow-aware state — plus full **grid CRUD**,
 `ui_read_grid`/`ui_insert_grid_row`/`ui_update_grid_row`/`ui_delete_grid_row`, on top-level
-and master-detail grids). On top sit setup recipes — `enable_features` + `activate_features`
+and master-detail grids; **tree + insert-dialog** screens via `ui_resolve_selector` +
+`ui_tree_dialog_insert` + `ui_populate_endpoint_entity_fields`, e.g. creating a
+web-service-endpoint entity AND exposing its fields on SM207060 — end to end, no browser). On top sit setup recipes — `enable_features` + `activate_features`
 (install/recompile), `create_financial_calendar` (incl. start date), `create_ledger`,
 `create_numbering_sequence`, `create_segmented_key` → `set_segment_value`,
 `chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
@@ -626,8 +631,36 @@ and siblings) — a refactor that breaks the key-in-values rule or drops the
 
 ### Known limitations (by design / platform)
 
-- **Endpoint writes (SM207060)** are a stateful wizard — extend entities via the UI /
-  customization project, not REST.
+- **Endpoint entity adds (SM207060)** are fully drivable via the modern plane — a REST
+  PUT to the WebServiceEndpoints entity is a no-op, but `ui_tree_dialog_insert` runs the
+  real UI's 5-phase flow (select the endpoint's root tree node → open the Create-Entity
+  dialog → fill it → commit the dialog → Save) in one call, and `ui_resolve_selector`
+  turns a screen title into the `ScreenID` value it needs first. Proven + reproduced live
+  (2026-07-02, multiple entities on a fresh endpoint, each verified against the contract's
+  own `swagger.json`). `EntityType` (a required-looking dialog field) resolves server-side
+  at commit time — omit it. `ui_populate_endpoint_entity_fields` then fills in the entity's
+  scalar **fields** from a chosen screen data view (proven live: field_count 1 → 20), so a
+  full "create entity + expose its fields" is now API-drivable end to end. Nested **detail
+  collections** are also fully drivable by the same tools: `ui_tree_dialog_insert` targeting
+  an entity node with `ObjectType="D"`/`"L"` creates the detail node, and
+  `ui_populate_endpoint_entity_fields(..., detail_title=...)` populates its fields — a
+  detail node selects via its FULL ancestor path (root→entity→detail), not just its
+  immediate parent, or the select silently no-ops (`activeRowId` comes back `null`).
+  Proven byte-identical against a live browser capture (2026-07-02): a detail populate that
+  returns 0 fields is a genuine platform outcome, not a tool gap — either the chosen data
+  view legitimately maps no scalar fields onto that object (matched the browser exactly,
+  no error either side), or the view's fields collide with a name already staged elsewhere
+  on that endpoint (e.g. `"An element with the DesignID name already exists"` — a
+  `messageType:"error"` on the commit call, which the browser also hit and which
+  `_ui_error` already surfaces as a raised `ScreenError` rather than a silent no-op).
+  Pick a data view whose fields don't already exist on that node, or use a different
+  (never-populated) detail node, to get a non-empty populate — proven live (2026-07-02,
+  through the actual MCP tool): a brand-new detail node populated cleanly right after an
+  already-poisoned sibling kept colliding on every view tried, so the collision sticks to
+  the specific node once a field has landed there, not the entity/endpoint as a whole.
+  **Endpoint ACTIONS** (wiring a button to an API
+  action) still need the customization-XML route (SM204505 export/import) — too fragile to
+  drive as a dialog; not yet started.
 - **Multi-segment segmented-key deletion** is impossible via *any* API (and via the UI):
   Acumatica requires ≥1 segment and won't cascade-delete a key's segments, so the last
   segment always orphans. `delete_segmented_key` handles single-segment keys + safely
