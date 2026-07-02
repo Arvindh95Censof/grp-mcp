@@ -330,3 +330,56 @@ def test_positional_row_spec_hard_errors():
     s = _client("GL202500")
     with pytest.raises(ScreenError):
         s._spec_to_command({"row": "AccountRecords", "to": 8})
+
+
+# ---- ui.py CSRF guard (_is_same_origin) -------------------------------------
+# A page open in any OTHER tab/site can still fire a blind cross-origin POST at
+# the config UI while it happens to be running (CORS blocks it from reading the
+# response, not from sending the request) — do_POST must reject anything that
+# doesn't prove same-origin via Origin (or, failing that, Referer).
+
+def test_same_origin_exact_origin_match():
+    from grp_mcp.ui import _is_same_origin
+    assert _is_same_origin({"Origin": "http://127.0.0.1:8765"}, "http://127.0.0.1:8765")
+
+
+def test_same_origin_rejects_cross_origin():
+    from grp_mcp.ui import _is_same_origin
+    assert not _is_same_origin({"Origin": "https://evil.com"}, "http://127.0.0.1:8765")
+
+
+def test_same_origin_falls_back_to_referer_when_origin_absent():
+    from grp_mcp.ui import _is_same_origin
+    assert _is_same_origin(
+        {"Referer": "http://127.0.0.1:8765/index.html"}, "http://127.0.0.1:8765"
+    )
+
+
+def test_same_origin_rejects_mismatched_referer():
+    from grp_mcp.ui import _is_same_origin
+    assert not _is_same_origin({"Referer": "https://evil.com/"}, "http://127.0.0.1:8765")
+
+
+def test_same_origin_rejects_no_headers_at_all():
+    # e.g. a bare curl/script with no browser-supplied Origin or Referer — secure
+    # default is to reject, not to assume good faith just because both are absent.
+    from grp_mcp.ui import _is_same_origin
+    assert not _is_same_origin({}, "http://127.0.0.1:8765")
+
+
+# ---- snapshot_entity write_roots enforcement (default path) -----------------
+# The default (no `path` given) snapshot destination used to skip _check_write_path
+# entirely — only a caller-SUPPLIED path was fenced. Verify the auto-computed
+# default now goes through the same check, by configuring write_roots to a
+# directory that can't contain it and confirming a PermissionError fires before
+# any network call (proves the check now runs first, not after the fetch).
+
+def test_snapshot_entity_default_path_respects_write_roots(monkeypatch):
+    c = Config(
+        default="restricted",
+        instances={"restricted": _inst(write_roots=["C:/nowhere-real-should-not-match"])},
+    )
+    monkeypatch.setattr(server, "_config", c)
+    monkeypatch.delenv("GRP_MCP_CONNECTIONS", raising=False)
+    with pytest.raises(PermissionError):
+        asyncio.run(server.snapshot_entity("SomeEntity", instance="restricted"))

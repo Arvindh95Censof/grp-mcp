@@ -80,7 +80,7 @@ PAGE = """<!DOCTYPE html>
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 4</span></h1>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 5</span></h1>
 <p class="sub" id="src">loading…</p>
 <div class="banner">Editing here writes <code>connections.json</code>. To apply changes to the live connector, run <code>reload_config</code> in Claude (no restart needed) — or restart the grp-mcp server.</div>
 <div id="list"></div>
@@ -125,7 +125,7 @@ async function load(){
     return '<div class="card'+(p.name===d.active?' active':'')+'">'
       +'<div class="row"><div><div class="name">'+esc(p.name)+(p.name===d.active?'<span class="pill">active</span>':'')+'</div>'
       +'<div class="meta">'+esc(p.base_url)+'</div>'
-      +'<div class="meta">tenant '+esc(p.tenant||'—')+' · '+esc(p.endpoint_name)+'/'+esc(p.endpoint_version)+(p.has_secret?'':' · <span style="color:var(--err)">no secret</span>')+'</div>'
+      +'<div class="meta">tenant '+esc(p.tenant||'—')+' · '+esc(p.endpoint_name)+'/'+esc(p.endpoint_version)+((p.has_client_secret&&p.has_password)?'':' · <span style="color:var(--err)">no secret</span>')+'</div>'
       +'<div class="gates">'+g(p.allow_write,'write')+' '+g(p.allow_delete,'delete')+' '+g(p.allow_publish,'publish')+'</div></div>'
       +'<div class="acts">'
       +(p.name===d.active?'':'<button data-a="active" data-n="'+esc(p.name)+'">Set active</button>')
@@ -143,11 +143,13 @@ $('list').addEventListener('click',async e=>{const b=e.target.closest('button');
     if(a==='remove'){if(!confirm('Remove profile "'+n+'"?'))return;await api('/api/remove',{method:'POST',body:JSON.stringify({name:n})});showTop('Removed '+n);await load()}
     if(a==='test'){b.textContent='…';const r=await api('/api/test',{method:'POST',body:JSON.stringify({name:n})});b.textContent='Test';showTop(r.ok?('✓ '+n+': '+r.entity_count+' entities'):('✗ '+n+': '+r.error),!r.ok)}
     if(a==='edit'){const p=(window._profiles||[]).find(x=>x.name===n)||{};FIELDS.forEach(f=>$(f).value=p[f]!=null?p[f]:'');$('client_secret').value='';$('password').value='';
+      $('client_secret').placeholder=p.has_client_secret?'•••••••• (set — leave blank to keep)':'';
+      $('password').placeholder=p.has_password?'•••••••• (set — leave blank to keep)':'';
       $('allow_write').checked=!!p.allow_write;$('allow_delete').checked=!!p.allow_delete;$('allow_publish').checked=!!p.allow_publish;
       showTop('Editing '+n+' — re-enter secret + password to change them (leave blank to keep).');$('name').scrollIntoView({behavior:'smooth'})}
   }catch(err){showTop(err.message,true)}
 });
-$('clear').onclick=()=>{FIELDS.forEach(f=>$(f).value='');['allow_write','allow_delete','allow_publish','set_active'].forEach(c=>$(c).checked=false);$('formmsg').className='msg'};
+$('clear').onclick=()=>{FIELDS.forEach(f=>$(f).value='');$('client_secret').placeholder='';$('password').placeholder='';['allow_write','allow_delete','allow_publish','set_active'].forEach(c=>$(c).checked=false);$('formmsg').className='msg'};
 $('form').addEventListener('submit',async e=>{e.preventDefault();
   const body={};FIELDS.forEach(f=>body[f]=$(f).value.trim());
   ['allow_write','allow_delete','allow_publish','set_active'].forEach(c=>body[c]=$(c).checked);
@@ -173,11 +175,27 @@ def _profiles_payload(cfg) -> dict:
                 "allow_write": i.allow_write,
                 "allow_delete": i.allow_delete,
                 "allow_publish": i.allow_publish,
-                "has_secret": bool(i.client_secret and i.password),
+                "has_client_secret": bool(i.client_secret),
+                "has_password": bool(i.password),
             }
             for n, i in cfg.instances.items()
         ],
     }
+
+
+def _is_same_origin(headers, expected: str) -> bool:
+    """CSRF guard: binding to 127.0.0.1 stops remote attackers, but a page open in
+    the SAME browser (any other tab/site) can still fire a blind cross-origin POST
+    here while this UI happens to be running — CORS blocks it from reading the
+    response, not from sending the request. A real load of this page's own JS
+    always carries an Origin (or, failing that, a Referer) matching `expected`
+    exactly; a POST forged from another site won't. Pure function (headers/expected
+    passed in) so it's unit-testable without a live HTTP handler."""
+    origin = headers.get("Origin")
+    if origin is not None:
+        return origin == expected
+    referer = headers.get("Referer") or ""
+    return referer == expected or referer.startswith(expected + "/")
 
 
 async def _test(inst: Instance) -> dict:
@@ -212,6 +230,9 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _same_origin(self) -> bool:
+        return _is_same_origin(self.headers, f"http://{HOST}:{PORT}")
+
     def do_GET(self) -> None:  # noqa: N802
         try:
             if self.path == "/" or self.path.startswith("/index"):
@@ -225,6 +246,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            if not self._same_origin():
+                self._json({"error": "cross-origin request rejected"}, 403)
+                return
             body = self._read_json()
             if self.path == "/api/profile":
                 self._save_profile(body)

@@ -2273,7 +2273,8 @@ async def snapshot_entity(
     regen, segment restructure, bulk overwrite) so you can roll back.
 
     Auto-pages with $skip so the snapshot captures the FULL table, not just page 1.
-    A caller-supplied `path` must be inside the instance's write_roots (if configured).
+    The final path — whether you supplied one or it's the auto-generated default —
+    must be inside the instance's write_roots (if configured).
     """
     params: dict[str, Any] = {}
     if filter:
@@ -2282,15 +2283,12 @@ async def snapshot_entity(
         params["$expand"] = expand
     cfg = _cfg()
     name = instance or cfg.default
-    if path:
-        _check_write_path(path, instance)
-    data = await _client(instance).get_all(entity, params)
-
     if not path:
         base = os.path.dirname(os.environ.get("GRP_MCP_CONNECTIONS", "")) or os.getcwd()
-        out_dir = os.path.join(base, "snapshots")
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{entity}_{name}.json")
+        path = os.path.join(base, "snapshots", f"{entity}_{name}.json")
+    _check_write_path(path, instance)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = await _client(instance).get_all(entity, params)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False, default=str)
     n = len(data) if isinstance(data, list) else (0 if data is None else 1)
