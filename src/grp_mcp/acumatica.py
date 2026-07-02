@@ -124,8 +124,18 @@ class AcumaticaClient:
                     await self._fetch_token()
         return {"Authorization": f"Bearer {self._access_token}"}
 
-    def _assert_same_origin(self, url: str) -> None:
-        """Refuse to attach the ERP bearer token to any non-configured origin (SSRF)."""
+    def _assert_allowed_url(self, url: str) -> None:
+        """Refuse to attach the ERP bearer token to any URL outside the configured
+        instance — SSRF / token-leak guard.
+
+        Two checks, because same host is not enough: a caller-supplied URL (e.g.
+        poll_action's Location, a download link) that shares the host but points at
+        a DIFFERENT app under the same server (http://host/OtherApp/...) would still
+        receive the token under an origin-only check. So we also require the URL's
+        path to fall under the instance's base_url path prefix (e.g. /2026R1). When
+        the site is hosted at the domain root (empty base path) there is nothing to
+        scope to, so the origin check alone applies.
+        """
         u = urlparse(url)
         origin = f"{u.scheme}://{u.netloc}".lower()
         if origin != self.instance.origin:
@@ -134,6 +144,20 @@ class AcumaticaClient:
                 f"Acumatica origin '{self.instance.origin}' is allowed. (Blocked to "
                 f"prevent leaking the OAuth token to an arbitrary URL.)"
             )
+        base_path = urlparse(self.instance.base_url).path.rstrip("/")
+        if base_path:
+            req_path = u.path.rstrip("/") or "/"
+            # allow the prefix itself and anything nested under it (prefix + "/")
+            if req_path != base_path and not req_path.startswith(base_path + "/"):
+                raise AcumaticaError(
+                    f"Refusing authenticated request to path '{u.path}': only paths under "
+                    f"the configured instance base '{base_path}/' receive the token "
+                    f"(same host, different app path is blocked to prevent token leakage)."
+                )
+
+    # backward-compatible alias (older internal name)
+    def _assert_same_origin(self, url: str) -> None:
+        self._assert_allowed_url(url)
 
     # ---- request plumbing ----------------------------------------------
 
@@ -145,7 +169,7 @@ class AcumaticaClient:
         token once on 401 and raises AcumaticaError on >=400. Rejects any URL whose
         origin is not the configured instance (so the bearer token never leaves it).
         """
-        self._assert_same_origin(url)
+        self._assert_allowed_url(url)
         headers = await self._auth_header()
         headers.update(kwargs.pop("headers", {}))
         resp = await self._http.request(method, url, headers=headers, **kwargs)

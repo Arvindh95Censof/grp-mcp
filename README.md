@@ -114,12 +114,6 @@ write almost anything:
 | `run_report` | Run a Report-type entity and save the rendered file (PDF) to disk. |
 | `poll_action` | Check a long-running action's status by its `Location`. |
 
-**Contract / config**
-
-| Tool | What it does |
-|------|--------------|
-| `extend_endpoint` | **Verified no-op over REST** — kept for reference; extend endpoints via the SM207060 UI / playwright or a customization project instead. |
-
 **Safety**
 
 | Tool | What it does |
@@ -211,10 +205,17 @@ scalar fields are supported (no nested detail rows).
 
 ### Extending an endpoint contract
 
-`extend_endpoint` is a **verified no-op over REST** and is kept only for reference.
-`WebServiceEndpoints` (SM207060) is a stateful wizard form — its create/extend views
-are transient and a PUT does nothing. Reading a contract works fine via
-`get_endpoint_definition`. Two working ways to actually add entities/fields/actions:
+A PUT to `WebServiceEndpoints` (SM207060) is a **verified no-op** — it's a stateful
+wizard form whose create/extend views are transient — so the old `extend_endpoint`
+helper is **no longer registered as an MCP tool** (it was a trap: a clean success that
+changed nothing; the function survives only as importable reference). Reading a
+contract works fine via `get_endpoint_definition`. Three working ways to actually add
+entities/fields/actions:
+
+- **Modern UI-screen plane (no browser).** `ui_tree_dialog_insert` adds an entity or
+  detail collection by driving the real SM207060 wizard, and
+  `ui_populate_endpoint_entity_fields` exposes its scalar fields — end to end (see the
+  modern-plane tools above).
 
 - **Customization project (headless, no browser).** An endpoint can live in a
   customization project as an `<EntityEndpoint>` block in `project.xml`; grp-mcp
@@ -233,8 +234,10 @@ This server holds ERP credentials and runs with the host user's privileges, so t
 tools are sandboxed:
 
 - **Token never leaves the instance.** Every authenticated request is checked
-  against the configured origin (`scheme://host`); a `poll_action`/download URL on
-  any other host is refused (prevents OAuth-token exfiltration / SSRF).
+  against the configured origin (`scheme://host`) **and the base-URL path prefix**
+  (e.g. `/2026R1`); a `poll_action`/download URL on another host — *or a same-host
+  URL pointing at a different app path* — is refused (prevents OAuth-token
+  exfiltration / SSRF, incl. sibling apps on the same server).
 - **Writes are opt-in.** Record mutations (`create_or_update_entity`,
   `load_from_excel`, `invoke_action`, `run_import_scenario`, `set_note`,
   `attach_file`, `attach_file_to_provider`, `screen_submit`, `ui_screen_action`,
@@ -246,11 +249,19 @@ tools are sandboxed:
   screen/UI planes can't sidestep the delete gate. Customization
   publish/import/unpublish require `"allow_publish": true`. **Default is
   read-only.**
-- **Filesystem is fenced.** Tools that read (`attach_file`, `import_customization`,
-  `load_from_excel`) or write (`download_file`, `run_report`, `snapshot_entity`,
-  `export_customization`) a local path enforce `read_roots` / `write_roots` (a path
-  must sit inside an allowed dir if the list is set) and a `max_file_bytes` size cap
-  on reads. Leave the root lists empty only on a trusted single-user host.
+- **Filesystem sandbox is OPT-IN, not on by default.** Tools that read (`attach_file`,
+  `import_customization`, `load_from_excel`) or write (`download_file`, `run_report`,
+  `snapshot_entity`, `export_customization`) a local path enforce `read_roots` /
+  `write_roots` **only if those lists are set** — an **empty list means UNRESTRICTED**
+  (any path the OS user can reach), *not* sandboxed. To make this impossible to
+  over-trust, each file-touching tool echoes a `sandbox` field in its result
+  (`UNRESTRICTED — no write_roots set` vs `restricted to [...]`). A `max_file_bytes`
+  cap applies to reads. Set the root lists on any multi-user or untrusted host.
+- **Config mutations need an admin opt-in.** `add_instance` / `remove_instance` /
+  `set_active_instance` **persisting** to `connections.json` (which stores
+  credentials) require the `GRP_MCP_ALLOW_ADMIN=1` env var — a gate separate from the
+  ERP write gates, so an agent can't silently rewrite your credential file.
+  `persist=false` (session-only) needs no gate.
 - **Bounded loops.** Pagination and polling arguments are range-checked, so a
   `page_size`/`poll_interval` of 0 can't spin forever.
 - **Sessions released.** Token refreshes are serialized (one login, not N), and API
@@ -545,7 +556,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.30 — 73 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.31 — 72 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen

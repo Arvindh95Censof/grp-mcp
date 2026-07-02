@@ -34,8 +34,14 @@ _KB_FIRST_POLICY = (
     "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
     "and ordering constraints; verify each prerequisite exists in the instance "
     "(run_dac_odata / screen_get / get_entity / setup_readiness) and set up any "
-    "missing one first (recursively). Do not drive a screen cold. Reads "
-    "(get_entity, screen_get, run_*, list_*, count_entity) are exempt. This exists "
+    "missing one first (recursively). Do not drive a screen cold. Exempt (reads "
+    "only): get_entity, count_entity, list_* (list_entities/list_actions/etc.), "
+    "screen_get, screen_get_schema, screen_preflight, run_generic_inquiry, "
+    "run_dac_odata, run_report, ui_get_structure, ui_read_grid, ui_resolve_selector, "
+    "screen_capabilities, setup_readiness, get_setup_guidance, whoami. NOTE: "
+    "run_import_scenario is NOT a read — despite the run_ prefix it WRITES data "
+    "(executes an import scenario), so it requires the KB-first check like any other "
+    "write. This exists "
     "because Acumatica screens have hard dependencies the screen won't surface "
     "until a write fails with a generic/misleading error (e.g. CS203000 Segment "
     "Values requires the key to exist on CS202000 with a Validate=ON segment, and "
@@ -128,6 +134,26 @@ def _require_delete(instance: str | None) -> None:
         raise PermissionError(
             f"Deletes are disabled for instance '{name}'. Set \"allow_delete\": true "
             f"in its connections.json profile to permit delete_entity."
+        )
+
+
+def _require_admin(op: str) -> None:
+    """Gate config-file MUTATIONS that PERSIST to connections.json (which stores
+    credentials) behind an explicit opt-in env var — a separate, higher-trust gate
+    than the per-instance write gates, since these edit the connector's own config
+    (add/remove a profile, change the persisted default) rather than ERP data.
+
+    Session-only variants (persist=False) are NOT gated — they don't touch disk.
+    Set GRP_MCP_ALLOW_ADMIN=1 to permit persisting config changes.
+    """
+    allowed = os.environ.get("GRP_MCP_ALLOW_ADMIN", "").strip().lower() in ("1", "true", "yes")
+    if not allowed:
+        raise PermissionError(
+            f"Refusing to persist a config change ({op}): writing connections.json "
+            f"(which holds credentials) requires the GRP_MCP_ALLOW_ADMIN=1 environment "
+            f"variable. Either set it to manage profiles, or call this with persist=false "
+            f"for a session-only change. (Guards against an agent silently rewriting your "
+            f"credential file.)"
         )
 
 
@@ -299,7 +325,10 @@ def add_instance(
     Gates default to read-only (allow_write/allow_delete/allow_publish off) and the
     filesystem sandbox (read_roots/write_roots) is unset (unrestricted) unless given.
     set_active=true makes it the default profile. persist=true writes connections.json
-    (the file is gitignored). Returns the updated profile list (no secrets).
+    (the file is gitignored) — and, because that file holds credentials, persisting
+    requires the GRP_MCP_ALLOW_ADMIN=1 env var (an admin gate separate from the ERP
+    write gates); persist=false is a session-only add that needs no gate. Returns the
+    updated profile list (no secrets).
 
     Needs a registered Connected Application on the target instance (Integration ->
     Connected Applications, Resource Owner Password Credentials flow).
@@ -321,6 +350,8 @@ def add_instance(
         read_roots=read_roots or [],
         write_roots=write_roots or [],
     )
+    if persist:
+        _require_admin("add_instance persist")
     existed = name in cfg.instances
     cfg.instances[name] = inst
     _clients.pop(name, None)  # drop any stale cached client for this name
@@ -341,11 +372,14 @@ def set_active_instance(name: str, persist: bool = False) -> dict:
     """Select which profile tools use by default (when called without `instance`).
 
     persist=true also writes the choice as "default" in connections.json so it
-    survives a restart; otherwise it's a session-only switch.
+    survives a restart (requires the GRP_MCP_ALLOW_ADMIN=1 env var, since it edits the
+    credential file); otherwise it's an ungated session-only switch.
     """
     cfg = _cfg()
     if name not in cfg.instances:
         raise KeyError(f"Unknown profile '{name}'. Configured: {', '.join(cfg.instances)}")
+    if persist:
+        _require_admin("set_active_instance persist")
     cfg.default = name
     saved = save_config(cfg) if persist else None
     return {"active": name, "persisted": bool(saved), "persisted_to": saved}
@@ -356,11 +390,15 @@ def remove_instance(name: str, persist: bool = True) -> dict:
     """Remove a connection profile (and drop its cached session).
 
     If it was the active profile, the active switches to another remaining profile.
-    persist=true updates connections.json. Refuses to remove the last profile.
+    persist=true updates connections.json (requires the GRP_MCP_ALLOW_ADMIN=1 env var,
+    since it edits the credential file); persist=false is a session-only removal.
+    Refuses to remove the last profile.
     """
     cfg = _cfg()
     if name not in cfg.instances:
         raise KeyError(f"Unknown profile '{name}'. Configured: {', '.join(cfg.instances)}")
+    if persist:
+        _require_admin("remove_instance persist")
     if len(cfg.instances) == 1:
         raise ValueError("refusing to remove the only configured profile.")
     del cfg.instances[name]
@@ -476,7 +514,11 @@ async def get_endpoint_definition(
     )
 
 
-@mcp.tool()
+# NOT a registered MCP tool (deliberately un-decorated): a PUT to
+# WebServiceEndpoints is a verified no-op, so exposing it only invited an agent to
+# "extend an endpoint" and silently achieve nothing. Superseded by ui_tree_dialog_insert
+# (+ ui_populate_endpoint_entity_fields), which drive the real SM207060 wizard via the
+# modern UI-screen plane. Kept as an importable reference documenting why REST can't.
 async def extend_endpoint(
     endpoint_name: str,
     endpoint_version: str,
@@ -486,8 +528,8 @@ async def extend_endpoint(
     extend_current_endpoint: list[dict] | None = None,
     instance: str | None = None,
 ) -> Any:
-    """[DOES NOT WORK over REST — kept for reference] Attempt to add entities to a
-    contract via the WebServiceEndpoints entity.
+    """[NOT A TOOL — DOES NOT WORK over REST] Attempt to add entities to a contract
+    via the WebServiceEndpoints entity.
 
     Verified on csmdev 2025R1: a PUT here is a NO-OP. WebServiceEndpoints (SM207060)
     is a STATEFUL WIZARD form, not a CRUD entity -- CreateEntity/EntityProperties are
@@ -496,12 +538,15 @@ async def extend_endpoint(
     PopulateFields, Save) are container actions whose parameters aren't in the
     contract and which need live form state that doesn't survive stateless calls.
 
-    To actually extend an endpoint, use one of:
-      - Playwright on the SM207060 UI (drives the real wizard), or
-      - a customization project: import_customization + publish_customization.
+    To actually extend an endpoint, use the modern-plane tools that drive the real
+    SM207060 wizard:
+      - ui_tree_dialog_insert            (add an entity / detail collection), then
+      - ui_populate_endpoint_entity_fields (expose its scalar fields).
+    Or a customization project: import_customization + publish_customization.
 
-    Reading a contract works fine: use get_endpoint_definition.
-    (allow_publish gate retained in case a future build makes this writable.)
+    Reading a contract works fine: use get_endpoint_definition. This function is no
+    longer registered as an MCP tool (it was a trap: a clean success that changed
+    nothing); it remains only as importable reference.
     """
     _require_publish(instance)
     body: dict = {
@@ -2464,6 +2509,7 @@ async def load_from_excel(
             "unknown_fields": unknown if schema_error is None else None,
             "schema_error": schema_error,
             "sample": mapped[:5],
+            "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("read"),
             "note": (
                 "Schema validation FAILED — could not confirm field names; fix the "
                 "error and re-run before loading. No data written."
@@ -2666,7 +2712,8 @@ async def snapshot_entity(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False, default=str)
     n = len(data) if isinstance(data, list) else (0 if data is None else 1)
-    return {"entity": entity, "instance": name, "count": n, "path": path}
+    return {"entity": entity, "instance": name, "count": n, "path": path,
+            "sandbox": cfg.get(name).fs_sandbox("write")}
 
 
 @mcp.tool()
@@ -3213,6 +3260,7 @@ async def download_file(
         "filename": chosen.get("filename"),
         "bytes": len(data),
         "path": out_path,
+        "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }
 
 
@@ -3251,6 +3299,7 @@ async def run_report(
         "bytes": len(data),
         "path": out_path,
         "parameters": parameters or {},
+        "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }
 
 

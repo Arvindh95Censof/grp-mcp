@@ -13,6 +13,7 @@ import json
 import pytest
 
 from grp_mcp import server
+from grp_mcp.acumatica import AcumaticaClient, AcumaticaError
 from grp_mcp.config import Config, Instance
 from grp_mcp.screen import ScreenClient
 
@@ -700,3 +701,92 @@ def test_ui_grid_row_action_confirm_false_leaves_dialog_open():
         "Snapshots", {"SnapshotID": "abc"}, "importSnapshotCommand", confirm=False))
     assert res["status"] == "dialog_open"
     assert not any("dialogCallback" in c for c in calls)  # never committed
+
+
+# ---- bearer-token URL guard: origin AND base-path scoped --------------------
+# The token must never ride to a same-host but different-app URL (poll_action /
+# download take caller-supplied URLs). base_url "https://host/2026R1" -> only
+# paths under /2026R1 are allowed; a bare-root base falls back to origin-only.
+
+def _acu(base_url):
+    return AcumaticaClient(_inst(base_url=base_url))
+
+
+def test_token_guard_allows_url_under_base_path():
+    c = _acu("https://host/2026R1")
+    c._assert_allowed_url("https://host/2026R1/entity/Default/24.200.001/SalesOrder")
+    c._assert_allowed_url("https://host/2026R1/t/Company/api/odata/dac/Account")
+    c._assert_allowed_url("https://host/2026R1")  # the prefix itself
+
+
+def test_token_guard_blocks_different_origin():
+    c = _acu("https://host/2026R1")
+    with pytest.raises(AcumaticaError):
+        c._assert_allowed_url("https://evil.example.com/2026R1/entity/x")
+
+
+def test_token_guard_blocks_same_host_different_app_path():
+    c = _acu("https://host/2026R1")
+    with pytest.raises(AcumaticaError):
+        c._assert_allowed_url("https://host/OtherApp/entity/x")
+    # a path that merely shares the prefix as a substring, not a segment, is blocked
+    with pytest.raises(AcumaticaError):
+        c._assert_allowed_url("https://host/2026R1Evil/x")
+
+
+def test_token_guard_root_hosted_base_is_origin_only():
+    c = _acu("https://host")  # site at domain root -> no path to scope to
+    c._assert_allowed_url("https://host/entity/Default/24.200.001/SalesOrder")
+    c._assert_allowed_url("https://host/anything/at/all")
+    with pytest.raises(AcumaticaError):
+        c._assert_allowed_url("https://elsewhere/x")
+
+
+def test_extend_endpoint_is_not_a_registered_tool():
+    # deregistered on purpose: a REST PUT to WebServiceEndpoints is a verified no-op,
+    # so exposing it as a tool only invited a silent do-nothing "success".
+    async def _names():
+        return {t.name for t in await server.mcp.list_tools()}
+    names = asyncio.run(_names())
+    assert "extend_endpoint" not in names
+    assert "ui_tree_dialog_insert" in names  # the working replacement
+
+
+# ---- admin gate: persisting config mutations need GRP_MCP_ALLOW_ADMIN --------
+
+def test_admin_gate_blocks_persist_without_env(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    with pytest.raises(PermissionError):
+        server.set_active_instance("rw", persist=True)
+
+
+def test_admin_gate_allows_session_only_switch(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    # persist=false touches no file -> ungated
+    out = server.set_active_instance("rw", persist=False)
+    assert out["active"] == "rw" and out["persisted"] is False
+
+
+def test_admin_gate_opens_with_env(cfg, monkeypatch, tmp_path):
+    monkeypatch.setenv("GRP_MCP_ALLOW_ADMIN", "1")
+    monkeypatch.setenv("GRP_MCP_CONNECTIONS", str(tmp_path / "connections.json"))
+    out = server.set_active_instance("rw", persist=True)
+    assert out["active"] == "rw" and out["persisted"] is True
+
+
+def test_admin_gate_remove_instance_persist_blocked(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    with pytest.raises(PermissionError):
+        server.remove_instance("rw", persist=True)
+
+
+# ---- fs sandbox status is honest about "empty roots = unrestricted" ----------
+
+def test_fs_sandbox_unrestricted_when_empty():
+    s = _inst().fs_sandbox("write")
+    assert "UNRESTRICTED" in s and "write_roots" in s
+
+
+def test_fs_sandbox_restricted_when_set():
+    s = _inst(read_roots=["C:/data"]).fs_sandbox("read")
+    assert "restricted to" in s and "C:/data" in s

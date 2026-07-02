@@ -36,10 +36,28 @@ class Instance(BaseModel):
     allow_write: bool = False  # gate create/update, load, action, import-scenario, note, attach
     allow_delete: bool = False  # gate record deletes (stricter than write)
     allow_publish: bool = False  # gate for Customization API write ops (publish/import/unpublish)
-    # --- filesystem sandbox (empty list = unrestricted; set to enforce) ---
-    read_roots: list[str] = Field(default_factory=list)  # dirs attach_file may read from
-    write_roots: list[str] = Field(default_factory=list)  # dirs download/report/snapshot may write to
+    # --- filesystem sandbox — OPT-IN, NOT on by default ---
+    # IMPORTANT: an empty list means UNRESTRICTED (no sandbox) — local file tools can
+    # then read/write ANY path the OS user can. This is NOT "sandboxed by default";
+    # you must set roots to enforce a sandbox. File-touching tool results echo a
+    # `sandbox` field so the caller can see which mode is active.
+    read_roots: list[str] = Field(
+        default_factory=list,
+        description="Dirs local READS (attach_file, load_from_excel) are confined to. "
+                    "EMPTY = UNRESTRICTED (no sandbox).")
+    write_roots: list[str] = Field(
+        default_factory=list,
+        description="Dirs local WRITES (download_file, run_report, snapshot_entity, "
+                    "export_customization) are confined to. EMPTY = UNRESTRICTED (no sandbox).")
     max_file_bytes: int = 50_000_000  # cap on read/download size (bytes)
+
+    def fs_sandbox(self, kind: str) -> str:
+        """Human-readable sandbox status for `read`/`write`, echoed in tool results
+        so 'empty roots = unrestricted' is never a silent assumption."""
+        roots = self.read_roots if kind == "read" else self.write_roots
+        if not roots:
+            return f"UNRESTRICTED — no {kind}_roots set (any path the OS user can access)"
+        return f"restricted to {roots}"
 
     @property
     def token_url(self) -> str:
