@@ -790,3 +790,32 @@ def test_fs_sandbox_unrestricted_when_empty():
 def test_fs_sandbox_restricted_when_set():
     s = _inst(read_roots=["C:/data"]).fs_sandbox("read")
     assert "restricted to" in s and "C:/data" in s
+
+
+# ---- publish job view / status (non-blocking publish) -----------------------
+
+def test_publish_job_view_in_progress_vs_completed_vs_error():
+    base = {"job": "grp_mcp", "project_names": ["grp_mcp"], "completed": False,
+            "failed": None, "result": None, "error": None}
+    v = server._publish_job_view(dict(base))
+    assert v["status"] == "in_progress" and v["completed"] is False and v["note"]
+    done = server._publish_job_view({**base, "completed": True, "failed": False,
+                                     "result": {"isCompleted": True}})
+    assert done["status"] == "completed" and done["note"] is None
+    err = server._publish_job_view({**base, "error": "boom"})
+    assert err["status"] == "error" and err["note"] is None
+
+
+def test_publish_status_reads_module_state(monkeypatch):
+    monkeypatch.setattr(server, "_publish_jobs", {
+        "a": {"job": "a", "project_names": ["a"], "completed": True, "failed": False,
+              "result": {}, "error": None},
+        "b": {"job": "b", "project_names": ["b"], "completed": False, "failed": None,
+              "result": None, "error": None},
+    })
+    # explicit job
+    assert asyncio.run(server.publish_status("a"))["status"] == "completed"
+    # default = most recently inserted
+    assert asyncio.run(server.publish_status())["job"] == "b"
+    # unknown
+    assert asyncio.run(server.publish_status("zzz"))["status"] == "unknown"

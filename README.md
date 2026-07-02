@@ -127,7 +127,8 @@ write almost anything:
 | `list_published` | List published customization projects (read-only). |
 | `export_customization` | Export a project to a `.zip` on disk (headless edit loop). |
 | `import_customization` | Import a customization `.zip` (does not publish). |
-| `publish_customization` | Publish projects (async begin + poll). |
+| `publish_customization` | Publish projects — **non-blocking**: runs the site recompile (1-3 min, longer than the MCP request timeout) in a background task and returns after `wait_seconds` (default 40) with status `completed` \| `in_progress` \| `error`. A fast-fail validation error still surfaces here; a long recompile returns `in_progress` and finishes on its own. |
+| `publish_status` | Check a background publish started by `publish_customization` (instant in-memory read; no API call). Poll until status ≠ `in_progress`; never re-publish an in-progress one. |
 | `unpublish_customization` | Unpublish all customization projects (rollback). |
 
 Every tool takes an optional `instance` arg to pick a connection; defaults to the
@@ -556,7 +557,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.31 — 72 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.32 — 73 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen

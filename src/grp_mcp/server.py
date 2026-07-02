@@ -53,6 +53,30 @@ mcp = FastMCP("grp-mcp", instructions=_KB_FIRST_POLICY)
 _config: Config | None = None
 _clients: dict[str, AcumaticaClient] = {}
 _setup_map_cache: dict | None = None
+# background publish jobs: job-id -> live state dict (updated by a driver task).
+# Lets publish_customization return before the site recompile finishes (which
+# outlasts the MCP request timeout) while the publish still completes server-side.
+_publish_jobs: dict[str, dict] = {}
+
+
+def _publish_job_view(state: dict) -> dict:
+    """Serializable snapshot of a publish job's live state (drops the Task handle)."""
+    done = bool(state.get("completed"))
+    err = state.get("error")
+    return {
+        "job": state["job"],
+        "project_names": state["project_names"],
+        "status": "completed" if done else ("error" if err else "in_progress"),
+        "completed": done,
+        "failed": state.get("failed"),
+        "result": state.get("result"),
+        "error": err,
+        "note": None if (done or err) else (
+            f"Site recompile still running server-side — it WILL finish on its own; "
+            f"do NOT re-publish. Poll publish_status(job={state['job']!r}) until "
+            f"status != in_progress."
+        ),
+    }
 
 
 def _setup_map() -> dict:
@@ -3392,23 +3416,88 @@ async def publish_customization(
     tenant_mode: str = "Current",
     tenant_login_names: list[str] | None = None,
     options: dict | None = None,
+    wait_seconds: float = 40.0,
     instance: str | None = None,
 ) -> Any:
-    """Publish one or more customization projects (async begin + poll until done).
+    """Publish customization project(s) — NON-BLOCKING (won't hang on the recompile).
 
-    WARNING: website-level — recompiles the site and affects ALL tenants on the
-    instance. tenant_mode: Current | All | List (with tenant_login_names).
-    `options` passes extra publishBegin flags (e.g. merge/db-script options).
-    Requires the instance's profile to have "allow_publish": true.
+    A site recompile takes 1-3 min, longer than the MCP request timeout, so this
+    used to return a spurious timeout error even though the publish completed. Now
+    it runs the publish in a BACKGROUND task (which owns the login session and
+    polls to completion) and returns after up to `wait_seconds`:
+      • status "completed" — finished within wait_seconds (incl. fast validation
+        FAILURES, which surface here with the error log in `result`);
+      • status "in_progress" — still recompiling server-side; it WILL finish on its
+        own. Poll `publish_status(job)` until status != in_progress. Do NOT
+        re-publish (that would start a second recompile).
+
+    WARNING: website-level — recompiles the site and affects ALL tenants. tenant_mode:
+    Current | All | List (with tenant_login_names). `options` passes extra publishBegin
+    flags. wait_seconds is clamped to [0, 120]. Requires "allow_publish": true.
     """
     _require_publish(instance)
-    async with _customization(instance) as c:
-        return await c.publish(
-            project_names,
-            tenant_mode=tenant_mode,
-            tenant_login_names=tenant_login_names,
-            options=options,
-        )
+    _require_range("wait_seconds", wait_seconds, 0, 120)
+    inst = _cfg().get(instance or _cfg().default)
+    client = CustomizationClient(inst)
+    # publishBegin in the foreground so auth/begin errors surface immediately (and
+    # nothing is backgrounded on a bad request).
+    try:
+        await client.publish_begin(project_names, tenant_mode, tenant_login_names, options)
+    except Exception:
+        await client.aclose()
+        raise
+    job = "+".join(project_names)
+    state: dict[str, Any] = {"job": job, "project_names": project_names,
+                             "completed": False, "failed": None, "result": None, "error": None}
+    _publish_jobs[job] = state
+
+    async def _drive() -> None:
+        waited = 0.0
+        last: Any = None
+        try:
+            while waited < 1800:
+                last = await client.publish_end()
+                if isinstance(last, dict) and last.get("isCompleted"):
+                    state.update(completed=True, failed=bool(last.get("isFailed")), result=last)
+                    return
+                await asyncio.sleep(3.0)
+                waited += 3.0
+            state.update(result=last, error="publish poll exceeded 1800s")
+        except Exception as e:  # noqa: BLE001 — record, don't crash the loop
+            state.update(error=str(e)[:400])
+        finally:
+            state.pop("_task", None)
+            await client.aclose()
+
+    state["_task"] = asyncio.create_task(_drive())
+    # let it settle: fast projects + fast-fail validation finish inside wait_seconds
+    waited = 0.0
+    while waited < wait_seconds and not state["completed"] and state["error"] is None:
+        await asyncio.sleep(2.0)
+        waited += 2.0
+    return _publish_job_view(state)
+
+
+@mcp.tool()
+async def publish_status(job: str | None = None) -> Any:
+    """Check a background publish started by publish_customization (in-memory read,
+    no API call — instant).
+
+    job: the `job` id publish_customization returned; omit for the most recent.
+    Returns the same shape (status completed | in_progress | error). A site recompile
+    finishes on its own, so just poll this until status != "in_progress" — never
+    re-run publish_customization to "retry" one that's still in_progress.
+    """
+    if not _publish_jobs:
+        return {"status": "none",
+                "note": "No publish started in this server session (state is in-memory; "
+                        "a server restart clears it — verify via list_published instead)."}
+    if job is None:
+        job = next(reversed(_publish_jobs))
+    state = _publish_jobs.get(job)
+    if state is None:
+        return {"status": "unknown", "job": job, "known_jobs": list(_publish_jobs)}
+    return _publish_job_view(state)
 
 
 @mcp.tool()
