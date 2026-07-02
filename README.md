@@ -558,7 +558,7 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.33 — 74 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.34 — 74 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen
@@ -576,9 +576,14 @@ and `screen_capabilities` to pick the right plane/tool per operation). On top si
 `chart_of_accounts`, `generate_master_calendar` + `manage_financial_periods`
 (open/close/lock/reopen/deactivate) — plus import scenarios, the Customization Web API,
 `setup_readiness`, and `get_setup_guidance` (a baked-in foundation setup map: prereqs,
-required fields, gotchas, and plane-to-drive per screen). **The financial foundation chain —
-System→GL→CA→AP→AR→Tax — is fully grp-mcp-drivable end-to-end, no manual/UI steps**, proven
-live on a real instance.
+required fields, gotchas, and plane-to-drive per screen — including the **blank-tenant
+bootstrap recipe**: base currency is created inline by the company save, the Actual ledger
+comes via the `Ledger` entity with a nested `Companies` link, feature activation must fire
+the modern-plane `requestValidation`, and `AccountClass` 500s until a branch record exists;
+plus the project.xml **endpoint-transplant method** for building comprehensive web-service
+endpoints headlessly). **The financial foundation chain — System→GL→CA→AP→AR→Tax — is fully
+grp-mcp-drivable end-to-end, no manual/UI steps**, proven live on a real instance, including
+from a completely blank tenant.
 
 ### The modern UI-screen plane (`ui_get_structure` / `ui_screen_action`)
 

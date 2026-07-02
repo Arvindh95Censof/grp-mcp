@@ -1,6 +1,6 @@
 {
   "scope": "Acumatica financial foundation setup (Implementing Basic Financials). NOT all of Acumatica: excludes Distribution/Projects/Manufacturing/FA/Payroll/CRM and the transactional layer.",
-  "source": "KB 6-area sweep + live /structure sweep (local2026r1) + proven grp-mcp session experience. Full prose: OPEX/PS/setup-map/SETUP_MAP.md.",
+  "source": "KB 6-area sweep + live /structure sweep (local2026r1) + proven grp-mcp session experience, incl. a full blank-tenant foundation bootstrap run (2026-07-02). Full prose: OPEX/PS/setup-map/SETUP_MAP.md.",
   "layers": {
     "documented": "order/prereqs/KB gotchas below \u2014 version-stable, safe to trust.",
     "live": "ALWAYS recompute per-instance via ui_get_structure(screen)/check state \u2014 never trust baked required-field lists blindly; features, licensing, and what's already configured are instance-specific."
@@ -85,6 +85,14 @@
     {
       "id": "ui-plane-auth-and-row-actions",
       "rule": "Modern UI-JSON plane essentials (learned 2026-07-02 doing SM203520 snapshot restore). (1) AUTH: the modern plane (/ui/screen/<ID>) rides the SAME login cookie as the classic SOAP Login \u2014 it is NOT separately authenticated. An unauthenticated/expired session does NOT 401 cleanly; it answers HTTP 200/302 with a {\"redirect\":\".../Login.aspx\"} body, which naively parses as \"no error, empty data\" -> you silently get an empty structure/grid and misattribute the cause (I wrongly blamed a maintenance lockout). _ui_error now flags that redirect as NOT AUTHENTICATED, and the modern entrypoints self-heal by calling login() if needed; through the MCP tools (async with ScreenClient) login is automatic. A goTo/other redirect is NOT an auth failure. (2) MAINTENANCE LOCKOUT (SM203510 Schedule/Stop Maintenance) does NOT block the admin who scheduled it, nor the SOAP/REST planes (per-call auth) \u2014 only non-admin forms-auth UI sessions. So you can drive a restore via the modern plane DURING the lockout as admin. (3) ROW-SCOPED ACTIONS: classic SOAP can navigate a keyed MASTER record but CANNOT select an arbitrary existing GRID row by key (RowNumber is inert) \u2014 so a \"select this row, then click a toolbar button\" flow (SM203520 Restore Snapshot -> importSnapshotCommand; faults \"A snapshot is not selected\" on SOAP) is impossible there. Use the modern-plane ui_grid_row_action tool: it makes the row active via activeRowContexts (GridActiveDataRow + the row key), fires the action, auto-answers the 302 openDialog with OK; confirm=False arms without committing; parent={view,key} scopes a tenant/master header. It returns an honest status: committed / dialog_open / redirected (a goTo like Restore->SM203510 is a hand-off to run/monitor, NOT a synchronous completion \u2014 verify the downstream effect). (4) ROUTING: call screen_capabilities(screen_id) to get the recommended plane/tool per operation shape instead of trial-and-error. Plane-by-shape: edit keyed master / bulk-append rows -> SOAP (screen_record/screen_insert_rows, also the only plane that works under lockout); select-row-then-act or dialog/process action -> modern; selector field -> ui_resolve_selector first; entity on the endpoint -> REST."
+    },
+    {
+      "id": "blank-tenant-bootstrap",
+      "rule": "Standing up a TRULY BLANK tenant (proven live 2026-07-02, blank 2026R1 -> multibranch company): working order = Features (enable_features stage + activate_features) -> Company (CS101500) -> Branches (CS102000) -> Ledger (REST) -> rest of canonical order. Three bootstrap traps: (1) BASE CURRENCY IS CREATED INLINE BY THE COMPANY SAVE, not beforehand - creating a Currency standalone (CM202000 / 'Currency' entity) on a blank tenant fails PXSetupNotEntered ('Company Branches form') because CurrencyMaint itself needs a company; instead TYPE the new base currency code into OrganizationView.BaseCuryID on CS101500 (its options list is empty - that's fine) and the company save creates the currency. Base currency stays changeable until GL102000 saves. (2) The company save does NOT create the Actual ledger even though CreateLedgerView.LedgerCD looks required - create it separately via create_or_update_entity('Ledger', {LedgerID, Type:'Actual', Currency, Companies:[{Company:<CD>}]}) on the Default endpoint; the nested Companies row makes the link (Organization.ActualLedgerID gets set). (3) GL202000/AccountClass (and other GL reads) 500 with PXSetupNotEnteredException[PX.Objects.GL.Branch] until a company + branch RECORD exists - it wants the records, not GL prefs; creating the branches clears it. Also: Branch/$adHocSchema 403 just means the Multibranch feature is still off."
+    },
+    {
+      "id": "endpoint-transplant-build",
+      "rule": "RELIABLE headless way to build a COMPREHENSIVE web-service endpoint (every field incl. tab/override-gated ones the SM207060 PopulateFields dialog structurally can't reach): transplant a proven <EntityEndpoint> project.xml - retarget <Endpoint name=.. version=..> + <ExtendsEndpoint>, then import_customization(replace=True) + publish_customization. GOTCHA (cost an hour): every detail-collection field typed 'XxxLines[]' needs its sibling <Detail name=\"XxxLines\"> type-definition element (sits under <Endpoint> after the TopLevelEntity blocks) included too - dropping them passes static validation but the publish DB-apply fails fast with 'The given key was not present in the dictionary'. Publish signature: SUCCESS = long site recompile (~1-3 min; publish_customization v0.32+ is non-blocking - poll publish_status); FAILURE returns fast with an error log, so bisecting a bad project.xml is cheap. Endpoint names: letters/digits/_/. only - no hyphens, no leading digit. Singleton config views (CS100000 Features, GL101000, GL102000, the period/calendar process screens) CANNOT be endpoint entities (EDM generation breaks) - drive those with the recipe tools (enable_features, create_financial_calendar, set_gl_preferences, generate_master_calendar, manage_financial_periods, set_segment_value) instead."
     }
   ],
   "canonical_order": [
@@ -136,9 +144,11 @@
         "Modify->tick->Enable flow; Enable recompiles the site (~1-3 min)",
         "Per company type add: no-branches=default; branches-no-balancing=+Multibranch; branches-balancing=+Multibranch+Multicompany+Advanced Financials+Inter-Branch",
         "Multiple Base Currencies is a trap-door (blocks re-enabling others)",
-        "Advanced Financials not in Standard edition"
+        "Advanced Financials not in Standard edition",
+        "ACTIVATE via the MODERN plane only: classic SOAP RequestValidation replays every feature field and NREs ('Object reference not set ... ProjectAccounting'), leaving ActivationStatus stuck at Pending Activation. Fire the modern command 'requestValidation' (lowercase) - it returns a reloadPage redirect as the recompile starts. activate_features v0.33+ does this automatically",
+        "Staging dependency order: Subaccounts won't tick until Advanced Financials is already ON - stage Advanced Financials first, then Subaccounts in a second enable_features call"
       ],
-      "plane": "enable_features / activate_features (fires RequestValidation, polls ActivationStatus->Validated)",
+      "plane": "enable_features (SOAP staging; split dependent features across 2 calls) + activate_features (v0.33+: modern-plane requestValidation, non-blocking - poll activate_features_status until ActivationStatus=Validated)",
       "verify": "run_dac_odata('FeaturesSet')"
     },
     "CS101500": {
@@ -161,9 +171,11 @@
       "gotchas": [
         "Base currency PERMANENT after GL102000 saved; Create Ledger uses it (set first)",
         "One Actual ledger/company",
-        "The ledger LINK lives in grid OrganizationLedgerLinkWithLedgerSelect - a bare ledger row is NOT linked; Organization.ActualLedgerID stays null until linked"
+        "The ledger LINK lives in grid OrganizationLedgerLinkWithLedgerSelect - a bare ledger row is NOT linked; Organization.ActualLedgerID stays null until linked",
+        "Blank-tenant create that WORKS (proven 2026-07-02): modern ui_screen_action('CS101500', action='Save', set_fields=[...]) on the fresh new-record graph - BAccount.AcctCD + BAccount.AcctName, OrganizationView.OrganizationType (enum WithoutBranches|NotBalancing; UI label 'With Branches' = NotBalancing), OrganizationView.BaseCuryID (TYPE the code even though the options list is empty - on a blank tenant the save CREATES the currency), CurrentBAccount.LegalName (REQUIRED), DefAddress.CountryID AND DefLocationAddress.CountryID (both REQUIRED; country ref data is preloaded)",
+        "The company save does NOT create the Actual ledger even though CreateLedgerView.LedgerCD looks required - easiest is create_or_update_entity('Ledger', {LedgerID, Type:'Actual', Currency, Companies:[{Company:<CD>}]}) which also makes the link (sets Organization.ActualLedgerID)"
       ],
-      "plane": "screen_submit (master-detail)",
+      "plane": "modern ui_screen_action Save (proven on a blank tenant) or screen_submit; ledger+link via create_or_update_entity('Ledger') REST",
       "verify": "run_dac_odata('Organization') -> ActualLedgerID set"
     },
     "CS102000": {
@@ -185,9 +197,11 @@
         "A With-Branches company needs >=1 branch",
         "Without-Branches auto-creates a read-only branch (same ID as company) - never create it",
         "Branch does not own a ledger (Ledgers tab read-only)",
-        "Balancing needs GL201500 Branch Accounting + GL101010 mapping (post-foundation)"
+        "Balancing needs GL201500 Branch Accounting + GL101010 mapping (post-foundation)",
+        "Proven create (2026-07-02): screen_record('CS102000', key_field='BranchSummary.BranchID', key_value=<ID>, insert=True, fields={BranchName, Company:<CD>, 'MainAddress.Country':<ISO2>, LegalName}) - QUALIFY the key as BranchSummary.BranchID, bare 'BranchID' is ambiguous (collides with SpecifyNewID)",
+        "$adHocSchema 403 on the Branch entity = Multibranch feature still OFF, not a permissions problem"
       ],
-      "plane": "screen_submit",
+      "plane": "screen_record (qualified key) / screen_submit",
       "verify": "run_dac_odata('Branch')"
     },
     "CS201010": {
@@ -360,7 +374,8 @@
       "gotchas": [
         "ID can't change once assigned",
         "delete only if unused",
-        "group same-type accounts"
+        "group same-type accounts",
+        "read/$adHocSchema 500 with PXSetupNotEnteredException[PX.Objects.GL.Branch] on a fresh instance = a company + branch RECORD must exist first (not GL prefs) - create CS101500/CS102000 records and the read clears"
       ],
       "plane": "screen_submit / screen_insert_rows (grid)",
       "verify": "run_dac_odata('AccountClass')"
@@ -771,7 +786,8 @@
       "gotchas": [
         "single-currency instance needs NO CM setup",
         "Decimal Precision LOCKS after posting",
-        "base currency permanent (set at company creation)"
+        "base currency permanent (set at company creation)",
+        "on a BLANK tenant even the BASE currency cannot be created here first - CurrencyMaint itself fails PXSetupNotEntered ('Company Branches form') until a company exists; the base currency is created INLINE by the CS101500 company save (see blank-tenant-bootstrap)"
       ],
       "plane": "screen_submit",
       "verify": "run_dac_odata('Currency')"
