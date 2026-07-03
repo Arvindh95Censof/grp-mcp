@@ -558,7 +558,12 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.39.1 — 77 tools across four client planes (v0.39.1: baked Acumatica's own *T290
+v0.40 — 78 tools across four client planes (v0.40: added **`guide`** — a START-HERE tool
+that returns a task→tool decision map + the plane-by-shape routing rule, so an agent
+facing ~77 tools across four planes picks the right one instead of guessing;
+`guide(topic="write"|"read"|"setup"|"process"|"planes"|…)` narrows it, and the server
+instructions now point agents to it first. Complements `get_setup_guidance` (setup) and
+`screen_capabilities` (per-screen). v0.39.1: baked Acumatica's own *T290
 Modern UI* dev-training protocol facts into the setup map served by `get_setup_guidance`
 — the standard grid-toolbar action names (`refresh`/`insert`/`delete`/`adjust`/`filter`/
 `import`/`exportToExcel`), the confirmed `fieldState.enabled` read-only signal, the

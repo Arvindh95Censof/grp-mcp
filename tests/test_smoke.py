@@ -1106,3 +1106,24 @@ def test_process_summary_extracts_result_and_messages():
     out = ScreenClient._process_summary(j)
     assert out["processing_result"] == {"rows": [{"ok": 1}]}
     assert out["messages"] == ["2 records processed."]
+
+
+# ---- v0.40: guide tool ------------------------------------------------------
+
+def test_guide_full_overview():
+    g = server.guide()
+    assert set(g) >= {"start_here", "the_four_planes", "by_task", "plane_by_shape"}
+    assert len(g["the_four_planes"]) == 4
+    assert "write ONE record" in g["by_task"]
+
+
+def test_guide_topic_filter_and_aliases():
+    assert server.guide("write")["topic"] == "write ONE record"
+    assert server.guide("gl")["topic"] == "financial-foundation / GL setup"
+    p = server.guide("planes")
+    assert "the_four_planes" in p and "plane_by_shape" in p
+
+
+def test_guide_unknown_topic_lists_options():
+    out = server.guide("nope")
+    assert "error" in out and "planes" in out["topics"]

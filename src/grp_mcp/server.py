@@ -22,6 +22,11 @@ from .loaders import map_row, read_rows
 from .screen import ScreenClient, ScreenError
 
 _KB_FIRST_POLICY = (
+    "TOOL SELECTION: this server has ~77 tools across FOUR Acumatica planes (contract "
+    "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON). If you're unsure which "
+    "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
+    "screen call screen_capabilities(screen_id); for financial-foundation setup call "
+    "get_setup_guidance. Don't guess a plane.\n\n"
     "KB-FIRST CRUD POLICY (mandatory). Before ANY create/update/delete on an "
     "Acumatica screen or entity with this server — i.e. before calling "
     "create_or_update_entity, delete_entity, load_from_excel, invoke_action, "
@@ -38,7 +43,7 @@ _KB_FIRST_POLICY = (
     "only): get_entity, count_entity, list_* (list_entities/list_actions/etc.), "
     "screen_get, screen_get_schema, screen_preflight, run_generic_inquiry, "
     "run_dac_odata, run_report, ui_get_structure, ui_read_grid, ui_resolve_selector, "
-    "screen_capabilities, ui_preflight, setup_readiness, get_setup_guidance, whoami. NOTE: "
+    "screen_capabilities, ui_preflight, setup_readiness, get_setup_guidance, guide, whoami. NOTE: "
     "run_import_scenario is NOT a read — despite the run_ prefix it WRITES data "
     "(executes an import scenario), so it requires the KB-first check like any other "
     "write. This exists "
@@ -3283,6 +3288,133 @@ async def _probe_exists(client, dac: str, key: str):
         return len(vals) > 0
     except Exception:
         return None
+
+
+_GUIDE = {
+    "start_here": (
+        "grp-mcp exposes Acumatica over FOUR planes. Don't guess — pick by task shape "
+        "below, or call screen_capabilities(screen_id) for one screen, or "
+        "get_setup_guidance for financial-foundation setup. Golden rules: (a) KB-FIRST "
+        "before any write (search_kb/read_kb_file for the screen's prerequisites); "
+        "(b) a clean ok is NOT proof — read back (run_dac_odata/screen_get/get_entity); "
+        "(c) writes need allow_write, deletes allow_delete, publish allow_publish."
+    ),
+    "the_four_planes": {
+        "contract REST (entities)": "the endpoint's typed entities — default for CRUD on "
+            "anything on the endpoint. Tools: get_entity, fetch_all_entities, "
+            "create_or_update_entity, delete_entity, invoke_action. endpoint='Name/Ver' "
+            "overrides the configured endpoint (e.g. grp_mcp/25.200.001).",
+        "DAC / GI OData (raw read)": "read tables/inquiries the endpoint doesn't expose. "
+            "Tools: run_dac_odata (any DAC incl. config singletons), get_dac_metadata "
+            "(mandatory-field discovery), run_generic_inquiry, list_dacs, "
+            "list_generic_inquiries. Read-only.",
+        "classic screen SOAP": "drive a SCREEN the REST API can't (context / master-detail "
+            "/ wizard screens). Tools: screen_get, screen_get_schema, screen_submit, "
+            "screen_record, screen_insert_rows, screen_preflight. Uses FRIENDLY "
+            "container.field names (screen_get_schema). Enum/read-only pre-validated.",
+        "modern UI-JSON": "what classic SOAP can't: dialog actions that SOAP silently "
+            "no-ops (e.g. GL201000 Generate), grid-CELL edits, row-scoped actions, "
+            "processes, selector lookups. Tools: ui_get_structure, ui_screen_action, "
+            "ui_read_grid, ui_insert_grid_row, ui_update_grid_row, ui_delete_grid_row, "
+            "ui_grid_row_action, ui_run_process, ui_lookup, ui_resolve_selector, "
+            "ui_preflight, ui_tree_dialog_insert, ui_populate_endpoint_entity_fields.",
+    },
+    "by_task": {
+        "discover what exists": ["whoami", "list_instances", "list_entities",
+            "get_entity_schema", "list_screens", "screen_get_schema", "ui_get_structure",
+            "list_dacs", "list_generic_inquiries", "list_actions", "screen_capabilities"],
+        "read data": ["get_entity / fetch_all_entities (endpoint entity)",
+            "run_dac_odata (raw DAC / config singleton)", "run_generic_inquiry (saved GI)",
+            "screen_get (screen the API can't reach)", "ui_read_grid (live grid)",
+            "count_entity", "run_report"],
+        "write ONE record": ["create_or_update_entity (endpoint entity — DEFAULT)",
+            "screen_record / screen_submit (context/master-detail screen)",
+            "ui_screen_action (modern form field / dialog action)",
+            "ui_preflight (dry-run validate a modern write first)"],
+        "grid rows": ["screen_insert_rows (bulk append, classic)",
+            "ui_insert_grid_row / ui_update_grid_row / ui_delete_grid_row (modern, "
+            "key-addressed, cell-validated)", "ui_grid_row_action (select row + fire action)"],
+        "run a process / mass-action": ["ui_run_process (Process/ProcessAll to completion)",
+            "manage_financial_periods, generate_master_calendar (GL recipes)"],
+        "financial-foundation / GL setup": ["get_setup_guidance FIRST (per-screen prereqs, "
+            "required fields, order, plane, gotchas)", "setup_readiness (what's missing)",
+            "enable_features + activate_features", "create_financial_calendar", "create_ledger",
+            "chart_of_accounts", "create_segmented_key + set_segment_value",
+            "create_numbering_sequence", "set_gl_preferences", "generate_master_calendar",
+            "manage_financial_periods"],
+        "lookups / reference data": ["ui_lookup (search any selector's table)",
+            "ui_resolve_selector (resolve one selector field to {id,text} for a write)"],
+        "web-service endpoints / customization": ["get_endpoint_definition",
+            "import_customization + publish_customization (poll publish_status)",
+            "list_published, unpublish_customization, export_customization",
+            "ui_tree_dialog_insert + ui_populate_endpoint_entity_fields (add entity via SM207060)"],
+        "import / export data": ["run_import_scenario (SM206036)", "load_from_excel",
+            "setup_data_provider, setup_readiness"],
+        "files / notes / attachments": ["attach_file", "download_file", "list_attachments",
+            "set_note"],
+        "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],
+        "sessions / config / seats": ["release_sessions (free API seats)", "test_connection",
+            "reload_config", "set_active_instance", "add_instance", "remove_instance"],
+    },
+    "plane_by_shape": (
+        "entity CRUD on the endpoint -> contract REST; raw table / config singleton -> "
+        "run_dac_odata; saved inquiry -> run_generic_inquiry; a screen REST can't reach "
+        "(context/master-detail/wizard) or a bulk-append, and the ONLY plane under a "
+        "maintenance lockout -> classic SOAP (screen_*); a dialog action SOAP no-ops, a "
+        "grid-CELL edit, a row-scoped action, or a process -> modern (ui_*); unsure which "
+        "for a given screen -> screen_capabilities(screen_id)."
+    ),
+    "deeper_guides": {
+        "get_setup_guidance": "per-screen financial-foundation setup map (prereqs, required "
+            "fields, order, plane, verify, gotchas) + cross-cutting rules incl. the modern-"
+            "UI protocol facts and SOAP write caveats.",
+        "screen_capabilities": "probes one screen's /structure and recommends the plane/tool "
+            "per operation shape.",
+    },
+}
+
+
+@mcp.tool()
+def guide(topic: str | None = None) -> Any:
+    """START HERE — pick the right grp-mcp tool for your task (this server has ~77 tools
+    across four Acumatica planes, so guessing wastes calls).
+
+    Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,
+    instant (static, no API call).
+
+    topic: narrow the answer — one of: "read", "write", "grid", "process", "setup",
+        "lookup", "customization", "import", "files", "actions", "session", "discover",
+        "planes". Omit for the full overview. (For a SPECIFIC screen use
+        screen_capabilities(screen_id); for financial-foundation setup use
+        get_setup_guidance.)
+    """
+    if topic:
+        t = topic.strip().lower()
+        aliases = {
+            "read": "read data", "write": "write ONE record", "grid": "grid rows",
+            "process": "run a process / mass-action",
+            "setup": "financial-foundation / GL setup", "gl": "financial-foundation / GL setup",
+            "lookup": "lookups / reference data", "lookups": "lookups / reference data",
+            "customization": "web-service endpoints / customization",
+            "endpoint": "web-service endpoints / customization",
+            "import": "import / export data", "export": "import / export data",
+            "files": "files / notes / attachments", "notes": "files / notes / attachments",
+            "actions": "actions", "action": "actions",
+            "session": "sessions / config / seats", "config": "sessions / config / seats",
+            "discover": "discover what exists",
+        }
+        if t in ("plane", "planes"):
+            return {"the_four_planes": _GUIDE["the_four_planes"],
+                    "plane_by_shape": _GUIDE["plane_by_shape"]}
+        key = aliases.get(t)
+        if key and key in _GUIDE["by_task"]:
+            return {"topic": key, "tools": _GUIDE["by_task"][key],
+                    "plane_by_shape": _GUIDE["plane_by_shape"],
+                    "golden_rules": _GUIDE["start_here"]}
+        return {"error": f"unknown topic {topic!r}",
+                "topics": sorted(set(aliases) | {"planes"}),
+                "tip": "omit topic for the full overview."}
+    return _GUIDE
 
 
 @mcp.tool()
