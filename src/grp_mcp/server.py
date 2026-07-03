@@ -1599,6 +1599,7 @@ async def screen_submit(
     commands: list[dict],
     dry_run: bool = False,
     auto_answer: str | None = None,
+    skip_validation: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the screen-based SOAP API — writes screens REST can't.
@@ -1642,6 +1643,12 @@ async def screen_submit(
     `delete_row` (unless dry_run) additionally requires "allow_delete": true, so
     the screen plane can't sidestep the delete gate. Opens/closes its own SOAP
     session so it never holds an API seat at idle (trial = 2 seats — always frees).
+
+    PRE-WRITE VALIDATION: before submitting, each `set` is checked against the
+    screen's modern-plane metadata — a read-only field or an invalid enum value is
+    rejected up front (returns ok:false + `validation_errors`) rather than being
+    accepted by SOAP with ok:true and silently dropped. Best-effort (only fires when
+    the field is identified); pass skip_validation=true to bypass.
     """
     _require_write(instance)
     # A delete_row OR a record-level Delete action destroys data — hold it to the
@@ -1653,7 +1660,8 @@ async def screen_submit(
         _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        return await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer)
+        return await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer,
+                              skip_validation=skip_validation)
 
 
 @mcp.tool()
@@ -1752,6 +1760,15 @@ async def screen_get(
     fields: schema friendly field names = the columns to return (qualify
             "Container.Field" if a name repeats; see screen_get_schema). top: max
             rows. Returns {headers, rows:[{header: value}, ...]}.
+
+    filters: [{"field": "<Friendly>", "value": ..., "condition"/"op": ...}]. The
+            condition is an Acumatica name (Equals, NotEqual, Greater, GreaterOrEqual,
+            Less, LessOrEqual, Contains, StartsWith, EndsWith, Between, IsNull,
+            IsNotNull) OR an operator alias via `op` (=, !=, >, >=, <, <=, contains,
+            startswith, ...). Default = Equals. An unrecognized condition or unknown
+            key is REJECTED with an error (it used to silently fall back to Equals and
+            return the wrong rows). Example: [{"field":"AccountRecords.Account",
+            "op":">=","value":"300000"}].
 
     Example — read the financial calendar periods (GL101000):
         screen_get("GL101000", ["Periods.PeriodNbr","Periods.StartDate","Periods.Description"])

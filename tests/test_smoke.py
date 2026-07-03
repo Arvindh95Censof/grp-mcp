@@ -880,3 +880,81 @@ def test_default_http_timeout_is_120():
     cli = AcumaticaClient(_inst())
     assert cli._http.timeout.read == 120.0
     assert cli._http.timeout.connect == 30.0
+
+
+# ---- v0.36: submit-path validation, filter conditions, fault boundary ------
+
+from grp_mcp.screen import _normalize_condition
+
+
+def test_filter_condition_aliases():
+    assert _normalize_condition({"field": "A", "value": "1", "op": ">="}) == "GreaterOrEqual"
+    assert _normalize_condition({"field": "A", "value": "1", "op": ">"}) == "Greater"
+    assert _normalize_condition({"field": "A", "value": "1", "op": "!="}) == "NotEqual"
+    assert _normalize_condition({"field": "A", "value": "1", "condition": "Contains"}) == "Contains"
+    # canonical names pass through; alias is case-insensitive
+    assert _normalize_condition({"field": "A", "value": "1", "op": "STARTSWITH"}) == "StartsWith"
+    # default when neither given
+    assert _normalize_condition({"field": "A", "value": "1"}) == "Equals"
+
+
+def test_filter_rejects_unknown_condition_and_keys():
+    with pytest.raises(ValueError):
+        _normalize_condition({"field": "A", "value": "1", "op": "~="})   # bad operator
+    with pytest.raises(ValueError):
+        _normalize_condition({"field": "A", "value": "1", "foo": "bar"})  # unknown key
+
+
+def test_fault_boundary_keeps_full_message():
+    # the #4 truncation: " at least one error" must NOT be treated as a stack frame
+    import re
+    msg = ("PX.Data.PXException: Error: Inserting 'Numbering Sequence' record raised "
+           "at least one error. Please review the errors. at PX.Data.PXCache.Insert(Object)")
+    m = re.search(r"PX\.\w[\w.]*Exception: (.+?)(?: at [A-Z][\w.]*[.(]|---|\Z)", msg)
+    got = m.group(1).strip()
+    assert "at least one error" in got and "Please review the errors" in got
+    assert "PXCache.Insert" not in got  # stack frame stripped
+
+
+def _screen_stub():
+    from grp_mcp.screen import ScreenClient
+    return ScreenClient(_inst(), "GL102000")
+
+
+def test_validate_sets_flags_readonly_and_bad_enum(monkeypatch):
+    import xml.etree.ElementTree as ET
+    s = _screen_stub()
+    # fake modern-plane metadata
+    s._ui_meta = {
+        ("GLSetupRecord", "TrialBalanceSign"): {
+            "readonly": False, "enabled": True,
+            "options": [{"value": "N", "text": "Normal"}, {"value": "R", "text": "Reversed"}]},
+        ("GLSetupRecord", "AllocationNumberingID"): {
+            "readonly": True, "enabled": False, "options": None},
+    }
+
+    def fake_find_field(name):
+        fld = {"SignOfTheTrialBalance": ("TrialBalanceSign", "GLSetupRecord"),
+               "AllocationNumberingSequence": ("AllocationNumberingID", "GLSetupRecord")}[name]
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = fld[0]
+        ET.SubElement(el, "ObjectName").text = fld[1]
+        return el
+
+    s._find_field = fake_find_field
+    issues = asyncio.run(s._validate_sets([
+        {"set": "AllocationNumberingSequence", "to": "ALLOCATION"},   # read-only
+        {"set": "SignOfTheTrialBalance", "to": "Disbursement"},        # invalid enum
+        {"set": "SignOfTheTrialBalance", "to": "R"},                   # valid -> no issue
+    ]))
+    flagged = {i["field"] for i in issues}
+    assert flagged == {"AllocationNumberingSequence", "SignOfTheTrialBalance"}
+    assert len(issues) == 2
+    enum_issue = next(i for i in issues if i["field"] == "SignOfTheTrialBalance")
+    assert "allowed" in enum_issue
+
+
+def test_validate_sets_noop_without_metadata():
+    s = _screen_stub()
+    s._ui_meta = {}   # modern plane unreachable -> never block
+    assert asyncio.run(s._validate_sets([{"set": "Whatever", "to": "x"}])) == []

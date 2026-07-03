@@ -44,6 +44,48 @@ _ENV_CLOSE = "</soap:Body></soap:Envelope>"
 # bind (no-bind). Used to flag suspected silent no-persist on an HTTP-200 result.
 _NOBIND_LEN = 1500
 
+# Export/screen_get filter conditions the screen SOAP API accepts, plus operator
+# aliases. #7: the tool used to read only the key "condition" and pass its value
+# through verbatim — an unknown key ("op") or an operator symbol (">=") was silently
+# ignored and the condition defaulted to Equals, returning a wrong (Equals) result
+# set with no warning. Normalize aliases and REJECT anything unrecognized loudly.
+_FILTER_CONDITIONS = {
+    "Equals", "NotEqual", "Greater", "GreaterOrEqual", "Less", "LessOrEqual",
+    "Contains", "StartsWith", "EndsWith", "IsNull", "IsNotNull", "Between",
+}
+_CONDITION_ALIASES = {
+    "=": "Equals", "==": "Equals", "eq": "Equals", "equal": "Equals", "equals": "Equals",
+    "!=": "NotEqual", "<>": "NotEqual", "ne": "NotEqual", "notequal": "NotEqual",
+    ">": "Greater", "gt": "Greater", "greater": "Greater",
+    ">=": "GreaterOrEqual", "gte": "GreaterOrEqual", "greaterorequal": "GreaterOrEqual",
+    "<": "Less", "lt": "Less", "less": "Less",
+    "<=": "LessOrEqual", "lte": "LessOrEqual", "lessorequal": "LessOrEqual",
+    "contains": "Contains", "startswith": "StartsWith", "endswith": "EndsWith",
+    "isnull": "IsNull", "isnotnull": "IsNotNull", "between": "Between",
+}
+
+
+def _normalize_condition(flt: dict) -> str:
+    """Resolve a filter's condition from `condition` or the `op` alias; reject
+    unknown keys or unrecognized operators LOUDLY (no silent Equals fallback)."""
+    unknown = set(flt) - {"field", "value", "condition", "op"}
+    if unknown:
+        raise ValueError(
+            f"filter has unknown key(s) {sorted(unknown)}; allowed: field, value, "
+            f"condition (or its alias 'op')")
+    raw = flt.get("condition", flt.get("op"))
+    if raw is None:
+        return "Equals"
+    if raw in _FILTER_CONDITIONS:
+        return raw
+    norm = _CONDITION_ALIASES.get(str(raw).strip().lower())
+    if norm:
+        return norm
+    raise ValueError(
+        f"unrecognized filter condition {raw!r}. Use an Acumatica condition "
+        f"({', '.join(sorted(_FILTER_CONDITIONS))}) or an operator alias "
+        f"(=, !=, >, >=, <, <=, contains, startswith, ...).")
+
 # Headers the modern UI-screen protocol (/t/<Tenant>/ui/screen/<ScreenID>) expects.
 _UI_HEADERS = {
     "Accept": "application/json,text/html",
@@ -194,6 +236,7 @@ class ScreenClient:
         self._active_tree_row: dict | None = None  # see ui_select_tree_node
         self._active_tree_controls: dict | None = None
         self._active_tree_context_views: dict | None = None
+        self._ui_meta: dict[tuple[str, str], dict] | None = None  # (view,field)->meta cache
 
     @property
     def url(self) -> str:
@@ -238,8 +281,13 @@ class ScreenClient:
                     f"(setup graph: {setup.group(1) if setup else '?'}). "
                     f"Configure that Preferences/Setup form first, then retry."
                 )
-            # surface the real PX inner exception, not the SOAP wrapper boilerplate
-            inner = re.search(r"PX\.\w[\w.]*Exception: ([^\n]+?)(?: at |---)", msg)
+            # surface the real PX inner exception, not the SOAP wrapper boilerplate.
+            # Stack-frame boundary: a real frame is " at <Namespace>.<Type>...", i.e.
+            # " at " followed by an UPPERCASE dotted identifier. The old ` at ` boundary
+            # also matched the plain-English " at " in "...record raised at least one
+            # error", truncating the message mid-sentence — so require the frame shape.
+            inner = re.search(
+                r"PX\.\w[\w.]*Exception: (.+?)(?: at [A-Z][\w.]*[.(]|---|\Z)", msg)
             raise ScreenError(
                 f"{op} on {self.screen_id}: {inner.group(1).strip() if inner else msg}"
             )
@@ -1398,11 +1446,68 @@ class ScreenClient:
                 conts = [pc]
         return [{"answer": c, "to": answer} for c in conts]
 
+    async def _ui_field_meta(self) -> dict[tuple[str, str], dict]:
+        """(view, field) -> {readonly, enabled, options, required} from the modern
+        /structure. Cached per session; best-effort (returns {} if the modern plane
+        can't read this screen, e.g. a SetupNotEntered/unlicensed screen)."""
+        if self._ui_meta is None:
+            self._ui_meta = {}
+            try:
+                st = await self.get_ui_structure()
+                for view, fields in (st.get("views") or {}).items():
+                    for f in fields:
+                        self._ui_meta[(view, f["field"])] = f
+            except Exception:
+                self._ui_meta = {}  # cache the miss; never block a write on this
+        return self._ui_meta
+
+    async def _validate_sets(self, commands: list[dict]) -> list[dict]:
+        """Best-effort pre-write validation of {set} commands against modern-plane
+        field metadata. Catches two silent-corruption classes: writing a read-only
+        field (accepted, ignored, ok:true) and an invalid enum value (accepted,
+        silently no-op/defaulted, ok:true). Only flags fields POSITIVELY identified
+        in the metadata — an unmappable field (grid column, modern plane unreachable)
+        is skipped, never falsely flagged. Returns a list of issue dicts."""
+        meta = await self._ui_field_meta()
+        if not meta:
+            return []
+        issues: list[dict] = []
+        for c in commands:
+            if "set" not in c or "key" in c:
+                continue
+            val = c.get("to")
+            try:
+                el = self._find_field(c["set"])
+            except ScreenError:
+                continue
+            fld, obj = el.findtext("FieldName"), el.findtext("ObjectName")
+            m = meta.get((obj, fld))
+            if not m:
+                continue  # grid column / unmapped — skip, don't guess
+            if m.get("readonly") or m.get("enabled") is False:
+                issues.append({"field": c["set"], "value": val,
+                               "problem": "read-only / not writable — the write is "
+                               "accepted by SOAP but silently ignored"})
+                continue
+            opts = m.get("options")
+            if opts and val is not None:
+                sval = str(val)
+                ok = any(sval == str(o.get("value")) or sval.lower() == str(o.get("text")).lower()
+                         for o in opts)
+                if not ok:
+                    issues.append({"field": c["set"], "value": val,
+                                   "problem": "not a valid option (SOAP would silently "
+                                   "keep the current/default value)",
+                                   "allowed": [{"value": o.get("value"), "text": o.get("text")}
+                                               for o in opts]})
+        return issues
+
     async def submit(
         self,
         commands: list[dict],
         dry_run: bool = False,
         auto_answer: str | None = None,
+        skip_validation: bool = False,
     ) -> dict:
         """Submit an ergonomic command sequence; return parsed result.
 
@@ -1430,6 +1535,22 @@ class ScreenClient:
         set the row's fields, Save.
         """
         await self._ensure_tree()
+        # Pre-write guard (#1 enum / #2 read-only): SOAP accepts a read-only or
+        # invalid-enum SET with ok:true and silently drops it. Validate against the
+        # modern-plane field metadata and FAIL LOUD instead of corrupting silently.
+        # Best-effort: only fires when the field is positively identified; pass
+        # skip_validation=True to bypass. Skipped under dry_run (already non-committing).
+        if not dry_run and not skip_validation:
+            issues = await self._validate_sets(commands)
+            if issues:
+                return {
+                    "screen_id": self.screen_id, "ok": False,
+                    "validation_errors": issues,
+                    "messages": [f"{i['field']}: {i['problem']}" for i in issues],
+                    "note": "Refused to submit — these SETs would be silently ignored by "
+                            "SOAP (ok:true but no change). Fix the value(s) or pass "
+                            "skip_validation=true to override.",
+                }
         if dry_run:
             # preview: drop the committing commands (button actions + row deletes)
             # so the field SETs run but nothing persists; surfaces field errors.
@@ -1491,13 +1612,35 @@ class ScreenClient:
                     field_errors = self._parse_field_errors(dx)
                 except ScreenError:
                     pass
-            return {
+            out = {
                 "screen_id": self.screen_id,
                 "ok": False,
                 "error": str(e),
                 "field_errors": field_errors,
                 "messages": [f["message"] for f in field_errors],
             }
+            # #4b: an insert/Save fault whose per-field diagnostic came back empty
+            # (e.g. "Inserting 'X' record raised at least one error") leaves the caller
+            # with nothing actionable. Best-effort: list the screen's REQUIRED fields
+            # (modern plane) and which the caller did set, so the missing one is
+            # obvious without a second round of manual discovery.
+            if not field_errors:
+                try:
+                    meta = await self._ui_field_meta()
+                    if meta:
+                        req = sorted(f"{v}.{fld}" for (v, fld), m in meta.items()
+                                     if m.get("required"))
+                        set_objs = {self._find_field(c["set"]).findtext("FieldName")
+                                    for c in commands if "set" in c}
+                        if req:
+                            out["required_fields"] = req
+                            out["fields_you_set"] = sorted(x for x in set_objs if x)
+                            out["hint"] = ("The SOAP fault carries no field detail. "
+                                           "A required field is likely unset — compare "
+                                           "required_fields against fields_you_set.")
+                except Exception:
+                    pass
+            return out
         errors = self._parse_field_errors(xml)
         result = {
             "screen_id": self.screen_id,
@@ -1648,7 +1791,7 @@ class ScreenClient:
             el = self._find_field(flt["field"])
             fld = el.findtext("FieldName") or ""
             obj = el.findtext("ObjectName") or ""
-            cond = flt.get("condition", "Equals")
+            cond = _normalize_condition(flt)  # #7: alias ops, reject unknown loudly
             val = escape(str(flt.get("value", "")))
             # Filter.Value is anyType — it MUST carry an explicit xsi:type or the
             # server fails to cast it (XmlNode[] -> String). Strings cover the

@@ -558,7 +558,16 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.35 — 74 tools across four client planes (v0.35: `publishBegin` runs inside the
+v0.36 — 74 tools across four client planes (v0.36: hardened the classic-SOAP write
+path against four silent-wrong-behavior bugs — `screen_submit` now pre-validates each
+`set` against modern-plane metadata and **refuses** a read-only field or invalid-enum
+write instead of returning `ok:true` and dropping it silently; `screen_get` filters
+accept operator aliases via `op` (`>=`, `!=`, …) and **reject** an unknown key/condition
+instead of silently defaulting to `Equals` and returning the wrong rows; insert/Save
+faults keep their full message and attach `required_fields`/`fields_you_set` hints
+instead of a truncated `"record raised"`. Platform limitations SOAP can't fix — grid
+key-edit footgun, sparse schemas, no-SOAP-delete-on-pure-grids, REST-only
+reports/attachments — are documented in `get_setup_guidance`. v0.35: `publishBegin` runs inside the
 background publish job so a cold-site begin can't be lost to a client timeout —
 `publish_status` now reports phase `begin`/`publishing`; entity tools
 (`get_entity`/`create_or_update_entity`/`get_entity_schema`/`list_entities`/
