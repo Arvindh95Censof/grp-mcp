@@ -1016,3 +1016,73 @@ def test_ui_coerce_validate_passthrough_when_no_meta():
     assert issues == [] and norm[0]["value"] == "x"
 
 
+
+
+# ---- v0.38: grid-cell write validation (realistic column fixtures) ----------
+
+def _grid_client():
+    from grp_mcp.screen import ScreenClient
+    return ScreenClient(_inst(), "GL202500")
+
+
+# real GL202500 AccountRecords column shape (from a live grid read)
+_GL_COLS = [
+    {"field": "AccountID", "allowUpdate": False, "dataType": 9},
+    {"field": "AccountCD", "allowUpdate": True, "dataType": 18},
+    {"field": "Description", "allowUpdate": True, "dataType": 18},
+    {"field": "Type", "allowUpdate": True,
+     "valueItems": {"items": [{"value": "A", "text": "Asset"}, {"value": "L", "text": "Liability"},
+                              {"value": "I", "text": "Income"}, {"value": "E", "text": "Expense"}]}},
+    {"field": "PostOption", "allowUpdate": True,
+     "valueItems": {"items": [{"value": "S", "text": "Summary"}, {"value": "D", "text": "Detail"}]}},
+    {"key": "Files", "allowUpdate": False},  # meta column, no `field`
+]
+
+
+def test_parse_grid_cols():
+    s = _grid_client()
+    meta = s._parse_grid_cols(_GL_COLS)
+    assert set(meta) == {"AccountID", "AccountCD", "Description", "Type", "PostOption"}
+    assert meta["AccountID"]["readonly"] is True
+    assert meta["AccountCD"]["readonly"] is False
+    assert [o["value"] for o in meta["Type"]["options"]] == ["A", "L", "I", "E"]
+    assert meta["Description"]["options"] is None
+
+
+def test_grid_validate_coerce_readonly_enum_and_label():
+    s = _grid_client()
+    meta = s._parse_grid_cols(_GL_COLS)
+    # label -> value coercion (Expense -> E, Summary -> S), read-only + bad enum flagged
+    coerced, issues = s._grid_validate_coerce(meta, {
+        "AccountCD": "60000",            # editable, no enum -> untouched
+        "Type": "Expense",               # label -> "E"
+        "PostOption": "S",               # already a value -> kept
+        "AccountID": "999",              # read-only -> issue
+        "Description": "Ok",             # editable free text
+    })
+    assert coerced["Type"] == "E"
+    assert coerced["AccountCD"] == "60000"
+    probs = {i["field"] for i in issues}
+    assert probs == {"AccountID"}
+
+
+def test_grid_validate_coerce_bad_enum_lists_allowed():
+    s = _grid_client()
+    meta = s._parse_grid_cols(_GL_COLS)
+    _, issues = s._grid_validate_coerce(meta, {"Type": "Widget"})
+    assert len(issues) == 1 and issues[0]["field"] == "Type"
+    assert [o["value"] for o in issues[0]["allowed"]] == ["A", "L", "I", "E"]
+
+
+def test_grid_validate_coerce_unknown_column_passes_through():
+    s = _grid_client()
+    meta = s._parse_grid_cols(_GL_COLS)
+    coerced, issues = s._grid_validate_coerce(meta, {"Nonexistent": "x"})
+    assert issues == [] and coerced["Nonexistent"] == "x"   # never block on unknown col
+
+
+def test_grid_write_guard_skips_without_columns():
+    s = _grid_client()
+    coerced, refusal = asyncio.run(
+        s._grid_write_guard("AccountRecords", {"columns": []}, {"Type": "bad"}, "op", False))
+    # _grid_col_meta would try the /structure fallback (no network in test) -> {} -> skip

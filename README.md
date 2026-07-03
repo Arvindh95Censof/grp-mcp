@@ -558,7 +558,12 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.37 — 75 tools across four client planes (v0.37: extended the same write-safety to
+v0.38 — 75 tools across four client planes (v0.38: extended the write-safety to
+**modern grid cells** too — `ui_insert_grid_row`/`ui_update_grid_row` now refuse a
+read-only cell or invalid enum and coerce an enum's display label to its stored value,
+using per-column `allowUpdate`/`valueItems` metadata (with a `/structure` fallback for
+empty grids). So enum/read-only silent-drops are now guarded across **all** write
+shapes — SOAP submit, modern form fields, and modern grid cells. v0.37: extended the same write-safety to
 the **modern UI-screen plane** — `ui_screen_action` now pre-validates `set_fields`
 (refuses a read-only field or invalid enum instead of silently dropping it), **coerces
 an enum's display label to its option value** (pass `"Reversed"` or `"R"`), resolves a

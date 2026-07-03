@@ -1238,8 +1238,104 @@ class ScreenClient:
             raise ScreenError(f"{op} {grid_view}{dataKey or ''} on {self.screen_id}: {err}")
         return resp.json()
 
+    @staticmethod
+    def _parse_grid_cols(columns: list | None) -> dict[str, dict]:
+        """Grid column list -> {field: {readonly, options}}. `allowUpdate` is the
+        per-cell read-only signal (False = read-only); `valueItems.items` are the
+        enum allowed-values [{value,text}] (same shape as a form field's options)."""
+        meta: dict[str, dict] = {}
+        for c in (columns or []):
+            f = c.get("field")
+            if not f:
+                continue
+            vi = c.get("valueItems")
+            items = vi.get("items") if isinstance(vi, dict) else None
+            meta[f] = {
+                "readonly": c.get("allowUpdate") is False,
+                "options": ([{"value": o.get("value"), "text": o.get("text")} for o in items]
+                            if items else None),
+            }
+        return meta
+
+    async def _grid_col_meta(self, grid_view: str, grid_read: dict) -> dict[str, dict]:
+        """Per-column meta for grid_view: from the grid read's columns (has valueItems),
+        falling back to the /structure controlsData columns when the grid is EMPTY (a
+        grid read of 0 rows returns 0 columns — proven live). {} if neither yields a
+        column list, in which case the caller skips validation (never blocks)."""
+        meta = self._parse_grid_cols(grid_read.get("columns"))
+        if meta:
+            return meta
+        try:
+            r = await self._http.get(self.ui_url + "/structure",
+                                     headers={"Accept": "application/json"})
+            cols = ((r.json().get("controlsData") or {}).get(grid_view) or {}).get("columns")
+            return self._parse_grid_cols(cols)
+        except Exception:  # noqa: BLE001 — best-effort; never block a write on this
+            return {}
+
+    @staticmethod
+    def _grid_validate_coerce(cmeta: dict, values: dict) -> tuple[dict, list[dict]]:
+        """Grid-cell peer of ui_coerce_validate. For each value whose column is known:
+        flag a read-only cell, coerce an enum display-label to its option value, or
+        flag an invalid enum (with the allowed list). A value whose column ISN'T in
+        cmeta is passed through untouched (column-completeness varies by screen — a
+        spurious block on a real column is worse than missing a typo). Returns
+        (coerced_values, issues)."""
+        out: dict = {}
+        issues: list[dict] = []
+        for k, v in values.items():
+            m = cmeta.get(k)
+            if not m:
+                out[k] = v
+                continue
+            if m.get("readonly"):
+                issues.append({"field": k, "value": v,
+                               "problem": "read-only cell (allowUpdate=false) — accepted "
+                               "by the plane but silently ignored"})
+                out[k] = v
+                continue
+            opts = m.get("options")
+            if opts and v is not None and not isinstance(v, bool):
+                sv = str(v)
+                if any(sv == str(o.get("value")) for o in opts):
+                    out[k] = v
+                else:
+                    match = next((o for o in opts
+                                  if sv.lower() == str(o.get("text")).lower()), None)
+                    if match:
+                        out[k] = match.get("value")
+                    else:
+                        issues.append({"field": k, "value": v,
+                                       "problem": "not a valid option (would silently "
+                                       "no-op)", "allowed": opts})
+                        out[k] = v
+            else:
+                out[k] = v
+        return out, issues
+
+    async def _grid_write_guard(self, grid_view: str, g: dict, values: dict,
+                                op: str, skip_validation: bool) -> tuple[dict, dict | None]:
+        """Run grid-cell validation/coercion. Returns (coerced_values, refusal) — if
+        `refusal` is non-None the caller must return it (ok:false) instead of writing."""
+        if skip_validation:
+            return values, None
+        cmeta = await self._grid_col_meta(grid_view, g)
+        if not cmeta:
+            return values, None  # no column shape -> skip, never block
+        coerced, issues = self._grid_validate_coerce(cmeta, values)
+        if issues:
+            return values, {
+                "screen_id": self.screen_id, "grid_view": grid_view, "ok": False,
+                "validation_errors": issues,
+                "messages": [f"{i['field']}: {i['problem']}" for i in issues],
+                "note": f"Refused {op} — these cells would be silently ignored by the "
+                        "modern plane (read-only or invalid enum). Fix the value(s), or "
+                        "pass skip_validation=true to override."}
+        return coerced, None
+
     async def ui_update_grid_row(self, grid_view: str, key: dict, values: dict,
-                                 parent: dict | None = None) -> dict:
+                                 parent: dict | None = None,
+                                 skip_validation: bool = False) -> dict:
         """Update ONE existing grid row in place, matched by its key field(s).
 
         key:    {keyField: value} — the child-identifying key (for a detail grid the
@@ -1250,6 +1346,10 @@ class ScreenClient:
                 ui_grid_read). None = top-level grid.
         """
         g = await self.ui_grid_read(grid_view, parent)
+        values, refusal = await self._grid_write_guard(grid_view, g, values,
+                                                       "ui_update_grid_row", skip_validation)
+        if refusal:
+            return refusal
         idx, row = self._locate_row(g["rows"], key)
         if row is None:
             raise ScreenError(f"ui_update_grid_row: no row in {grid_view} matches key {key}")
@@ -1259,12 +1359,21 @@ class ScreenClient:
                                      "ui_update_grid_row", parent)
 
     async def ui_insert_grid_row(self, grid_view: str, values: dict,
-                                 parent: dict | None = None) -> dict:
+                                 parent: dict | None = None,
+                                 skip_validation: bool = False) -> dict:
         """Append a NEW grid row. `values` MUST include the grid's key field(s) plus
         any other required columns (e.g. GL202500 needs AccountCD + Type + Description).
         For a detail grid (parent set) the parent-linkage id is auto-filled server-side,
-        so `values` needs only the child fields. A client rowId is generated."""
+        so `values` needs only the child fields. A client rowId is generated.
+
+        Cell writes are validated/coerced like form fields (read-only + invalid-enum
+        refused, enum label->value coerced) when the grid's column meta is available;
+        skip_validation=true bypasses."""
         g = await self.ui_grid_read(grid_view, parent)
+        values, refusal = await self._grid_write_guard(grid_view, g, values,
+                                                       "ui_insert_grid_row", skip_validation)
+        if refusal:
+            return refusal
         change = {"id": str(uuid.uuid4()), "index": len(g["rows"]), "values": self._kv(values)}
         return await self._grid_save(grid_view, g, {"inserted": [change]}, None,
                                      "ui_insert_grid_row", parent)

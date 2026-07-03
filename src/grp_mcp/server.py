@@ -1561,6 +1561,7 @@ async def ui_update_grid_row(
     key: dict,
     values: dict,
     parent: dict | None = None,
+    skip_validation: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Edit ONE existing GRID row in place, on the MODERN UI-screen plane.
@@ -1587,6 +1588,12 @@ async def ui_update_grid_row(
     screen_get. To APPEND a new row use ui_insert_grid_row; for FORM-view (non-
     grid) field edits use ui_screen_action.
 
+    CELL VALIDATION: each cell is checked against the grid's live column metadata —
+    a read-only cell (allowUpdate=false) or an invalid enum is REFUSED (ok:false +
+    validation_errors) rather than silently dropped, and an enum's display label is
+    coerced to its stored value. Best-effort (skipped only when the grid exposes no
+    column shape); skip_validation=true bypasses.
+
     Example — rename a GL account's description:
         ui_update_grid_row("GL202500", "AccountRecords",
             key={"AccountCD": "40000"}, values={"Description": "Sales Revenue"})
@@ -1594,7 +1601,9 @@ async def ui_update_grid_row(
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        await s.ui_update_grid_row(grid_view, key, values, parent)
+        res = await s.ui_update_grid_row(grid_view, key, values, parent, skip_validation)
+    if isinstance(res, dict) and res.get("ok") is False:
+        return res  # validation refusal — surface it instead of a bogus success
     return {"screen_id": screen_id.upper(), "grid_view": grid_view,
             "key": key, "values": values, "parent": parent, "ok": True}
 
@@ -1605,6 +1614,7 @@ async def ui_insert_grid_row(
     grid_view: str,
     values: dict,
     parent: dict | None = None,
+    skip_validation: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Append a NEW row to a GRID on the MODERN UI-screen plane.
@@ -1623,6 +1633,11 @@ async def ui_insert_grid_row(
 
     Requires allow_write. Verify with run_dac_odata / screen_get.
 
+    CELL VALIDATION: cells are checked against the grid's live column metadata — a
+    read-only cell or invalid enum is REFUSED (ok:false + validation_errors) instead
+    of silently dropped, and an enum's display label is coerced to its stored value
+    (so Type "Expense" and "E" both work). skip_validation=true bypasses.
+
     Examples:
         ui_insert_grid_row("GL202500", "AccountRecords",
             values={"AccountCD": "40100", "Type": "I", "Description": "Service Revenue"})
@@ -1632,7 +1647,9 @@ async def ui_insert_grid_row(
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        await s.ui_insert_grid_row(grid_view, values, parent)
+        res = await s.ui_insert_grid_row(grid_view, values, parent, skip_validation)
+    if isinstance(res, dict) and res.get("ok") is False:
+        return res  # validation refusal — surface it instead of a bogus success
     return {"screen_id": screen_id.upper(), "grid_view": grid_view,
             "values": values, "parent": parent, "ok": True}
 
