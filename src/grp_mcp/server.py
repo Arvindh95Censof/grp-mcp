@@ -67,14 +67,15 @@ def _publish_job_view(state: dict) -> dict:
         "job": state["job"],
         "project_names": state["project_names"],
         "status": "completed" if done else ("error" if err else "in_progress"),
+        "phase": state.get("phase"),
         "completed": done,
         "failed": state.get("failed"),
         "result": state.get("result"),
         "error": err,
         "note": None if (done or err) else (
-            f"Site recompile still running server-side — it WILL finish on its own; "
-            f"do NOT re-publish. Poll publish_status(job={state['job']!r}) until "
-            f"status != in_progress."
+            f"{'publishBegin still running (cold site can take >60s)' if state.get('phase') == 'begin' else 'Site recompile still running server-side'}"
+            f" — it WILL finish on its own; do NOT re-publish. Poll "
+            f"publish_status(job={state['job']!r}) until status != in_progress."
         ),
     }
 
@@ -97,12 +98,22 @@ def _cfg() -> Config:
     return _config
 
 
-def _client(instance: str | None) -> AcumaticaClient:
+def _client(instance: str | None, endpoint: str | None = None) -> AcumaticaClient:
+    """Cached contract-REST client; `endpoint` = '<Name>/<Version>' overrides the
+    instance's configured endpoint for this client (e.g. 'grp_mcp/25.200.001')."""
     cfg = _cfg()
     name = instance or cfg.default
-    if name not in _clients:
-        _clients[name] = AcumaticaClient(cfg.get(name))
-    return _clients[name]
+    key = f"{name}@{endpoint}" if endpoint else name
+    if key not in _clients:
+        inst = cfg.get(name)
+        if endpoint:
+            ep_name, _, ep_ver = endpoint.partition("/")
+            if not ep_name or not ep_ver:
+                raise ValueError(
+                    f"endpoint must be '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001'), got {endpoint!r}")
+            inst = inst.model_copy(update={"endpoint_name": ep_name, "endpoint_version": ep_ver})
+        _clients[key] = AcumaticaClient(inst)
+    return _clients[key]
 
 
 @asynccontextmanager
@@ -486,14 +497,17 @@ async def list_endpoints(instance: str | None = None) -> Any:
 
 
 @mcp.tool()
-async def list_entities(refresh: bool = False, instance: str | None = None) -> Any:
+async def list_entities(refresh: bool = False, endpoint: str | None = None,
+                        instance: str | None = None) -> Any:
     """List the top-level entities exposed by the instance's configured endpoint.
 
     Uses endpoint_name/endpoint_version from connections.json. Source: the
     endpoint's swagger.json (the metadata-root GET is often proxy-gated 401).
     Set refresh=true to bypass the per-session cache.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001') to hit a
+    different endpoint than the configured one — no config change needed.
     """
-    return await _client(instance).list_entities(refresh=refresh)
+    return await _client(instance, endpoint).list_entities(refresh=refresh)
 
 
 @mcp.tool()
@@ -501,6 +515,7 @@ async def get_entity_schema(
     entity: str,
     refresh: bool = False,
     deep: bool = False,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """List the fields of one entity in the configured endpoint contract.
@@ -513,8 +528,9 @@ async def get_entity_schema(
     expanded to its own nested fields, recursively (cycle-guarded). Use this to
     see every field inputtable via the API, including detail/tab fields, in one
     call. Pass these nested arrays back to create_or_update_entity to set details.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     """
-    client = _client(instance)
+    client = _client(instance, endpoint)
     if deep:
         return await client.get_entity_schema_deep(entity, refresh=refresh)
     return await client.get_entity_schema(entity, refresh=refresh)
@@ -600,6 +616,7 @@ async def get_entity(
     top: int | None = None,
     skip: int | None = None,
     custom: str | None = None,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Retrieve one or many records of a top-level entity.
@@ -610,6 +627,8 @@ async def get_entity(
             $skip for paging the next page of a large list, etc).
     custom: $custom param to pull fields NOT in the contract (unexposed elements /
             user-defined fields), format "<View>.<Field>" comma-separated.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001') to read an
+            entity that only exists on a non-default endpoint.
 
     For pulling an ENTIRE large table, prefer fetch_all_entities (auto-pages).
     """
@@ -629,7 +648,7 @@ async def get_entity(
     if custom:
         params["$custom"] = custom
 
-    client = _client(instance)
+    client = _client(instance, endpoint)
     try:
         result = await client.get_entity(entity, record_id, params)
     except AcumaticaError as e:
@@ -720,6 +739,7 @@ async def fetch_all_entities(
     expand: str | None = None,
     page_size: int = 1000,
     max_records: int | None = None,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Retrieve ALL records of an entity, auto-paging with $top/$skip.
@@ -730,6 +750,7 @@ async def fetch_all_entities(
 
     page_size: rows per request ($top). max_records: hard cap to stop early
     (None = no cap). Use filter/select to scope/shrink. Returns {count, records}.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     """
     _require_range("page_size", page_size, 1, 10000)
     _require_range("max_records", max_records, 1, 100000000)
@@ -740,7 +761,7 @@ async def fetch_all_entities(
         params["$select"] = select
     if expand:
         params["$expand"] = expand
-    rows = await _client(instance).get_all(
+    rows = await _client(instance, endpoint).get_all(
         entity, params, page_size=page_size, max_records=max_records
     )
     return {"entity": entity, "count": len(rows), "records": rows}
@@ -750,6 +771,7 @@ async def fetch_all_entities(
 async def create_or_update_entity(
     entity: str,
     fields: dict,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Create or update a record (PUT). Acumatica upserts by key fields.
@@ -758,6 +780,8 @@ async def create_or_update_entity(
     fields: plain field->value map; scalars are auto-wrapped. Detail lines go in
             a list, e.g. {"OrderType": "SO", "CustomerID": "ABC",
                           "Details": [{"InventoryID": "ITEM1", "OrderQty": 2}]}.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001') to write
+            an entity that only exists on a non-default endpoint.
 
     Requires the instance's "allow_write": true (default is read-only).
 
@@ -786,7 +810,7 @@ async def create_or_update_entity(
     row's id across a later, separate call.
     """
     _require_write(instance)
-    client = _client(instance)
+    client = _client(instance, endpoint)
     result = await client.put_entity(entity, _wrap_fields(fields))
     if isinstance(result, dict):
         empty_details = [
@@ -2687,13 +2711,15 @@ async def setup_data_provider(
 
 
 @mcp.tool()
-async def delete_entity(entity: str, record_id: str, instance: str | None = None) -> Any:
+async def delete_entity(entity: str, record_id: str, endpoint: str | None = None,
+                        instance: str | None = None) -> Any:
     """Delete a record by its id (the record's key GUID or keys path).
 
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     Requires the instance's "allow_delete": true (default off, stricter than write).
     """
     _require_delete(instance)
-    return await _client(instance).delete_entity(entity, record_id)
+    return await _client(instance, endpoint).delete_entity(entity, record_id)
 
 
 @mcp.tool()
@@ -2701,6 +2727,7 @@ async def count_entity(
     entity: str,
     filter: str | None = None,
     select: str | None = None,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Count records of an entity (optionally scoped by filter).
@@ -2708,13 +2735,14 @@ async def count_entity(
     NOTE: the contract API has no server-side $count, so this fetches matching
     rows (auto-paging with $skip so big tables aren't under-counted) and counts
     them. Pass select=<a key field> to shrink the payload, and use filter to scope.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     """
     params: dict[str, Any] = {}
     if filter:
         params["$filter"] = filter
     if select:
         params["$select"] = select
-    rows = await _client(instance).get_all(entity, params)
+    rows = await _client(instance, endpoint).get_all(entity, params)
     return {"entity": entity, "count": len(rows), "filter": filter or None}
 
 
@@ -2792,6 +2820,7 @@ async def invoke_action(
     action: str,
     entity_ref: dict,
     parameters: dict | None = None,
+    endpoint: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Invoke an action on a record (e.g. Release, ConfirmShipment).
@@ -2800,13 +2829,14 @@ async def invoke_action(
     action: action name, e.g. "Release".
     entity_ref: identifies the target record, e.g. {"OrderType": "SO", "OrderNbr": "000123"}.
     parameters: optional action parameters.
+    endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     Returns 202 + a Location to poll for long-running actions.
 
     Requires the instance's "allow_write": true (actions mutate ERP state).
     """
     _require_write(instance)
     body = {"entity": _wrap_fields(entity_ref), "parameters": _wrap_fields(parameters or {})}
-    return await _client(instance).invoke_action(entity, action, body)
+    return await _client(instance, endpoint).invoke_action(entity, action, body)
 
 
 @mcp.tool()
@@ -3463,9 +3493,12 @@ async def publish_customization(
     polls to completion) and returns after up to `wait_seconds`:
       • status "completed" — finished within wait_seconds (incl. fast validation
         FAILURES, which surface here with the error log in `result`);
-      • status "in_progress" — still recompiling server-side; it WILL finish on its
-        own. Poll `publish_status(job)` until status != in_progress. Do NOT
-        re-publish (that would start a second recompile).
+      • status "in_progress" — still working server-side (phase "begin" = the
+        publishBegin call itself, which can exceed 60s on a cold site; phase
+        "publishing" = recompiling); it WILL finish on its own. Poll
+        `publish_status(job)` until status != in_progress. Do NOT re-publish
+        (that would start a second recompile). Begin/auth failures surface via
+        publish_status as status "error".
 
     WARNING: website-level — recompiles the site and affects ALL tenants. tenant_mode:
     Current | All | List (with tenant_login_names). `options` passes extra publishBegin
@@ -3475,15 +3508,13 @@ async def publish_customization(
     _require_range("wait_seconds", wait_seconds, 0, 120)
     inst = _cfg().get(instance or _cfg().default)
     client = CustomizationClient(inst)
-    # publishBegin in the foreground so auth/begin errors surface immediately (and
-    # nothing is backgrounded on a bad request).
-    try:
-        await client.publish_begin(project_names, tenant_mode, tenant_login_names, options)
-    except Exception:
-        await client.aclose()
-        raise
+    # The job is registered BEFORE publishBegin and begin runs INSIDE the background
+    # task: on a cold IIS site publishBegin alone can exceed the MCP request timeout,
+    # which used to kill the call with NO job recorded (publish_status said "none"
+    # and you couldn't tell whether the publish had started). Begin/auth errors now
+    # surface via publish_status as status "error" with phase "begin".
     job = "+".join(project_names)
-    state: dict[str, Any] = {"job": job, "project_names": project_names,
+    state: dict[str, Any] = {"job": job, "project_names": project_names, "phase": "begin",
                              "completed": False, "failed": None, "result": None, "error": None}
     _publish_jobs[job] = state
 
@@ -3491,6 +3522,8 @@ async def publish_customization(
         waited = 0.0
         last: Any = None
         try:
+            await client.publish_begin(project_names, tenant_mode, tenant_login_names, options)
+            state["phase"] = "publishing"
             while waited < 1800:
                 last = await client.publish_end()
                 if isinstance(last, dict) and last.get("isCompleted"):

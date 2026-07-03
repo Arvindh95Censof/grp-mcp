@@ -27,7 +27,10 @@ class AcumaticaError(RuntimeError):
 class AcumaticaClient:
     def __init__(self, instance: Instance) -> None:
         self.instance = instance
-        self._http = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        # 120s read: a cold IIS site (first hit after app-pool recycle) or a very
+        # wide single row (e.g. the 200+-column FeaturesSet DAC) can exceed 60s.
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=30.0), follow_redirects=True)
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._expires_at: float = 0.0
@@ -172,7 +175,15 @@ class AcumaticaClient:
         self._assert_allowed_url(url)
         headers = await self._auth_header()
         headers.update(kwargs.pop("headers", {}))
-        resp = await self._http.request(method, url, headers=headers, **kwargs)
+        try:
+            resp = await self._http.request(method, url, headers=headers, **kwargs)
+        except httpx.TimeoutException as e:
+            # httpx timeout exceptions often stringify to "" — make the cause explicit.
+            raise AcumaticaError(
+                f"{method} {url} -> TIMED OUT ({type(e).__name__}) after the HTTP "
+                f"read limit. Common causes: cold IIS instance (first request after "
+                f"an app-pool recycle/publish) or a very wide row (e.g. FeaturesSet). "
+                f"A retry usually succeeds once the site is warm.") from e
         if resp.status_code == 401:  # token rejected; force one refresh + retry
             self._access_token = None
             headers.update(await self._auth_header())

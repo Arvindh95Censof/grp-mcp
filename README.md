@@ -558,7 +558,14 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.34 — 74 tools across four client planes: contract REST (CRUD, actions, `$skip` paging,
+v0.35 — 74 tools across four client planes (v0.35: `publishBegin` runs inside the
+background publish job so a cold-site begin can't be lost to a client timeout —
+`publish_status` now reports phase `begin`/`publishing`; entity tools
+(`get_entity`/`create_or_update_entity`/`get_entity_schema`/`list_entities`/
+`fetch_all_entities`/`count_entity`/`delete_entity`/`invoke_action`) accept
+`endpoint="<Name>/<Version>"` to target a non-default endpoint without config
+changes; HTTP read timeout raised to 120s with explicit timeout errors for cold
+IIS / wide-row reads): contract REST (CRUD, actions, `$skip` paging,
 attachments up/down, notes, reports — with an auto-fix for a detail-collection write-echo
 quirk), DAC + GI OData (incl. CSDL metadata / mandatory-field discovery), the **screen-based
 SOAP engine** (context/master-detail/wizard screens REST can't), and the **modern UI-screen

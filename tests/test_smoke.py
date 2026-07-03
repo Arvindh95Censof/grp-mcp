@@ -819,3 +819,64 @@ def test_publish_status_reads_module_state(monkeypatch):
     assert asyncio.run(server.publish_status())["job"] == "b"
     # unknown
     assert asyncio.run(server.publish_status("zzz"))["status"] == "unknown"
+
+
+# ---- v0.35: endpoint override, publish phases, timeout wrapping -------------
+
+def test_client_endpoint_override(cfg, monkeypatch):
+    monkeypatch.setattr(server, "_clients", {})
+    default = server._client("ro")
+    assert default.instance.endpoint_name == "Default"
+    over = server._client("ro", "grp_mcp/25.200.001")
+    assert over.instance.endpoint_name == "grp_mcp"
+    assert over.instance.endpoint_version == "25.200.001"
+    assert over.instance.entity_base.endswith("/entity/grp_mcp/25.200.001")
+    # distinct cache slots; base client untouched
+    assert over is not default and server._client("ro") is default
+    assert server._client("ro", "grp_mcp/25.200.001") is over
+
+
+def test_client_endpoint_override_bad_format(cfg, monkeypatch):
+    monkeypatch.setattr(server, "_clients", {})
+    with pytest.raises(ValueError):
+        server._client("ro", "grp_mcp")  # missing /Version
+    with pytest.raises(ValueError):
+        server._client("ro", "/25.200.001")  # missing name
+
+
+def test_publish_job_view_phases():
+    base = {"job": "j", "project_names": ["j"], "completed": False,
+            "failed": None, "result": None, "error": None}
+    begin = server._publish_job_view({**base, "phase": "begin"})
+    assert begin["status"] == "in_progress" and begin["phase"] == "begin"
+    assert "publishBegin" in begin["note"]
+    pub = server._publish_job_view({**base, "phase": "publishing"})
+    assert pub["phase"] == "publishing" and "recompile" in pub["note"]
+    # begin failure surfaces as error via the job (the v0.35 fix)
+    err = server._publish_job_view({**base, "phase": "begin", "error": "login failed (401)"})
+    assert err["status"] == "error" and err["error"].startswith("login failed")
+
+
+def test_request_raw_wraps_timeout_with_explicit_message():
+    import httpx
+
+    cli = AcumaticaClient(_inst())
+
+    async def fake_auth_header():
+        return {"Authorization": "Bearer x"}
+
+    async def boom(*a, **k):
+        raise httpx.ReadTimeout("")  # httpx timeouts often stringify to ""
+
+    cli._auth_header = fake_auth_header
+    cli._http.request = boom
+    with pytest.raises(AcumaticaError) as ei:
+        asyncio.run(cli._request_raw("GET", "https://host/Site/entity/x"))
+    msg = str(ei.value)
+    assert "TIMED OUT" in msg and "ReadTimeout" in msg and "cold IIS" in msg
+
+
+def test_default_http_timeout_is_120():
+    cli = AcumaticaClient(_inst())
+    assert cli._http.timeout.read == 120.0
+    assert cli._http.timeout.connect == 30.0
