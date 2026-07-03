@@ -958,3 +958,61 @@ def test_validate_sets_noop_without_metadata():
     s = _screen_stub()
     s._ui_meta = {}   # modern plane unreachable -> never block
     assert asyncio.run(s._validate_sets([{"set": "Whatever", "to": "x"}])) == []
+
+
+# ---- v0.37: modern-plane write safety (coerce/validate, grid columns) -------
+
+def _screen_ui(meta):
+    from grp_mcp.screen import ScreenClient
+    s = ScreenClient(_inst(), "GL102000")
+
+    async def fake_meta():
+        return meta
+    s._ui_field_meta = fake_meta
+    return s
+
+
+def test_ui_coerce_validate_label_to_value_and_view_resolution():
+    meta = {("GLSetupRecord", "TrialBalanceSign"): {
+        "readonly": False, "enabled": True,
+        "options": [{"value": "N", "text": "Normal"}, {"value": "R", "text": "Reversed"}]}}
+    s = _screen_ui(meta)
+    # label -> value coercion, and view omitted (resolved by unique field name)
+    norm, issues, notes = asyncio.run(s.ui_coerce_validate(
+        [{"field": "TrialBalanceSign", "value": "Reversed"}]))
+    assert not issues
+    assert norm[0] == {"view": "GLSetupRecord", "field": "TrialBalanceSign", "value": "R"}
+    assert any("coerced" in n for n in notes)
+
+
+def test_ui_coerce_validate_flags_readonly_and_bad_enum():
+    meta = {
+        ("V", "RO"): {"readonly": True, "enabled": False, "options": None},
+        ("V", "E"): {"readonly": False, "enabled": True,
+                     "options": [{"value": "A", "text": "Apple"}]},
+    }
+    s = _screen_ui(meta)
+    _, issues, _ = asyncio.run(s.ui_coerce_validate([
+        {"view": "V", "field": "RO", "value": "x"},
+        {"view": "V", "field": "E", "value": "Zebra"},
+    ]))
+    probs = {i["field"]: i for i in issues}
+    assert "read-only" in probs["V.RO"]["problem"]
+    assert "allowed" in probs["V.E"]
+
+
+def test_ui_coerce_validate_ambiguous_field():
+    meta = {("V1", "Dup"): {"readonly": False, "enabled": True, "options": None},
+            ("V2", "Dup"): {"readonly": False, "enabled": True, "options": None}}
+    s = _screen_ui(meta)
+    _, issues, _ = asyncio.run(s.ui_coerce_validate([{"field": "Dup", "value": "1"}]))
+    assert issues and "ambiguous" in issues[0]["problem"]
+
+
+def test_ui_coerce_validate_passthrough_when_no_meta():
+    s = _screen_ui({})
+    norm, issues, notes = asyncio.run(s.ui_coerce_validate(
+        [{"view": "V", "field": "F", "value": "x"}]))
+    assert issues == [] and norm[0]["value"] == "x"
+
+

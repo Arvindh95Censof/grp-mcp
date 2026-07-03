@@ -558,7 +558,12 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.36 — 74 tools across four client planes (v0.36: hardened the classic-SOAP write
+v0.37 — 75 tools across four client planes (v0.37: extended the same write-safety to
+the **modern UI-screen plane** — `ui_screen_action` now pre-validates `set_fields`
+(refuses a read-only field or invalid enum instead of silently dropping it), **coerces
+an enum's display label to its option value** (pass `"Reversed"` or `"R"`), resolves a
+bare field name to its view, and returns `graph_is_dirty`/`verify` persistence signals;
+new `ui_preflight` dry-runs those checks without writing. v0.36: hardened the classic-SOAP write
 path against four silent-wrong-behavior bugs — `screen_submit` now pre-validates each
 `set` against modern-plane metadata and **refuses** a read-only field or invalid-enum
 write instead of returning `ok:true` and dropping it silently; `screen_get` filters

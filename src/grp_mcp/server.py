@@ -38,7 +38,7 @@ _KB_FIRST_POLICY = (
     "only): get_entity, count_entity, list_* (list_entities/list_actions/etc.), "
     "screen_get, screen_get_schema, screen_preflight, run_generic_inquiry, "
     "run_dac_odata, run_report, ui_get_structure, ui_read_grid, ui_resolve_selector, "
-    "screen_capabilities, setup_readiness, get_setup_guidance, whoami. NOTE: "
+    "screen_capabilities, ui_preflight, setup_readiness, get_setup_guidance, whoami. NOTE: "
     "run_import_scenario is NOT a read — despite the run_ prefix it WRITES data "
     "(executes an import scenario), so it requires the KB-first check like any other "
     "write. This exists "
@@ -973,6 +973,33 @@ async def ui_get_structure(screen_id: str, instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+async def ui_preflight(screen_id: str, set_fields: list[dict],
+                       instance: str | None = None) -> Any:
+    """Dry-run a modern-plane write: validate + coerce set_fields WITHOUT writing.
+
+    The read-only preview for ui_screen_action — runs the same write-safety pass
+    (against the live /structure) and tells you, before you commit, exactly what
+    would happen:
+      • `issues`      — read-only fields and invalid enum values that would be
+                        silently dropped (each with the `allowed` option list), and
+                        ambiguous field names needing a `view`;
+      • `coercions`   — enum display-text auto-normalized to its option value;
+      • `normalized`  — the set_fields as they would actually be applied (views
+                        resolved, values coerced);
+      • `ok`          — true only if there are no issues.
+    set_fields: [{"view"?: <ViewName>, "field": <FieldName>, "value": <value>}] —
+        `view` optional when the field name is unique across the screen's views.
+    Read-only (no graph mutation, no API seat held). Use it to check a payload,
+    then pass the same set_fields to ui_screen_action.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        normalized, issues, coercions = await s.ui_coerce_validate(set_fields)
+    return {"screen_id": screen_id.upper(), "ok": not issues,
+            "issues": issues, "coercions": coercions, "normalized": normalized}
+
+
+@mcp.tool()
 async def screen_capabilities(screen_id: str, instance: str | None = None) -> Any:
     """Recommend WHICH plane/tool to drive a screen with — the router for "use JSON
     or SOAP when needed" so you don't discover the right plane by trial-and-error.
@@ -1092,6 +1119,8 @@ async def ui_screen_action(
     set_fields: list[dict] | None = None,
     tree_select: dict | None = None,
     record_key: dict | None = None,
+    skip_validation: bool = False,
+    verify: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
@@ -1102,9 +1131,19 @@ async def ui_screen_action(
     (set fields + action="Save"). Reuses the same login session as the rest of the
     engine — no browser, no separate auth.
 
+    WRITE SAFETY (parity with screen_submit): before firing, each set_field is
+    checked against the screen's /structure metadata — a read-only field or an
+    invalid enum value is REFUSED up front (returns ok:false + validation_errors)
+    instead of being accepted with a clean 200 and silently dropped. An enum's
+    DISPLAY TEXT is auto-coerced to its option value (pass "Reversed" OR "R"). The
+    `view` may be omitted when the field name is unique across the screen's views
+    (it's resolved for you). skip_validation=true bypasses; verify=true re-reads the
+    screen after the action and reports whether the graph still shows unsaved changes.
+
     set_fields:  optional list of {"view": <ViewName>, "field": <FieldName>,
-        "value": <value>} — from ui_get_structure. For enum fields pass the option
-        `value` (not its display text); booleans are "true"/"false".
+        "value": <value>} — from ui_get_structure. `view` optional if the field name
+        is unambiguous. For enum fields pass the option value OR its display text
+        (auto-coerced); booleans are "true"/"false".
     tree_select: optional {"view": <TreeView>, "key": {keyField: value},
         "parent_key": {keyField: value} (omit for a root-level node)} — selects a
         node in a TREE control (e.g. SM207060's EntityTree) before set_fields/action
@@ -1166,6 +1205,20 @@ async def ui_screen_action(
                 f"ui_screen_action: unknown action {action!r} on {screen_id.upper()}. "
                 f"Available: {sorted(valid_actions)}"
             )
+        # Write safety (modern-plane parity with screen_submit): resolve friendly
+        # single-name fields, coerce enum labels -> values, and REFUSE a read-only /
+        # invalid-enum set that the plane would silently drop. Uses the /structure
+        # already fetched — zero extra calls.
+        coercions: list[str] = []
+        if set_fields and not skip_validation:
+            set_fields, issues, coercions = await s.ui_coerce_validate(set_fields)
+            if issues:
+                return {"screen_id": screen_id.upper(), "action": action, "ok": False,
+                        "validation_errors": issues,
+                        "messages": [f"{i['field']}: {i['problem']}" for i in issues],
+                        "note": "Refused — these set_fields would be silently ignored by the "
+                                "modern plane (read-only or invalid enum). Fix the value(s), "
+                                "or pass skip_validation=true to override."}
         valid_fields = {(v, f["field"]) for v, fs in struct["views"].items() for f in fs}
         grid_cols = {(g, c) for g, gd in struct["grids"].items() for c in (gd.get("columns") or [])}
         if record_key and record_key["view"] not in struct["views"]:
@@ -1205,8 +1258,31 @@ async def ui_screen_action(
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
         result = await s.ui_command(action)
-    return {"screen_id": screen_id.upper(), "action": action, "set_fields": set_fields or [],
-            "record_key": record_key, "tree_select": tree_select, "ok": True, "raw": result}
+        # Honest persistence signal: the plane echoes graphIsDirty. After a Save it
+        # should be False; still-True means the commit didn't take (a silent no-op the
+        # HTTP 200 hides). Best-effort verify=true re-reads /structure to confirm the
+        # graph settled. (ui_command already raised on any explicit error message.)
+        dirty = result.get("graphIsDirty") if isinstance(result, dict) else None
+        verified = None
+        if verify:
+            try:
+                after = await s.get_ui_structure()
+                verified = {"reread_ok": True, "actions": len(after.get("actions", []))}
+            except Exception as e:  # noqa: BLE001
+                verified = {"reread_ok": False, "error": str(e)[:200]}
+    ok = not (action == "Save" and dirty is True)
+    out = {"screen_id": screen_id.upper(), "action": action, "set_fields": set_fields or [],
+           "record_key": record_key, "tree_select": tree_select, "ok": ok, "raw": result}
+    if coercions:
+        out["coercions"] = coercions
+    if dirty is not None:
+        out["graph_is_dirty"] = dirty
+    if not ok:
+        out["warning"] = ("Action 'Save' returned graphIsDirty=true — the change may NOT "
+                          "have persisted (silent no-op). Read the record back to confirm.")
+    if verified is not None:
+        out["verified"] = verified
+    return out
 
 
 @mcp.tool()

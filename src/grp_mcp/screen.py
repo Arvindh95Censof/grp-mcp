@@ -825,6 +825,64 @@ class ScreenClient:
         return {"screen_id": self.screen_id, "primary_dac": d.get("primaryDacName"),
                 "screen_graph": screen_graph, "views": views, "actions": actions, "grids": grids}
 
+    async def ui_coerce_validate(self, sets: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
+        """Modern-plane write safety for a list of {view?, field, value} sets — the
+        peer of the classic submit()'s _validate_sets, closing the SAME silent-failure
+        gap on this plane. For each set, using the modern /structure metadata:
+          • resolve a missing `view` by field name (unique across views, else flagged
+            ambiguous) — friendly single-name addressing;
+          • COERCE an enum's display text to its option value (accept "Reversed" OR
+            "R" — passing the label used to silently no-op);
+          • FLAG a read-only/disabled field or an invalid enum value (both are
+            accepted by the plane with a clean 200 and silently dropped).
+        Returns (normalized_sets, issues, notes). Best-effort: a field not present in
+        the metadata is passed through untouched (downstream existence-check catches a
+        real typo). Zero extra calls — _ui_field_meta is cached."""
+        meta = await self._ui_field_meta()
+        by_field: dict[str, list] = {}
+        for (v, f), m in meta.items():
+            by_field.setdefault(f, []).append((v, m))
+        norm: list[dict] = []
+        issues: list[dict] = []
+        notes: list[str] = []
+        for s in sets:
+            field, view, val = s["field"], s.get("view"), s.get("value")
+            if not view:  # friendly single-name: resolve the view
+                cands = by_field.get(field, [])
+                if len(cands) == 1:
+                    view = cands[0][0]
+                    notes.append(f"{field} -> {view}.{field}")
+                elif len(cands) > 1:
+                    issues.append({"field": field, "value": val,
+                                   "problem": f"ambiguous field — qualify with a view; "
+                                   f"present in {sorted(c[0] for c in cands)}"})
+                    norm.append({"view": view, "field": field, "value": val})
+                    continue
+            m = meta.get((view, field)) if view else None
+            if m:
+                if m.get("readonly") or m.get("enabled") is False:
+                    issues.append({"field": f"{view}.{field}", "value": val,
+                                   "problem": "read-only / not writable — accepted by the "
+                                   "plane but silently ignored"})
+                    norm.append({"view": view, "field": field, "value": val})
+                    continue
+                opts = m.get("options")
+                if opts and val is not None and not isinstance(val, bool):
+                    sval = str(val)
+                    if not any(sval == str(o.get("value")) for o in opts):
+                        match = next((o for o in opts
+                                      if sval.lower() == str(o.get("text")).lower()), None)
+                        if match:
+                            notes.append(f"{view}.{field}: coerced label {val!r} -> "
+                                         f"value {match.get('value')!r}")
+                            val = match.get("value")
+                        else:
+                            issues.append({"field": f"{view}.{field}", "value": val,
+                                           "problem": "not a valid option (would silently "
+                                           "no-op)", "allowed": opts})
+            norm.append({"view": view, "field": field, "value": val})
+        return norm, issues, notes
+
     async def ui_set_field(self, view: str, field: str, value) -> None:
         """Set one field via the modern UI-screen protocol (see class docstring above).
 
