@@ -16,6 +16,7 @@ ScreenClient(...) as s:` so logout runs even on error; leaking sessions yields
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import re
 import uuid
@@ -996,6 +997,88 @@ class ScreenClient:
         if err:
             raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
         return resp.json()
+
+    @staticmethod
+    def _is_processing(j: dict) -> bool:
+        """True if the response says a long-running process is still in flight — a
+        `longRun`/`processing` redirect, or a LongRunData block flagged in-progress.
+        Conservative: an unrecognized shape returns False (don't hang on it)."""
+        for r in (j.get("redirects") or []):
+            if (r.get("settings") or {}).get("type") in ("longRun", "processing"):
+                return True
+        lr = (j.get("controlsData") or {}).get("LongRunData") or {}
+        if isinstance(lr, dict):
+            if lr.get("isInProgress") or lr.get("running") is True:
+                return True
+            st = str(lr.get("status") or "").lower()
+            if st in ("inprocess", "running", "inprogress"):
+                return True
+        return False
+
+    @staticmethod
+    def _process_summary(j: dict) -> dict:
+        """Extract the process outcome: the per-row ProcessingResultData (if any) plus
+        any messages, so the caller sees WHAT the process did."""
+        cd = j.get("controlsData") or {}
+        return {
+            "processing_result": cd.get("ProcessingResultData") or None,
+            "messages": [m.get("message") for m in (j.get("messages") or []) if m.get("message")],
+        }
+
+    async def ui_run_process(self, action: str, set_fields: list[dict] | None = None,
+                             load_views: list[str] | None = None,
+                             poll_interval: float = 3.0, timeout: float = 45.0) -> dict:
+        """Fire a PROCESS action (Process / ProcessAll / a mass-action) and drive it to
+        completion on the modern plane.
+
+        A small or empty batch finishes SYNCHRONOUSLY in the one call (verified live:
+        GL503000 ProcessAll -> 200 inline). A genuinely long-running batch opens a
+        processing dialog; this then polls it (via actionCloseProcessing) until it
+        settles or `timeout` (best-effort — kept under the MCP request limit; a very
+        long process may still need a re-poll). set_fields set the process FILTER first
+        (e.g. Action/FromYear/ToYear on GL503000). Any pre-process confirmation dialog
+        is auto-answered OK. Returns {ok, action, result:{processing_result, messages}}.
+        """
+        struct = await self.get_ui_structure()
+        valid = {a["name"] for a in struct["actions"]}
+        if action not in valid:
+            raise ScreenError(
+                f"ui_run_process: unknown action {action!r} on {self.screen_id}. "
+                f"Available: {sorted(valid)}")
+        views = set(load_views or []) | {f["view"] for f in (set_fields or [])}
+        primary = next(iter(struct["views"]), None)
+        if primary:
+            views.add(primary)
+        await self.ui_bootstrap(sorted(v for v in views if v))
+        for f in (set_fields or []):
+            await self.ui_set_field(f["view"], f["field"], f["value"])
+        resp = await self._ui_post({"command": [{"name": action}], "data": [],
+            "controlsParams": {}, "activeRowContexts": [], "viewsParams": {}})
+        if resp.status_code == 302:  # a confirm dialog before processing -> answer OK
+            body = resp.json()
+            view = next(((r.get("settings") or {}).get("viewName")
+                         for r in body.get("redirects", [])
+                         if (r.get("settings") or {}).get("type") == "openDialog"), None)
+            resp = await self._ui_post({"command": [{"name": action}], "data": [],
+                "dialogCallback": {"dialogResult": 1, "validateInput": False, "viewName": view},
+                "controlsParams": {}, "activeRowContexts": [], "viewsParams": {}})
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"ui_run_process {action} on {self.screen_id}: {err}")
+        j = resp.json()
+        waited = 0.0
+        while waited < timeout and self._is_processing(j):
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+            rp = await self._ui_post({"command": [{"name": "actionCloseProcessing"}],
+                "data": [], "controlsParams": {}, "activeRowContexts": [], "viewsParams": {}})
+            if self._ui_error(rp):
+                break
+            j = rp.json()
+        return {"screen_id": self.screen_id, "action": action,
+                "ok": not self._is_processing(j),
+                "still_processing": self._is_processing(j),
+                "result": self._process_summary(j)}
 
     async def ui_grid_row_action(self, grid_view: str, row_key: dict, action: str,
                                   parent: dict | None = None, confirm: bool = True) -> dict:

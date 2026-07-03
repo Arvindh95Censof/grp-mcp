@@ -558,7 +558,14 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.38 — 75 tools across four client planes (v0.38: extended the write-safety to
+v0.39 — 77 tools across four client planes (v0.39: two new modern-plane tools from a
+live route-discovery pass — `ui_run_process` drives a Process/ProcessAll screen action
+to completion (small batches finish synchronously; a large one is polled via the
+processing dialog), and `ui_lookup` does multi-row reference-table search over any
+selector field. The modern UI-JSON plane is confirmed to be just three routes
+(command POST, `/structure`, `/grid`) — everything else is a screen action; reports
+stay on the documented OData/`run_report` path and grid file-import needs a browser
+capture, both intentionally not wrapped. v0.38: extended the write-safety to
 **modern grid cells** too — `ui_insert_grid_row`/`ui_update_grid_row` now refuse a
 read-only cell or invalid enum and coerce an enum's display label to its stored value,
 using per-column `allowUpdate`/`valueItems` metadata (with a `/structure` fallback for

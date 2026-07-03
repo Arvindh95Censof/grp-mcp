@@ -1086,3 +1086,23 @@ def test_grid_write_guard_skips_without_columns():
     coerced, refusal = asyncio.run(
         s._grid_write_guard("AccountRecords", {"columns": []}, {"Type": "bad"}, "op", False))
     # _grid_col_meta would try the /structure fallback (no network in test) -> {} -> skip
+
+
+# ---- v0.39: process-runner helpers -----------------------------------------
+
+def test_is_processing_signals():
+    S = ScreenClient
+    assert S._is_processing({"redirects": [{"settings": {"type": "longRun"}}]}) is True
+    assert S._is_processing({"controlsData": {"LongRunData": {"status": "InProcess"}}}) is True
+    assert S._is_processing({"controlsData": {"LongRunData": {"running": True}}}) is True
+    # the verified SYNC case: plain envelope -> not processing
+    assert S._is_processing({"actionStates": {}, "graphIsDirty": False}) is False
+    assert S._is_processing({"controlsData": {"LongRunData": {}}}) is False
+
+
+def test_process_summary_extracts_result_and_messages():
+    j = {"controlsData": {"ProcessingResultData": {"rows": [{"ok": 1}]}},
+         "messages": [{"message": "2 records processed."}, {"message": None}]}
+    out = ScreenClient._process_summary(j)
+    assert out["processing_result"] == {"rows": [{"ok": 1}]}
+    assert out["messages"] == ["2 records processed."]

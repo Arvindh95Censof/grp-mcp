@@ -1286,6 +1286,83 @@ async def ui_screen_action(
 
 
 @mcp.tool()
+async def ui_lookup(
+    screen_id: str,
+    view: str,
+    field: str,
+    search: str = "",
+    pick: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Search a reference table behind a SELECTOR/lookup field — the modern plane's
+    magnifier as a general-purpose lookup.
+
+    Where ui_resolve_selector resolves ONE field to a single {id,text} for a write,
+    this returns ALL matching rows (with every lookup column) so you can BROWSE/SEARCH
+    reference data through any screen's selector — customers, vendors, accounts,
+    screens, terms, tax IDs, whatever a given selector points at — without needing a
+    DAC/GI route for it.
+
+    screen_id/view/field: a selector field (from ui_get_structure, where the field's
+        `selector` marker is non-null). e.g. GL202500 grid selectors, or any form's
+        lookup.
+    search: free-text filter against the lookup's search column (blank = first page).
+    pick:   optional {column: value} to further filter the returned rows.
+    Returns {view, field, search, row_count, rows}. Read-only (no gate, no seat held).
+    To then SET the value on a write, use ui_resolve_selector (single) + ui_screen_action.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        res = await s.ui_resolve_selector(view, field, search, pick)
+    return {"screen_id": screen_id.upper(), "view": view, "field": field,
+            "search": search, "row_count": res.get("row_count"), "rows": res.get("rows")}
+
+
+@mcp.tool()
+async def ui_run_process(
+    screen_id: str,
+    action: str,
+    set_fields: list[dict] | None = None,
+    poll_seconds: float = 45.0,
+    instance: str | None = None,
+) -> Any:
+    """Run a PROCESS screen action (Process / ProcessAll / a mass-action) to completion.
+
+    The modern-plane driver for processing screens — period Open/Close (GL503000),
+    posting, allocations run, revaluation, any "Process"/"Process All". It sets the
+    process FILTER, fires the action, auto-answers a confirmation dialog, and — for a
+    genuinely long-running batch — polls the processing dialog to completion.
+
+    Most batches on a normal-sized dataset finish SYNCHRONOUSLY in one call (verified
+    live: GL503000 ProcessAll). A large batch opens a progress dialog that this polls
+    up to `poll_seconds` (kept under the MCP request limit; if it returns
+    still_processing=true the process is still running server-side — re-call or check
+    the downstream effect). PRECONDITION (KB-first): consult kb-mcp for the screen's
+    prerequisites. Requires allow_write; a destructive process action additionally
+    requires allow_delete.
+
+    action:     the process command from ui_get_structure `actions` (e.g. "ProcessAll",
+        "Process"). set_fields: [{"view","field","value"}] for the filter (e.g.
+        GL503000 {"view":"Filter","field":"Action","value":"Open"} + FromYear/ToYear).
+    Returns {ok, action, still_processing, result:{processing_result, messages}}. Verify
+    the effect with run_dac_odata / screen_get.
+
+    Example — open financial periods (what manage_financial_periods does):
+        ui_run_process("GL503000", "ProcessAll",
+            set_fields=[{"view":"Filter","field":"Action","value":"Open"},
+                        {"view":"Filter","field":"FromYear","value":"2026"},
+                        {"view":"Filter","field":"ToYear","value":"2026"}])
+    """
+    _require_write(instance)
+    if action in _DESTRUCTIVE_ACTIONS:
+        _require_delete(instance)
+    _require_range("poll_seconds", poll_seconds, 0, 120)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        return await s.ui_run_process(action, set_fields=set_fields, timeout=float(poll_seconds))
+
+
+@mcp.tool()
 async def ui_grid_row_action(
     screen_id: str,
     grid_view: str,
