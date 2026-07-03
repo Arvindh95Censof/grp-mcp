@@ -558,7 +558,14 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.39 — 77 tools across four client planes (v0.39: two new modern-plane tools from a
+v0.39.1 — 77 tools across four client planes (v0.39.1: baked Acumatica's own *T290
+Modern UI* dev-training protocol facts into the setup map served by `get_setup_guidance`
+— the standard grid-toolbar action names (`refresh`/`insert`/`delete`/`adjust`/`filter`/
+`import`/`exportToExcel`), the confirmed `fieldState.enabled` read-only signal, the
+request `viewsParams`/`controlsParams` vs response `controlsData` distinction, and the
+Network-tab/HAR capture technique (confirmed live: `exportToExcel`/`import` return a
+token/URL handshake, not a one-shot file — so both need a HAR capture to build). v0.39:
+two new modern-plane tools from a
 live route-discovery pass — `ui_run_process` drives a Process/ProcessAll screen action
 to completion (small batches finish synchronously; a large one is polled via the
 processing dialog), and `ui_lookup` does multi-row reference-table search over any
