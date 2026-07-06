@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from .acumatica import looks_like_seat_limit
 from .config import Instance
 
 _XSI = "http://www.w3.org/2001/XMLSchema-instance"
@@ -226,10 +227,15 @@ class ScreenClient:
     {base_url}/Soap/{screen_id}.asmx and Login/Logout are session-wide.
     """
 
+    # Set once by server.py to _relieve_api_seats (frees OTHER cached sessions on a
+    # seat-limit fault). Lets a screen Login auto-recover from "API Login Limit".
+    default_seat_reliever = None
+
     def __init__(self, instance: Instance, screen_id: str, timeout: float = 120.0) -> None:
         self.instance = instance
         self.screen_id = screen_id.upper()
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        self.seat_reliever = None
         self._logged_in = False
         self._tree: ET.Element | None = None
         self._ui_booted = False
@@ -252,7 +258,7 @@ class ScreenClient:
 
     # ---- transport ------------------------------------------------------
 
-    async def _call(self, op: str, inner_xml: str) -> str:
+    async def _call(self, op: str, inner_xml: str, _seat_retried: bool = False) -> str:
         # classic SOAP op: mark it so the modern plane re-bootstraps a clean graph
         # if these get interleaved in one session (they keep separate graph state).
         self._classic_used = True
@@ -268,6 +274,16 @@ class ScreenClient:
         if "<soap:Fault>" in text or "<faultstring>" in text:
             m = re.search(r"<faultstring>(.*?)</faultstring>", text, re.S)
             msg = re.sub(r"\s+", " ", m.group(1)).strip() if m else text[:400]
+            # "API Login Limit": free other cached sessions, then retry this op once.
+            if not _seat_retried and looks_like_seat_limit(msg):
+                reliever = self.seat_reliever or type(self).default_seat_reliever
+                if reliever is not None:
+                    try:
+                        await reliever(self)
+                    except Exception:  # noqa: BLE001 — best-effort; fall through to raise
+                        reliever = None
+                    if reliever is not None:
+                        return await self._call(op, inner_xml, _seat_retried=True)
             # A PXSetupNotEnteredException means the screen's MODULE isn't configured
             # yet — GetSchema/Submit 500 until the named *Preferences/Setup* form is
             # filled in. Surface that as actionable guidance (a prerequisite to set up
@@ -1710,6 +1726,32 @@ class ScreenClient:
             except Exception:
                 self._ui_meta = {}  # cache the miss; never block a write on this
         return self._ui_meta
+
+    async def classify_writable(self, field_names: list[str]) -> tuple[list[str], list[str]]:
+        """Split friendly field names into (writable, readonly) using modern-plane
+        field metadata. A read-only field here is typically a ROLLUP/parent (e.g. the
+        CS100000 'StandardFinancials' feature) that the platform toggles automatically
+        when a child is enabled — setting it directly is refused/no-op. Fields that
+        can't be positively identified are treated as WRITABLE (never silently dropped)."""
+        try:
+            await self._ensure_tree()
+        except Exception:  # noqa: BLE001 — if the tree won't load, don't classify
+            return list(field_names), []
+        meta = await self._ui_field_meta()
+        if not meta:
+            return list(field_names), []
+        writable, readonly = [], []
+        for f in field_names:
+            try:
+                el = self._find_field(f)
+                m = meta.get((el.findtext("ObjectName"), el.findtext("FieldName")))
+            except ScreenError:
+                m = None
+            if m and (m.get("readonly") or m.get("enabled") is False):
+                readonly.append(f)
+            else:
+                writable.append(f)
+        return writable, readonly
 
     async def _validate_sets(self, commands: list[dict]) -> list[dict]:
         """Best-effort pre-write validation of {set} commands against modern-plane

@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -19,12 +19,45 @@ from .config import Instance
 # refresh a little before the token actually expires
 _EXPIRY_SKEW = 30.0
 
+# Signatures of the "you've used all your Web Services API seats" condition. Acumatica
+# phrases it several ways across the OAuth endpoint, the contract REST layer, and the
+# classic SOAP fault ("API Login Limit"). Match loosely + case-insensitively.
+_SEAT_LIMIT_PAT = re.compile(
+    r"api login limit"
+    r"|maximum number of .{0,40}(users?|logins?|sessions?)"
+    r"|number of .{0,20}licen[sc]e|licen[sc]e limit"
+    r"|concurrent (?:user|login|session)"
+    r"|you have exceeded",
+    re.I,
+)
+
+
+def looks_like_seat_limit(text: str | None, status: int | None = None) -> bool:
+    """True if a response body/fault text (or 429) signals API-seat exhaustion."""
+    if status == 429:
+        return True
+    return bool(text and _SEAT_LIMIT_PAT.search(text))
+
+
+# A reliever frees seats by logging out OTHER cached sessions; it takes the client to
+# EXCLUDE (never log out the one mid-request). Wired by server.py at import so both
+# client types can self-recover from a seat-limit fault without the tool layer retrying.
+SeatReliever = Callable[[object], Awaitable[None]]
+
 
 class AcumaticaError(RuntimeError):
     pass
 
 
+class LoginLimitError(AcumaticaError):
+    """API Web Services seat limit reached (all 'Max Web Services API Users' in use)."""
+
+
 class AcumaticaClient:
+    # Set once by server.py to _relieve_api_seats. On a seat-limit fault the client
+    # calls this (excluding itself) to log out OTHER cached sessions, then retries once.
+    default_seat_reliever: Optional[SeatReliever] = None
+
     def __init__(self, instance: Instance) -> None:
         self.instance = instance
         # 120s read: a cold IIS site (first hit after app-pool recycle) or a very
@@ -36,6 +69,19 @@ class AcumaticaClient:
         self._expires_at: float = 0.0
         self._swagger: dict | None = None
         self._token_lock = asyncio.Lock()  # serialize token fetch -> one session, not N
+        self.seat_reliever: Optional[SeatReliever] = None
+
+    async def _relieve_seats_once(self) -> bool:
+        """Free API seats by logging out other cached sessions (excluding self).
+        Returns True if a reliever ran (so the caller may retry once)."""
+        reliever = self.seat_reliever or type(self).default_seat_reliever
+        if reliever is None:
+            return False
+        try:
+            await reliever(self)
+        except Exception:  # noqa: BLE001 — best-effort seat relief; still surface original
+            return False
+        return True
 
     async def aclose(self) -> None:
         await self.logout()
@@ -68,7 +114,7 @@ class AcumaticaClient:
 
     # ---- auth -----------------------------------------------------------
 
-    async def _fetch_token(self) -> None:
+    async def _fetch_token(self, _seat_retried: bool = False) -> None:
         inst = self.instance
         if self._refresh_token:
             data = {
@@ -97,6 +143,14 @@ class AcumaticaClient:
                 self._refresh_token = None
                 await self._fetch_token()
                 return
+            # seat exhaustion at login: free other cached sessions, then retry once.
+            if not _seat_retried and looks_like_seat_limit(resp.text, resp.status_code):
+                if await self._relieve_seats_once():
+                    await self._fetch_token(_seat_retried=True)
+                    return
+                raise LoginLimitError(
+                    "API Web Services seat limit reached and no seats could be freed "
+                    "automatically. Call release_sessions and retry.")
             # surface only the OAuth error CODE/description — never the raw body,
             # which is the one response adjacent to the credential-bearing request.
             detail = ""
@@ -164,7 +218,8 @@ class AcumaticaClient:
 
     # ---- request plumbing ----------------------------------------------
 
-    async def _request_raw(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _request_raw(self, method: str, url: str, _seat_retried: bool = False,
+                           **kwargs: Any) -> httpx.Response:
         """Issue an authenticated request and return the raw httpx.Response.
 
         Used for binary payloads (file downloads, report PDFs) and when the caller
@@ -189,6 +244,12 @@ class AcumaticaClient:
             headers.update(await self._auth_header())
             resp = await self._http.request(method, url, headers=headers, **kwargs)
         if resp.status_code >= 400:
+            # seat exhaustion mid-request: free other cached sessions and retry once.
+            if not _seat_retried and looks_like_seat_limit(resp.text, resp.status_code):
+                if await self._relieve_seats_once():
+                    return await self._request_raw(
+                        method, url, _seat_retried=True, headers=headers, **kwargs)
+                raise LoginLimitError(f"{method} {url} -> {resp.status_code}: {resp.text}")
             raise AcumaticaError(f"{method} {url} -> {resp.status_code}: {resp.text}")
         return resp
 

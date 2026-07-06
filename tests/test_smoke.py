@@ -1127,3 +1127,148 @@ def test_guide_topic_filter_and_aliases():
 def test_guide_unknown_topic_lists_options():
     out = server.guide("nope")
     assert "error" in out and "planes" in out["topics"]
+
+
+# ---- v0.41: CoA type mapping (#9) -------------------------------------------
+
+def test_coa_type_map_letters_and_equity():
+    n = server._normalize_coa_type
+    assert n("A") == "Asset"
+    assert n("L") == "Liability"
+    assert n("E") == "Liability"  # Equity -> Liability (no Equity type)
+    assert n("B") == "Expense"
+    assert n("H") == "Income"
+
+
+def test_coa_type_full_names_passthrough_case_insensitive():
+    n = server._normalize_coa_type
+    assert n("asset") == "Asset"
+    assert n("LIABILITY") == "Liability"
+    assert n("Income") == "Income"
+
+
+def test_coa_type_override_and_invalid():
+    n = server._normalize_coa_type
+    assert n("B", {"B": "Asset"}) == "Asset"  # override built-in
+    with pytest.raises(ValueError):
+        n("Z")
+
+
+# ---- v0.41: seat-limit detection (#10) --------------------------------------
+
+def test_seat_limit_signatures():
+    from grp_mcp.acumatica import looks_like_seat_limit as f
+    assert f("API Login Limit reached")
+    assert f("You have exceeded the maximum number of users")
+    assert f("concurrent login not allowed")
+    assert f(None, status=429)
+    assert not f("some other fault")
+    assert not f(None)
+
+
+# ---- v0.41: run_dac_odata dedup (#12) ---------------------------------------
+
+def test_dac_dedup_collapses_identical_rows(cfg, monkeypatch):
+    dup = {"value": [{"FinPeriodID": "01-2026"}, {"FinPeriodID": "01-2026"},
+                     {"FinPeriodID": "02-2026"}]}
+
+    async def fake_run_dac(self, dac, params=None):
+        return json.loads(json.dumps(dup))  # fresh copy
+
+    monkeypatch.setattr(AcumaticaClient, "run_dac", fake_run_dac)
+    out = asyncio.run(server.run_dac_odata("FinPeriod", instance="rw"))
+    assert len(out["value"]) == 2
+    assert out["@grp.deduped"] == 1
+    # dedup=false leaves the raw payload untouched
+    raw = asyncio.run(server.run_dac_odata("FinPeriod", dedup=False, instance="rw"))
+    assert len(raw["value"]) == 3 and "@grp.deduped" not in raw
+
+
+# ---- v0.41: session-only routing + collisions (#6) --------------------------
+
+def test_list_instances_flags_tenant_collision(monkeypatch):
+    c = Config(default="a", instances={
+        "a": _inst(tenant="Company"), "b": _inst(tenant="Company"),
+        "c": _inst(tenant="Other")})
+    monkeypatch.setattr(server, "_config", c)
+    out = server.list_instances()
+    assert out["tenant_collisions"] == {"Company": ["a", "b"]}
+    by_name = {i["name"]: i for i in out["instances"]}
+    assert by_name["a"]["shares_tenant_with"] == ["b"]
+    assert by_name["c"]["shares_tenant_with"] is None
+
+
+def test_add_instance_session_only_marks_and_warns(monkeypatch):
+    c = Config(default="a", instances={"a": _inst(tenant="Company")})
+    monkeypatch.setattr(server, "_config", c)
+    out = server.add_instance(
+        "b", "https://h/S", "cid", "sek", "u", "p", tenant="Company", persist=False)
+    assert out["session_only"] is True
+    assert out["active"] == "a"  # not made active
+    assert "a" in out["same_tenant_collision"]
+    assert "b" in c.session_only
+
+
+# ---- v0.41: bulk-load driver + resume (#5) ----------------------------------
+
+def test_drive_load_success_and_next_offset(cfg, monkeypatch):
+    puts = []
+
+    async def fake_put(self, entity, body):
+        puts.append(body)
+
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    state = {"job": "j", "entity": "E", "total": 3, "processed": 0, "succeeded": 0,
+             "failed": 0, "next_offset": 0, "errors": [], "completed": False, "error": None}
+    client = server._client("rw")
+    mapped = [{"X": "1"}, {"X": "2"}, {"X": "3"}]
+    asyncio.run(server._drive_load(state, client, "E", mapped, 0, False))
+    assert state["succeeded"] == 3 and state["completed"] and state["next_offset"] == 3
+    assert len(puts) == 3
+
+
+def test_drive_load_stop_on_error_leaves_resume_offset(cfg, monkeypatch):
+    async def fake_put(self, entity, body):
+        if body["X"]["value"] == "2":
+            raise AcumaticaError("boom")
+
+    # _wrap_fields wraps scalars as {"value": ...}; assert resume points at the failed row
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    state = {"job": "j", "entity": "E", "total": 3, "processed": 0, "succeeded": 0,
+             "failed": 0, "next_offset": 5, "errors": [], "completed": False, "error": None}
+    client = server._client("rw")
+    mapped = [{"X": "1"}, {"X": "2"}, {"X": "3"}]
+    asyncio.run(server._drive_load(state, client, "E", mapped, 5, True))
+    assert state["succeeded"] == 1 and state["failed"] == 1
+    assert state["next_offset"] == 6  # base_offset 5 + failed index 1
+    assert state["errors"][0]["row"] == 1 + 5 + 1 + 1
+
+
+# ---- v0.42: calendar teardown + range validation (#7, #3) --------------------
+
+def test_reset_calendar_rejects_inverted_range(cfg):
+    with pytest.raises(ValueError):
+        asyncio.run(server.reset_calendar("2027", "2025", instance="rw"))
+
+
+def test_generate_master_calendar_rejects_inverted_range(cfg):
+    with pytest.raises(ValueError):
+        asyncio.run(server.generate_master_calendar("2027", "2025", instance="rw"))
+
+
+def test_delete_financial_year_needs_delete_gate(cfg):
+    # 'ro' has allow_delete=False -> refused before any network call
+    with pytest.raises(PermissionError):
+        asyncio.run(server.delete_financial_year("2027", instance="ro"))
+
+
+def test_reset_calendar_needs_delete_gate(cfg):
+    with pytest.raises(PermissionError):
+        asyncio.run(server.reset_calendar("2026", instance="ro"))
+
+
+# ---- v0.43: company-tree limitation is documented ---------------------------
+
+def test_setup_map_documents_company_tree_limitation():
+    ids = {r["id"] for r in server._setup_map()["cross_cutting_rules"]}
+    assert "company-tree-select-not-api-driveable" in ids

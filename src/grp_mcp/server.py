@@ -62,6 +62,61 @@ _setup_map_cache: dict | None = None
 # Lets publish_customization return before the site recompile finishes (which
 # outlasts the MCP request timeout) while the publish still completes server-side.
 _publish_jobs: dict[str, dict] = {}
+# background bulk-load jobs: job-id -> live state. A large load_from_excel (sequential
+# PUTs) outlasts the MCP request window, so it runs in a background task and reports
+# progress + a resume offset here, mirroring _publish_jobs.
+_load_jobs: dict[str, dict] = {}
+
+
+def _load_job_view(state: dict) -> dict:
+    """Serializable snapshot of a bulk-load job (drops the Task handle)."""
+    done = bool(state.get("completed"))
+    err = state.get("error")
+    return {
+        "job": state["job"],
+        "entity": state["entity"],
+        "status": "completed" if done else ("error" if err else "in_progress"),
+        "total": state["total"],
+        "processed": state["processed"],
+        "succeeded": state["succeeded"],
+        "failed": state["failed"],
+        "next_offset": state["next_offset"],
+        "completed": done,
+        "errors": state["errors"][:50],
+        "error": err,
+        "note": None if (done or err) else (
+            f"Load running in background: {state['processed']}/{state['total']} rows. "
+            f"Poll load_status(job={state['job']!r}) until status != in_progress. "
+            f"To resume after an interruption, re-run load_from_excel with "
+            f"offset={state['next_offset']}."
+        ),
+    }
+
+
+async def _drive_load(
+    state: dict, client: "AcumaticaClient", entity: str, mapped: list[dict],
+    base_offset: int, stop_on_error: bool,
+) -> None:
+    """Sequential PUT loop shared by the sync + background load paths. Updates `state`
+    as it goes so load_status reflects live progress and a resume offset."""
+    for i, fields in enumerate(mapped):
+        try:
+            await client.put_entity(entity, _wrap_fields(fields))
+            state["succeeded"] += 1
+        except Exception as e:  # noqa: BLE001 — record per-row, keep going
+            state["failed"] += 1
+            # spreadsheet row = header(1) + base_offset + (i+1)
+            state["errors"].append(
+                {"row": 1 + base_offset + i + 1, "error": str(e)[:300], "fields": fields})
+            if stop_on_error:
+                # leave next_offset AT this row so a resume retries it
+                state["processed"] += 1
+                state["next_offset"] = base_offset + i
+                state["completed"] = True
+                return
+        state["processed"] += 1
+        state["next_offset"] = base_offset + i + 1
+    state["completed"] = True
 
 
 def _publish_job_view(state: dict) -> dict:
@@ -119,6 +174,31 @@ def _client(instance: str | None, endpoint: str | None = None) -> AcumaticaClien
             inst = inst.model_copy(update={"endpoint_name": ep_name, "endpoint_version": ep_ver})
         _clients[key] = AcumaticaClient(inst)
     return _clients[key]
+
+
+async def _relieve_api_seats(exclude: object | None = None) -> None:
+    """Free API seats by logging out cached contract sessions (except `exclude`).
+
+    Wired as the default seat-reliever on both client types: when a request faults
+    with "API Login Limit" (all 'Max Web Services API Users' seats in use — a trial
+    has 2), the client calls this to log out the OTHER cached sessions this process
+    holds, then retries once. `exclude` is the client mid-request (never logged out).
+    ScreenClient/CustomizationClient sessions are context-managed and self-release, so
+    the persistent seat holders are the cached contract clients in `_clients`.
+    """
+    for name, client in list(_clients.items()):
+        if client is exclude:
+            continue
+        _clients.pop(name, None)
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 — best-effort seat relief
+            pass
+
+
+# Both client types self-recover from a seat-limit fault via this reliever (retry once).
+AcumaticaClient.default_seat_reliever = staticmethod(_relieve_api_seats)
+ScreenClient.default_seat_reliever = staticmethod(_relieve_api_seats)
 
 
 @asynccontextmanager
@@ -316,9 +396,17 @@ def list_instances() -> dict:
     Switch it with set_active_instance; add/remove with add_instance/remove_instance.
     """
     cfg = _cfg()
+    # map tenant -> profiles sharing it (>1 = a same-tenant collision; instance-less
+    # calls to any of them route to the active profile, which is easy to miss).
+    by_tenant: dict[str, list[str]] = {}
+    for n, i in cfg.instances.items():
+        if i.tenant:
+            by_tenant.setdefault(i.tenant, []).append(n)
+    collisions = {t: names for t, names in by_tenant.items() if len(names) > 1}
     return {
         "active": cfg.default,
         "source_path": cfg.source_path,
+        "tenant_collisions": collisions or None,
         "instances": [
             {
                 "name": n,
@@ -326,6 +414,8 @@ def list_instances() -> dict:
                 "endpoint": f"{i.endpoint_name}/{i.endpoint_version}",
                 "tenant": i.tenant,
                 "active": n == cfg.default,
+                "session_only": n in cfg.session_only,
+                "shares_tenant_with": [x for x in by_tenant.get(i.tenant, []) if x != n] or None,
                 "gates": {
                     "write": i.allow_write,
                     "delete": i.allow_delete,
@@ -393,16 +483,40 @@ def add_instance(
     if persist:
         _require_admin("add_instance persist")
     existed = name in cfg.instances
+    # same-tenant collision: another profile shares this tenant. A tool called WITHOUT
+    # instance= routes to cfg.default, so if this add isn't made active the read/write
+    # silently lands on the OTHER same-tenant profile — surface that up front.
+    collisions = [n for n, i in cfg.instances.items()
+                  if n != name and i.tenant == inst.tenant and inst.tenant]
     cfg.instances[name] = inst
+    if persist:
+        cfg.session_only.discard(name)
+    else:
+        cfg.session_only.add(name)
     _clients.pop(name, None)  # drop any stale cached client for this name
     if set_active or len(cfg.instances) == 1:
         cfg.default = name
     saved = save_config(cfg) if persist else None
+    is_active = cfg.default == name
+    routing = (
+        f"active — instance-less tool calls now route here."
+        if is_active else
+        f"NOT active (active={cfg.default!r}). Pass instance={name!r} to every call, "
+        f"or set_active_instance({name!r}), or re-add with set_active=true — otherwise "
+        f"calls without instance= go to {cfg.default!r}."
+    )
     return {
         "added": name,
         "replaced": existed,
         "active": cfg.default,
+        "session_only": not persist,
         "persisted_to": saved,
+        "routing": routing,
+        "same_tenant_collision": (
+            f"tenant {inst.tenant!r} is also used by {collisions} — without instance= "
+            f"(or making {name!r} active) same-tenant calls hit the active profile, not "
+            f"this one." if collisions else None
+        ),
         "instances": list_instances()["instances"],
     }
 
@@ -442,6 +556,7 @@ def remove_instance(name: str, persist: bool = True) -> dict:
     if len(cfg.instances) == 1:
         raise ValueError("refusing to remove the only configured profile.")
     del cfg.instances[name]
+    cfg.session_only.discard(name)
     _clients.pop(name, None)
     if cfg.default == name:
         cfg.default = next(iter(cfg.instances))
@@ -479,8 +594,17 @@ async def reload_config(instance: str | None = None) -> dict:
     changes (new/edited profiles, active selection, gates) to the live connector.
     Closes all cached API sessions first (frees license seats); they re-auth on
     next use. Returns the refreshed active profile + list.
+
+    Session-only profiles (added with add_instance persist=false) are PRESERVED
+    across the reload — a disk reload no longer silently drops an in-memory add.
+    Disk always wins on a name conflict (the on-disk profile is authoritative).
     """
     global _config
+    old = _config
+    # snapshot session-only adds so a disk reload doesn't drop them
+    preserved: dict[str, Instance] = {}
+    if old is not None:
+        preserved = {n: old.instances[n] for n in old.session_only if n in old.instances}
     for c in list(_clients.values()):
         try:
             await c.aclose()
@@ -488,7 +612,15 @@ async def reload_config(instance: str | None = None) -> dict:
             pass
     _clients.clear()
     _config = load_config()
-    return list_instances()
+    readded = []
+    for n, inst in preserved.items():
+        if n not in _config.instances:  # disk wins on conflict
+            _config.instances[n] = inst
+            _config.session_only.add(n)
+            readded.append(n)
+    out = list_instances()
+    out["preserved_session_only"] = readded or None
+    return out
 
 
 @mcp.tool()
@@ -1594,6 +1726,7 @@ async def ui_read_grid(
     fields: list[str] | None = None,
     top: int | None = None,
     parent: dict | None = None,
+    fallback_dac: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Read GRID rows via the MODERN UI-screen plane (the read peer of the grid CRUD).
@@ -1611,6 +1744,11 @@ async def ui_read_grid(
         read a CHILD grid under a header record (e.g. CA202000 entry-type details of
         one cash account: parent={"view":"CashAccount","key":{"CashAccountCD":"10200"}},
         grid_view="ETDetails"). Omit for a top-level grid.
+    fallback_dac: TREE grids (e.g. EP204061 "Folders", the Company Tree) load only the
+        visible/root level over the modern plane, so this returns just the root. Pass
+        the backing DAC name (e.g. "EPCompanyTree") and, when the grid yields <=1 row,
+        the FULL backing table is read via DAC OData and returned under `dac_fallback`
+        (with the parent-link + sort columns the flat grid read omits).
 
     Returns {grid_view, key_names, columns, row_count, rows:[{...cells, _rowId}]}.
     Read-only (no gate).
@@ -1631,9 +1769,25 @@ async def ui_read_grid(
         out.append(row)
         if top and len(out) >= top:
             break
-    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
-            "key_names": g["key_names"], "columns": col_fields,
-            "row_count": len(out), "rows": out}
+    result = {"screen_id": screen_id.upper(), "grid_view": grid_view,
+              "key_names": g["key_names"], "columns": col_fields,
+              "row_count": len(out), "rows": out}
+    # A tree grid only returns its visible/root level over the modern plane — when the
+    # caller names the backing DAC and we got <=1 row, read the full table instead.
+    if fallback_dac and len(out) <= 1:
+        try:
+            dac = await run_dac_odata(fallback_dac, instance=instance)
+            result["dac_fallback"] = {
+                "dac": fallback_dac,
+                "row_count": len(dac.get("value", [])),
+                "rows": dac.get("value", []),
+                "note": "Grid returned <=1 row (a collapsed tree only loads the root over "
+                        "the modern plane). These are the full backing-table rows via DAC "
+                        "OData, including parent-link/sort columns the grid read omits.",
+            }
+        except Exception as e:  # noqa: BLE001 — fallback is best-effort
+            result["dac_fallback"] = {"dac": fallback_dac, "error": str(e)[:200]}
+    return result
 
 
 @mcp.tool()
@@ -2045,6 +2199,14 @@ async def enable_features(
     (e.g. "Subaccounts", "Inventory", "InventorySubitems"). Sets each ON and
     Saves. Returns the screen_submit result.
 
+    ROLLUP FEATURES: some feature checkboxes are read-only PARENT/rollup toggles
+    (e.g. "StandardFinancials") that the platform turns on automatically once one of
+    their children is enabled — you can't set them directly (SOAP refuses / no-ops).
+    This detects those in the requested list, DROPS them from the SET commands (so the
+    batch isn't refused), and reports them under `rollup_skipped`; the writable
+    features are set + Saved as normal. If EVERY requested feature is a rollup, nothing
+    is set (enable a child instead).
+
     Save STAGES the change (FeaturesSet gets a working row; ActivationStatus =
     "Pending Activation"). To ACTIVATE/INSTALL the staged set, call
     activate_features (the "Enable" button = the RequestValidation action), which
@@ -2054,9 +2216,22 @@ async def enable_features(
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
-    cmds = [{"set": f, "to": "True"} for f in features] + [{"action": "Save"}]
     async with ScreenClient(inst, "CS100000") as s:
+        writable, rollup = await s.classify_writable(features)
+        if not writable:
+            return {
+                "screen_id": "CS100000", "ok": False, "staged": None,
+                "rollup_skipped": rollup,
+                "note": "Every requested feature is a read-only rollup/parent toggle — "
+                        "nothing to set. Enable one of their CHILD features instead; the "
+                        "parent turns on automatically.",
+            }
+        cmds = [{"set": f, "to": "True"} for f in writable] + [{"action": "Save"}]
         staged = await s.submit(cmds)
+    if rollup and isinstance(staged, dict):
+        staged = {**staged, "rollup_skipped": rollup,
+                  "rollup_note": f"read-only rollup features not set directly (auto-enable "
+                                 f"via children): {rollup}"}
     if not activate:
         return staged
     activated = await activate_features(instance=instance)
@@ -2160,33 +2335,121 @@ async def activate_features_status(instance: str | None = None) -> Any:
 
 @mcp.tool()
 async def create_financial_calendar(
-    first_year: str, starts_on: str | None = None, instance: str | None = None
+    first_year: str,
+    starts_on: str | None = None,
+    has_adjustment_period: bool = False,
+    number_of_periods: int | None = None,
+    period_type: str | None = None,
+    skip_validation: bool = False,
+    instance: str | None = None,
 ) -> Any:
-    """Create the financial calendar (GL101000): first year, AutoFill, start, Save.
+    """Create the financial calendar (GL101000): set the year-start date, AutoFill, Save.
 
-    first_year: e.g. "2026". Generates the period rows (monthly by default) and
-    saves — the prerequisite for the GL ledger.
-    starts_on: optional year start date, M/D/YYYY (e.g. "1/1/2026"). Omit to use
-    the screen's default start (≈ business date).
+    first_year: e.g. "2026" — the fiscal year to establish.
+    starts_on:  year-start date, M/D/YYYY (e.g. "1/1/2026"). Omit to default to
+                Jan 1 of first_year.
+    has_adjustment_period: add a year-end adjustment period (Period 13) to the pattern.
+    number_of_periods: override the period count (e.g. 12 monthly). Omit for default.
+    period_type: override the period type (e.g. "Month"). Omit for default.
 
-    The start date IS settable via the screen-based SOAP API, but ORDER MATTERS:
-    set FirstFinancialYear -> AutoFill -> set FinancialYearStartsOn (AFTER AutoFill)
-    -> Save, and answer the confirmation dialog (auto_answer). Setting the start
-    BEFORE AutoFill faults; AutoFill regenerates from the start so it must run
-    first. Requires allow_write. Verify with
+    WHY THE START DATE, NOT THE YEAR FIELD: on 2024R2+/26.100 the "First Financial
+    Year" field (FiscalYearSetup.FirstFinYear) is READ-ONLY once a calendar pattern
+    exists — the year is DERIVED from the year-start date (BegFinYear). Setting
+    FirstFinancialYear directly is refused (the read-only write guard rejects it, and
+    SOAP would silently drop it anyway). So this drives the year off
+    FinancialYearStartsOn (= BegFinYear) instead, which establishes the year on every
+    build. AutoFill then generates the period rows from that date; Save commits and a
+    confirmation dialog is auto-answered.
+
+    skip_validation bypasses the pre-write read-only/enum guard (use only if a valid
+    SET is being wrongly rejected). Requires allow_write. Verify with
     screen_get('GL101000', ['Periods.PeriodNbr','Periods.StartDate']).
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
-    cmds: list[dict] = [
-        {"set": "FirstFinancialYear", "to": str(first_year)},
-        {"action": "AutoFill"},
-    ]
-    if starts_on:
-        cmds.append({"set": "FinancialYearStartsOn", "to": str(starts_on)})
+    start = str(starts_on) if starts_on else f"1/1/{str(first_year).strip()}"
+    # Set the start date FIRST (it derives the year), then let AutoFill regenerate the
+    # period rows from it, then Save. FirstFinancialYear is intentionally NOT set.
+    cmds: list[dict] = [{"set": "FinancialYearStartsOn", "to": start}]
+    if period_type:
+        cmds.append({"set": "PeriodType", "to": str(period_type)})
+    if number_of_periods is not None:
+        cmds.append({"set": "NumberOfFinancialPeriods", "to": str(number_of_periods)})
+    if has_adjustment_period:
+        cmds.append({"set": "HasAdjustmentPeriod", "to": "True"})
+    cmds.append({"action": "AutoFill"})
     cmds.append({"action": "Save"})
     async with ScreenClient(inst, "GL101000") as s:
-        return await s.submit(cmds, auto_answer="Yes")
+        return await s.submit(cmds, auto_answer="Yes", skip_validation=skip_validation)
+
+
+@mcp.tool()
+async def delete_financial_year(year: str, instance: str | None = None) -> Any:
+    """Delete ONE financial year (and its periods) from the Master Calendar (GL201000).
+
+    Calendar teardown — the inverse of create_financial_calendar/generate_master_calendar.
+    Drives the modern plane: navigate the FiscalYear record to `year`, fire the screen's
+    Delete action (which COMMITS immediately — there is no separate Save; a Save after
+    the delete errors "At least one period should be defined" because the year is already
+    gone, proven live 2026R1).
+
+    year: the financial year to remove, e.g. "2027".
+
+    CAVEATS: delete LATER years before earlier ones (a year is generated from the prior
+    one) — see reset_calendar for a range. A year with posted GL activity, or the only
+    remaining year, may refuse to delete. To drop just a year-end ADJUSTMENT period
+    (Period 13) without deleting the year, re-run create_financial_calendar with
+    has_adjustment_period=false instead. Held to the allow_delete gate (destructive).
+    Verify with run_dac_odata('FinPeriod', filter="FinYear eq '<year>'") — expect empty.
+    """
+    _require_delete(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, "GL201000") as s:
+        await s.ui_bootstrap(["FiscalYear"])
+        await s.ui_navigate_record("FiscalYear", {"Year": str(year)})
+        res = await s.ui_command("Delete")
+    return {"screen_id": "GL201000", "year": str(year), "deleted": True,
+            "graph_is_dirty": res.get("graphIsDirty"),
+            "note": "Delete committed immediately (no Save). Verify with "
+                    f"run_dac_odata('FinPeriod', filter=\"FinYear eq '{year}'\") — expect empty."}
+
+
+@mcp.tool()
+async def reset_calendar(
+    from_year: str, to_year: str | None = None, instance: str | None = None
+) -> Any:
+    """Delete a RANGE of financial years from the Master Calendar (GL201000) — teardown.
+
+    Deletes each year in [from_year, to_year] HIGHEST-FIRST (a later year is generated
+    from the earlier one, so it must go first). Per-year result is reported; a year that
+    refuses (posted activity, or the last remaining year) is recorded and the rest
+    continue. Each delete commits immediately (see delete_financial_year).
+
+    from_year/to_year: inclusive year range (omit to_year for a single year). To also
+    reset the year PATTERN (period count / adjustment period), re-run
+    create_financial_calendar afterwards. Held to the allow_delete gate (destructive).
+    """
+    _require_delete(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    y0, y1 = int(from_year), int(to_year or from_year)
+    if y1 < y0:
+        raise ValueError(f"to_year ({y1}) must be >= from_year ({y0})")
+    results: list[dict] = []
+    async with ScreenClient(inst, "GL201000") as s:
+        for y in range(y1, y0 - 1, -1):  # highest year first
+            await s.ui_bootstrap(["FiscalYear"])
+            try:
+                await s.ui_navigate_record("FiscalYear", {"Year": str(y)})
+                res = await s.ui_command("Delete")
+                results.append({"year": str(y), "deleted": True,
+                                "graph_is_dirty": res.get("graphIsDirty")})
+            except Exception as e:  # noqa: BLE001 — record per-year, keep going
+                results.append({"year": str(y), "deleted": False, "error": str(e)[:200]})
+    deleted = [r["year"] for r in results if r.get("deleted")]
+    return {"screen_id": "GL201000", "from_year": str(y0), "to_year": str(y1),
+            "deleted_years": deleted, "results": results,
+            "note": "Verify with run_dac_odata('FinPeriod'). Re-run "
+                    "create_financial_calendar to rebuild the year pattern if needed."}
 
 
 @mcp.tool()
@@ -2261,25 +2524,70 @@ async def set_gl_preferences(
         return await s.submit(cmds, auto_answer="Yes")
 
 
+# Acumatica GL has exactly four account types (NO Equity — equity accounts are typed
+# Liability, hence Retained Earnings/YTD-Net-Income must be Liability; see
+# set_gl_preferences). Source systems often code the type as a single letter; this maps
+# the common scheme. E (Equity) -> Liability by that rule. B and H are less standard —
+# override per-load via chart_of_accounts(type_map=...) if your source differs.
+_ACU_ACCOUNT_TYPES = {"Asset", "Liability", "Income", "Expense"}
+_COA_TYPE_MAP = {
+    "A": "Asset",
+    "L": "Liability",
+    "B": "Expense",
+    "H": "Income",
+    "E": "Liability",  # Equity -> Liability (no Equity type in Acumatica GL)
+}
+
+
+def _normalize_coa_type(value: Any, type_map: dict | None = None) -> str:
+    """Resolve a source account-type code/name to an Acumatica GL type.
+
+    Accepts an already-valid type (Asset/Liability/Income/Expense, case-insensitive)
+    verbatim, or a single-letter source code mapped via type_map (defaults to
+    _COA_TYPE_MAP). Raises ValueError on anything unmapped rather than silently
+    passing a bad type to the screen (which would fault or mis-post).
+    """
+    raw = str(value).strip()
+    # already a full Acumatica type? (case-insensitive) -> canonical casing
+    for t in _ACU_ACCOUNT_TYPES:
+        if raw.lower() == t.lower():
+            return t
+    m = {**_COA_TYPE_MAP, **{k.upper(): v for k, v in (type_map or {}).items()}}
+    hit = m.get(raw.upper())
+    if hit is None:
+        raise ValueError(
+            f"account type {value!r} is not a valid Acumatica type "
+            f"({'/'.join(sorted(_ACU_ACCOUNT_TYPES))}) nor a known source code "
+            f"({'/'.join(sorted(m))}). Pass type_map to add a mapping.")
+    return hit
+
+
 @mcp.tool()
 async def chart_of_accounts(
     accounts: list[dict],
     save: bool = True,
     dry_run: bool = False,
     auto_answer: str | None = "Yes",
+    type_map: dict | None = None,
     instance: str | None = None,
 ) -> Any:
     """Create Chart of Accounts rows (GL202500) in one transaction.
 
     accounts: list of dicts. Per account:
         account      (required) the account number/CD, e.g. "10100"
-        type         (required) "Asset" | "Liability" | "Income" | "Expense"
+        type         (required) an Acumatica type "Asset"|"Liability"|"Income"|"Expense"
+                     OR a single-letter source code auto-mapped: A->Asset, L->Liability,
+                     E->Liability (Equity; Acumatica has no Equity type), B->Expense,
+                     H->Income. Override/extend via the type_map arg.
         description  (required) free text
         account_class            optional account class ID (must already exist)
         post_option              optional, e.g. "Detail" | "Summary"
         active                   optional bool, defaults True
     Each becomes a NewRow + field SETs on the AccountRecords grid; one Save
     commits them all. A confirmation dialog (if any) is auto-answered "Yes".
+
+    type_map: optional {code: AcumaticaType} to override the built-in letter map
+        (e.g. {"B": "Asset"} if your source codes B as a Bank/Asset account).
 
     Prerequisites: the GL module enabled and a posting ledger to exist. Verify
     after with screen_get('GL202500', ['AccountRecords.Account',
@@ -2292,7 +2600,7 @@ async def chart_of_accounts(
     for a in accounts:
         row = {
             "Account": str(a["account"]),
-            "Type": a["type"],
+            "Type": _normalize_coa_type(a["type"], type_map),
             "Description": a["description"],
         }
         if a.get("account_class"):
@@ -2336,18 +2644,37 @@ async def generate_master_calendar(
     'GL201000', ['Periods.FinancialPeriodID','Periods.Status']) or
     run_dac_odata('FinPeriod', filter="FinYear eq '<year>'"). Requires
     allow_write. (KB: To Generate Financial Periods for the Master Calendar.)
+
+    RANGE: to_year > from_year generates EVERY year in the inclusive range. The
+    screen's generateYears command only ever materializes a SINGLE year per fire
+    (setting ToYear on the params is silently ignored on this build), so this
+    loops year-by-year internally — one generateYears per year, reusing the same
+    login session — and reports per-year results.
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
-    to_year = str(to_year or from_year)
+    y0, y1 = int(from_year), int(to_year or from_year)
+    if y1 < y0:
+        raise ValueError(f"to_year ({y1}) must be >= from_year ({y0})")
+    per_year: list[dict] = []
     async with ScreenClient(inst, "GL201000") as s:
         # Load FiscalYear so the company/calendar context is present — without it
         # generateYears faults "Select a company and create its first calendar year."
         await s.ui_bootstrap(["FiscalYear"])
-        await s.ui_set_field("GenerateParams", "FromYear", str(from_year))
-        await s.ui_set_field("GenerateParams", "ToYear", to_year)
-        result = await s.ui_command("generateYears")
-    return {"generated": True, "from_year": str(from_year), "to_year": to_year, "raw": result}
+        for y in range(y0, y1 + 1):
+            # Set BOTH ends to the single year: ToYear is ignored on this build, so
+            # a multi-year span would only ever create from_year — drive one at a time.
+            await s.ui_set_field("GenerateParams", "FromYear", str(y))
+            await s.ui_set_field("GenerateParams", "ToYear", str(y))
+            raw = await s.ui_command("generateYears")
+            per_year.append({"year": str(y), "raw": raw})
+    return {
+        "generated": True,
+        "from_year": str(y0),
+        "to_year": str(y1),
+        "years": [p["year"] for p in per_year],
+        "per_year": per_year,
+    }
 
 
 @mcp.tool()
@@ -2737,7 +3064,9 @@ async def load_from_excel(
     sheet: str | None = None,
     dry_run: bool = True,
     limit: int | None = None,
+    offset: int = 0,
     stop_on_error: bool = False,
+    background: bool | None = None,
     instance: str | None = None,
 ) -> Any:
     """Bulk create/update records of an entity from an .xlsx/.csv file.
@@ -2751,14 +3080,25 @@ async def load_from_excel(
     schema and returns a preview WITHOUT writing anything. Inspect unknown_fields
     and sample, then re-run with dry_run=false to actually load.
 
-    limit caps rows processed; stop_on_error aborts on the first failed row.
+    offset skips the first N DATA rows (0-based) — use it to RESUME an interrupted
+    load from the next_offset a prior run reported. limit caps rows processed (after
+    offset). stop_on_error aborts on the first failed row (next_offset points AT that
+    row so a resume retries it).
+
+    background: a large load (sequential PUTs) can outlast the request window. When
+    background is True — or None (auto) and > 150 rows remain — the load runs in a
+    BACKGROUND task and returns a job id immediately; poll load_status(job) for
+    progress and next_offset. Set background=false to force the inline path.
     Tip: run get_entity_schema(entity) first to get exact field names.
     """
     _require_range("limit", limit, 1, 1000000)
+    _require_range("offset", offset, 0, 100000000)
     _check_read_path(path, instance)  # sandbox + size cap (read-side guard)
     if not dry_run:
         _require_write(instance)
     headers, rows = read_rows(path, sheet)
+    if offset:
+        rows = rows[offset:]
     if limit:
         rows = rows[:limit]
     mapped = [m for m in (map_row(r, column_map) for r in rows) if m]
@@ -2795,23 +3135,60 @@ async def load_from_excel(
             ),
         }
 
-    created, errors = 0, []
-    for i, fields in enumerate(mapped, start=2):  # row 2 = first data row
-        try:
-            await client.put_entity(entity, _wrap_fields(fields))
-            created += 1
-        except Exception as e:
-            errors.append({"row": i, "error": str(e)[:300], "fields": fields})
-            if stop_on_error:
-                break
-    return {
-        "dry_run": False,
-        "entity": entity,
-        "processed": created + len(errors),
-        "succeeded": created,
-        "failed": len(errors),
-        "errors": errors[:50],
+    job = f"{entity}@{offset}+{len(mapped)}"
+    state: dict[str, Any] = {
+        "job": job, "entity": entity, "total": len(mapped),
+        "processed": 0, "succeeded": 0, "failed": 0,
+        "next_offset": offset, "errors": [], "completed": False, "error": None,
     }
+    go_bg = background if background is not None else len(mapped) > 150
+    if not go_bg:
+        await _drive_load(state, client, entity, mapped, offset, stop_on_error)
+        out = _load_job_view(state)
+        out["dry_run"] = False
+        out["background"] = False
+        return out
+
+    _load_jobs[job] = state
+
+    async def _run() -> None:
+        try:
+            await _drive_load(state, client, entity, mapped, offset, stop_on_error)
+        except Exception as e:  # noqa: BLE001 — record, don't crash the loop
+            state["error"] = str(e)[:400]
+        finally:
+            state.pop("_task", None)
+    state["_task"] = asyncio.create_task(_run())
+    # let a fast load finish inline; otherwise return the job to poll
+    waited = 0.0
+    while waited < 5.0 and not state["completed"] and state["error"] is None:
+        await asyncio.sleep(1.0)
+        waited += 1.0
+    out = _load_job_view(state)
+    out["dry_run"] = False
+    out["background"] = True
+    return out
+
+
+@mcp.tool()
+async def load_status(job: str | None = None) -> Any:
+    """Check a background bulk-load started by load_from_excel (in-memory, instant).
+
+    job: the id load_from_excel returned; omit for the most recent. Returns the same
+    shape (status completed | in_progress | error) with processed/succeeded/failed and
+    next_offset. If it stopped early (stop_on_error or an interruption), resume with
+    load_from_excel(..., offset=next_offset). State is per server session (a restart
+    clears it — verify loaded rows via count_entity / get_entity instead).
+    """
+    if not _load_jobs:
+        return {"status": "none",
+                "note": "No background load started in this server session."}
+    if job is None:
+        job = next(reversed(_load_jobs))
+    state = _load_jobs.get(job)
+    if state is None:
+        return {"status": "unknown", "job": job, "known_jobs": list(_load_jobs)}
+    return _load_job_view(state)
 
 
 @mcp.tool()
@@ -3141,6 +3518,7 @@ async def run_dac_odata(
     expand: str | None = None,
     top: int | None = None,
     skip: int | None = None,
+    dedup: bool = True,
     instance: str | None = None,
 ) -> Any:
     """Query a single DAC through the DAC-based OData v4 interface.
@@ -3149,6 +3527,12 @@ async def run_dac_odata(
     filter/select/expand/top/skip: OData v4 query options ($filter, $select, ...).
     Read-only. Use this to read tables/screens NOT exposed on the contract endpoint
     (the contract API only sees entities added to the endpoint). Requires `tenant`.
+
+    dedup (default True): this platform's DAC-OData layer occasionally returns the
+    SAME row more than once across internal server-side page boundaries (observed on
+    FinPeriod). With dedup on, identical rows in the `value` array are collapsed
+    (order preserved) and a `@grp.deduped` count is added when any were removed.
+    Set dedup=false to see the raw payload verbatim.
     """
     params: dict[str, Any] = {}
     if filter:
@@ -3161,7 +3545,28 @@ async def run_dac_odata(
         params["$top"] = top
     if skip:
         params["$skip"] = skip
-    return await _client(instance).run_dac(dac, params)
+    result = await _client(instance).run_dac(dac, params)
+    if dedup and isinstance(result, dict) and isinstance(result.get("value"), list):
+        rows = result["value"]
+        seen: set[str] = set()
+        unique: list = []
+        for r in rows:
+            # Signature = the full row (paging dupes are byte-identical); sort keys so
+            # dict ordering never splits a true duplicate. Fall back to id() if a row
+            # isn't JSON-serializable (never expected for OData scalars).
+            try:
+                sig = json.dumps(r, sort_keys=True, default=str)
+            except Exception:  # noqa: BLE001
+                sig = repr(r)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique.append(r)
+        if len(unique) != len(rows):
+            result = dict(result)
+            result["value"] = unique
+            result["@grp.deduped"] = len(rows) - len(unique)
+    return result
 
 
 @mcp.tool()

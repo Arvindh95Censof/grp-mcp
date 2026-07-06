@@ -558,7 +558,24 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.40 — 78 tools across four client planes (v0.40: added **`guide`** — a START-HERE tool
+v0.41 — 80 tools across four client planes (v0.41: a batch of fixes + calendar teardown from
+a live-probing session. **`delete_financial_year`**/**`reset_calendar`** tear down Master-Calendar
+years (GL201000 navigate→Delete, verified live). **`create_financial_calendar`** now drives the
+year off the year-start date (`BegFinYear`) — the read-only `FirstFinancialYear` field is refused
+on 2024R2+/26.100 — and takes `has_adjustment_period`/`skip_validation`. **`generate_master_calendar`**
+loops a `from_year..to_year` range (the screen only ever materializes one year per fire).
+**`enable_features`** detects read-only rollup/parent features (e.g. `StandardFinancials`) and drops
+them from the SET instead of refusing the whole batch. **`load_from_excel`** runs a large load as a
+background job with progress + a resume `offset` (`load_status` polls it) and auto-backgrounds >150 rows.
+**`run_dac_odata`** de-dups paging-artifact duplicate rows. **`chart_of_accounts`** maps single-letter
+source account types (A/L/E→Liability/B/H) to Acumatica types. **`ui_read_grid`** takes `fallback_dac`
+so a collapsed TREE grid falls back to the full backing table (e.g. `EPCompanyTree`). API-seat
+exhaustion ("API Login Limit") now auto-frees other cached sessions and retries once. `add_instance`
+marks session-only profiles + surfaces same-tenant collisions, and `reload_config` preserves
+session-only adds. **Deferred (confirmed API limitation):** `company_tree` (EP204061) and
+`build_approval_map` (EP205015) — tree-node re-selection isn't driveable via either API plane
+(exhaustively probed), so those screens need real browser UI automation; documented in
+`get_setup_guidance`. v0.40: added **`guide`** — a START-HERE tool
 that returns a task→tool decision map + the plane-by-shape routing rule, so an agent
 facing ~77 tools across four planes picks the right one instead of guessing;
 `guide(topic="write"|"read"|"setup"|"process"|"planes"|…)` narrows it, and the server

@@ -94,6 +94,9 @@ class Config(BaseModel):
     default: str
     instances: dict[str, Instance]
     source_path: str | None = None  # file this config was loaded from (None = env)
+    # names added session-only (persist=false) — NOT written to disk, but preserved
+    # across reload_config so an in-memory add doesn't silently vanish. Transient.
+    session_only: set[str] = Field(default_factory=set)
 
     def get(self, name: str | None) -> Instance:
         key = name or self.default
