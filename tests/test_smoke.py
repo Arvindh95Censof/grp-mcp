@@ -15,7 +15,7 @@ import pytest
 from grp_mcp import server
 from grp_mcp.acumatica import AcumaticaClient, AcumaticaError
 from grp_mcp.config import Config, Instance
-from grp_mcp.screen import ScreenClient
+from grp_mcp.screen import ScreenClient, ScreenError
 
 
 def _inst(**over) -> Instance:
@@ -1272,3 +1272,77 @@ def test_reset_calendar_needs_delete_gate(cfg):
 def test_setup_map_documents_company_tree_limitation():
     ids = {r["id"] for r in server._setup_map()["cross_cutting_rules"]}
     assert "company-tree-select-not-api-driveable" in ids
+
+
+# ---- v0.42: non-SOAP cookie login for the modern plane ----------------------
+
+class _FakeResp:
+    def __init__(self, status=204, text=""):
+        self.status_code = status
+        self.text = text
+
+
+def test_cookie_login_sends_company_separately():
+    # tenant with a space (like csmdev 'AI MPM') MUST go in `company`, not name@tenant
+    inst = _inst(username="csmarvindh", tenant="AI MPM", password="pw")
+    s = ScreenClient(inst, "PY101500")
+    captured = {}
+
+    async def fake_post(url, json=None, headers=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResp(204)
+
+    s._http.post = fake_post
+    asyncio.run(s._cookie_login())
+    assert s._logged_in is True and s._cookie_session is True
+    assert captured["json"] == {"name": "csmarvindh", "password": "pw", "company": "AI MPM"}
+    assert "@" not in captured["json"]["name"]
+    assert captured["url"].endswith("/entity/auth/login")
+
+
+def test_cookie_login_raises_on_non_2xx():
+    s = ScreenClient(_inst(), "PY101500")
+
+    async def fake_post(url, json=None, headers=None):
+        return _FakeResp(401, "denied")
+
+    s._http.post = fake_post
+    with pytest.raises(ScreenError):
+        asyncio.run(s._cookie_login())
+    assert s._logged_in is False
+
+
+def test_ensure_login_falls_back_to_cookie_when_soap_fails():
+    s = ScreenClient(_inst(), "PY101500")
+
+    async def boom():
+        raise ScreenError("SOAP login disabled")
+
+    async def cookie():
+        s._logged_in = True
+        s._cookie_session = True
+
+    s.login = boom
+    s._cookie_login = cookie
+    asyncio.run(s._ensure_login())
+    assert s._logged_in is True and s._cookie_session is True
+
+
+def test_ensure_login_prefers_soap_and_is_noop_when_logged_in():
+    s = ScreenClient(_inst(), "PY101500")
+    calls = {"soap": 0, "cookie": 0}
+
+    async def soap():
+        calls["soap"] += 1
+        s._logged_in = True
+
+    async def cookie():
+        calls["cookie"] += 1
+
+    s.login = soap
+    s._cookie_login = cookie
+    asyncio.run(s._ensure_login())          # SOAP works -> cookie not tried
+    assert calls == {"soap": 1, "cookie": 0} and s._cookie_session is False
+    asyncio.run(s._ensure_login())          # already logged in -> no-op
+    assert calls == {"soap": 1, "cookie": 0}

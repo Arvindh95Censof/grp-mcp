@@ -558,7 +558,17 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.41 — 80 tools across four client planes (v0.41: a batch of fixes + calendar teardown from
+v0.42 — 80 tools across four client planes (v0.42: **non-SOAP cookie login for the modern
+UI plane.** The modern `/ui/screen/` plane used to ride the classic SOAP Login cookie, so on
+an instance where the SOAP screen API is disabled (e.g. csmdev — SOAP login off + OData 403)
+the whole modern plane was dead even though the browser's cookie route worked. `ScreenClient`
+now tries SOAP login first (still required for classic ops + sets the same cookie) and, on
+failure, falls back to the contract endpoint **`POST /entity/auth/login`** → the `.ASPXAUTH`
+cookie that authorizes `/ui/screen/*` — so `ui_get_structure` and every modern-plane tool now
+work headlessly on SOAP-disabled instances (verified live: csmdev `PY101500`/`GL101000`
+structure). The contract login takes `company` **separately** (not `name@tenant`), which is
+required for tenants whose login has spaces (`AI MPM`); logout routes to `/entity/auth/logout`
+for cookie sessions. Normal SOAP-enabled instances are unchanged. v0.41: a batch of fixes + calendar teardown from
 a live-probing session. **`delete_financial_year`**/**`reset_calendar`** tear down Master-Calendar
 years (GL201000 navigate→Delete, verified live). **`create_financial_calendar`** now drives the
 year off the year-start date (`BegFinYear`) — the read-only `FirstFinancialYear` field is refused

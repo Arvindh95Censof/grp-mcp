@@ -237,6 +237,7 @@ class ScreenClient:
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self.seat_reliever = None
         self._logged_in = False
+        self._cookie_session = False  # True if logged in via /entity/auth/login (non-SOAP)
         self._tree: ET.Element | None = None
         self._ui_booted = False
         self._classic_used = False  # guard: don't mix classic + modern graph state
@@ -315,19 +316,66 @@ class ScreenClient:
     # ---- session --------------------------------------------------------
 
     async def login(self) -> None:
+        """Classic SOAP Login (establishes the screen-API session + its cookie)."""
         await self._call(
             "Login",
             f"<tns:Login><tns:name>{escape(self.login_name)}</tns:name>"
             f"<tns:password>{escape(self.instance.password)}</tns:password></tns:Login>",
         )
         self._logged_in = True
+        self._cookie_session = False
+
+    async def _cookie_login(self) -> None:
+        """NON-SOAP cookie login via the contract endpoint POST /entity/auth/login.
+
+        Returns 204 + the ASP.NET forms-auth cookie (.ASPXAUTH + session), which
+        authorizes the MODERN /ui/screen/ plane exactly like the SOAP Login cookie
+        does — but works on instances where the classic SOAP screen API (Login op) is
+        DISABLED (e.g. csmdev: SOAP login off + OData 403, yet the browser's cookie
+        route works). Proven live 2026-07-06: /entity/auth/login {name,password,company}
+        -> 204 -> GET /t/<tenant>/ui/screen/PY101500/structure returned the descriptor.
+
+        NOTE the login SHAPE differs from SOAP: the contract login takes `company`
+        SEPARATELY (not name@tenant), which is required for tenants whose login name has
+        spaces (e.g. 'AI MPM'). Does NOT hold a Web Services API SOAP seat.
+        """
+        body: dict = {"name": self.instance.username, "password": self.instance.password}
+        if self.instance.tenant:
+            body["company"] = self.instance.tenant
+        if self.instance.branch:
+            body["branch"] = self.instance.branch
+        url = f"{self.instance.base_url.rstrip('/')}/entity/auth/login"
+        resp = await self._http.post(url, json=body,
+                                     headers={"Content-Type": "application/json"})
+        if resp.status_code not in (200, 204):
+            raise ScreenError(
+                f"cookie login (/entity/auth/login) failed: HTTP {resp.status_code} "
+                f"{resp.text[:200]}")
+        self._logged_in = True
+        self._cookie_session = True
+
+    async def _ensure_login(self) -> None:
+        """Establish a session for the MODERN plane. Tries classic SOAP Login first
+        (also required for classic ops + sets the same cookie), and on failure falls
+        back to the non-SOAP /entity/auth/login cookie — so modern-plane tools work even
+        where the SOAP screen API is disabled. No-op if already logged in either way."""
+        if self._logged_in:
+            return
+        try:
+            await self.login()
+        except Exception:  # noqa: BLE001 — SOAP login disabled/blocked; try cookie login
+            await self._cookie_login()
 
     async def logout(self) -> None:
         if not self._logged_in:
             return
         self._logged_in = False
         try:
-            await self._call("Logout", "<tns:Logout/>")
+            if self._cookie_session:
+                await self._http.post(
+                    f"{self.instance.base_url.rstrip('/')}/entity/auth/logout")
+            else:
+                await self._call("Logout", "<tns:Logout/>")
         except Exception:
             pass
 
@@ -431,8 +479,7 @@ class ScreenClient:
         per-session rule instead (each tool uses only classic OR only modern),
         with a best-effort re-bootstrap in _ui_post if the two ever interleave.
         """
-        if not self._logged_in:
-            await self.login()
+        await self._ensure_login()
         vp = {v: {} for v in (views or [])}
         await self._http.post(
             self.ui_url,
@@ -479,8 +526,7 @@ class ScreenClient:
         # login has run this session, self-authenticate rather than silently
         # bouncing to Login.aspx (which _ui_error would now flag, but self-healing
         # is cheaper than erroring on a recoverable state).
-        if not self._logged_in:
-            await self.login()
+        await self._ensure_login()
         # Ensure a graph exists (fallback bootstrap). Re-bootstrap if a classic SOAP
         # op ran since (the planes keep separate graph state — interleaving them in
         # one session can collide, e.g. a 409 on Save). Callers editing an existing
@@ -787,8 +833,7 @@ class ScreenClient:
         fields. Use it to discover what ui_set_field/ui_command can drive on any
         screen — no browser capture needed. Read-only GET (stateless, no bootstrap).
         """
-        if not self._logged_in:
-            await self.login()
+        await self._ensure_login()
         resp = await self._http.get(self.ui_url + "/structure", headers={"Accept": "application/json"})
         err = self._ui_error(resp)
         if err:
@@ -1226,8 +1271,7 @@ class ScreenClient:
         targets it (and the child's parent-link id is auto-filled server-side).
         parent=None → a top-level grid. (Proven: CA202000 CashAccount→ETDetails.)
         """
-        if not self._logged_in:
-            await self.login()
+        await self._ensure_login()
         if parent:
             pv = parent["view"]
             await self._http.post(self.ui_url, json={
@@ -1492,7 +1536,7 @@ class ScreenClient:
                                      "ui_delete_grid_row", parent)
 
     async def __aenter__(self) -> "ScreenClient":
-        await self.login()
+        await self._ensure_login()
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
