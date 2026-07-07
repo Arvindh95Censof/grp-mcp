@@ -1631,6 +1631,23 @@ def test_tree_triage_is_registered_tool():
     assert "tree_triage" in names
 
 
+def test_guide_names_every_registered_tool():
+    # guide() is the START-HERE router — every registered tool must be discoverable
+    # through it, or an agent leaning on guide alone can't find the tool (e.g. a poll
+    # companion like load_status/activate_features_status). Grow NOT_IN_GUIDE only for
+    # a tool deliberately excluded, with a reason.
+    import json as _json
+    NOT_IN_GUIDE: dict[str, str] = {
+        # (empty) — guide is expected to name all tools; add exclusions here with cause
+    }
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    blob = _json.dumps(server.guide())
+    missing = sorted(n for n in names if n not in blob and n not in NOT_IN_GUIDE)
+    assert not missing, (
+        f"tool(s) not referenced anywhere in guide() — add them to the right by_task "
+        f"bucket (or to NOT_IN_GUIDE with a reason): {missing}")
+
+
 def test_guide_and_setupmap_document_odata_role():
     # The OData v4 role prerequisite must be discoverable IN the MCP (guide +
     # get_setup_guidance), not only in the external Word doc.

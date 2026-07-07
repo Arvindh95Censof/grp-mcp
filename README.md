@@ -558,6 +558,14 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.48.2 — `guide` now names **every** registered tool (was 74/85). The 11 missing were
+companion/teardown/diagnostic tools (`load_status`, `activate_features_status`,
+`reset_calendar`, `delete_financial_year`, `delete_segmented_key`, `snapshot_entity`,
+`list_endpoints`, `screen_health`, `build_company_tree`, `generate_endpoint_entity`,
+`attach_file_to_provider`) — added to their task buckets, plus a new "org structure / trees /
+approvals" bucket. A coverage test now fails if any future tool isn't discoverable through
+`guide`.
+
 v0.48.1 — docs: the **OData v4 role prerequisite** is now surfaced inside the MCP itself —
 `guide` gains an `env_prerequisites.odata_v4_role` note (and the OData plane description says
 it), and `get_setup_guidance` carries a cross-cutting rule. Without OData access on the login
