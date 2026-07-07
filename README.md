@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.47 — **`tree_triage(screen_id)`** — answers "does this tree need Playwright, or is there
+an API path?" without manual probing. A tree's parent link is normally set only by clicking a
+node (no API), but a screen usually ships an alternative lever. This probes the target's
+`/structure` plus a site-map scan for a companion "Import ..." form and ranks the result
+API-first: **T1** grid+indent (this screen or a companion — e.g. Company Tree via EP204060),
+**T2** a settable Parent* field, **T3** a select-command tree (with the virtualized-tree caveat
+that killed EP204061's `MoveWorkGroup`), **T4** a companion Import screen, **T5** browser-only.
+Returns the tier, the evidence, and the recommended tool. Read-only. +3 tests (135 total).
+
 v0.46 — **seat-leak fix.** Shared UI-plane cookie sessions are marked `_shared` so nobody
 logs them out on close (the cache owns them) — but the only disposal path,
 `clear_session_cache`, merely dropped the local dict entry, leaving the ASP.NET forms-auth

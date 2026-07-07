@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -1336,6 +1337,162 @@ async def screen_capabilities(screen_id: str, instance: str | None = None) -> An
     return {"screen_id": screen_id.upper(), "primary_dac": struct.get("primary_dac"),
             "grids": {g: gd.get("key_fields") for g, gd in grids.items()},
             "actions": actions, "selector_fields": selectors, "recommendations": recs}
+
+
+# Verbs that reshape a hierarchy (indent/outdent) — NOT reorder (Up/Down move a sibling
+# within its level and don't change the parent, so they don't make a tree drivable).
+_INDENT_ACTION_WORDS = ("indent", "outdent", "promote", "demote")
+_INDENT_ACTION_EXACT = ("left", "right")  # Left/Right == outdent/indent on tree grids
+_PARENT_FIELD_RE = re.compile(r"parent", re.I)
+
+
+def _indent_actions(action_names: list[str]) -> list[str]:
+    out = []
+    for a in action_names:
+        al = a.lower()
+        if al in _INDENT_ACTION_EXACT or any(w in al for w in _INDENT_ACTION_WORDS):
+            out.append(a)
+    return out
+
+
+def _parent_fields(struct: dict) -> list[str]:
+    """Grid columns or view fields that look like a settable parent link."""
+    hits = set()
+    for g, gd in (struct.get("grids") or {}).items():
+        for c in (gd.get("columns") or []):
+            if _PARENT_FIELD_RE.search(c):
+                hits.add(f"{g}.{c}")
+    for v, fs in (struct.get("views") or {}).items():
+        for f in fs:
+            fld = f.get("field", "")
+            if _PARENT_FIELD_RE.search(fld) and not f.get("readonly"):
+                hits.add(f"{v}.{fld}")
+    return sorted(hits)
+
+
+@mcp.tool()
+async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
+    """Diagnose HOW (if at all) a hierarchical/tree screen can be built via API — which
+    known "tree lever" it exposes, ranked API-first, browser last. Answers "do I need
+    Playwright for this tree, or is there an API path?" without manual probing.
+
+    A tree control's parent link is normally set ONLY by clicking a node, which no API
+    reproduces. But a given screen usually ships an alternative lever; this probes for
+    all of them (the target screen's /structure + a scan of the site map for a companion
+    "Import ..." form) and returns the best tier found:
+
+      TIER 1  grid+indent   — a real grid + Left/Right (indent/outdent) actions, on THIS
+                              screen OR a companion "Import ..." form. Drivable via
+                              ui_insert_grid_row + ui_screen_action("Right")xdepth. BEST.
+                              (Company Tree: dead on EP204061, drivable on EP204060.)
+      TIER 2  parent-field  — a grid/view row carries a settable Parent* field; set it
+                              directly on ui_insert_grid_row. Pure API.
+      TIER 3  select-cmd    — a tree with a working node-select command (ui_screen_action
+                              tree_select / ui_tree_dialog_insert; e.g. SM207060). CAVEAT:
+                              fails if the tree is VIRTUALIZED (only the root node
+                              materializes) — selection then null-refs (proven live on
+                              EP204061 MoveWorkGroup). Verify with ui_read_grid(tree).
+      TIER 4  import        — a companion "Import ..." screen exists (may load a flat file
+                              with a parent column) even without indent actions.
+      TIER 5  browser-only  — no API lever found; last resort is Playwright/kapture.
+
+    Returns {screen_id, title, best_tier, verdict, levers:{...evidence...},
+    recommended_tool}. Read-only (probes /structure + SiteMap; holds one shared seat).
+    Advisory — confirm the live path with a small write before trusting it at scale.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    # Target screen structure (the screen the caller named).
+    async with ScreenClient(inst, sid) as s:
+        struct = await s.get_ui_structure()
+    actions = [a["name"] for a in struct.get("actions") or []]
+    grids = struct.get("grids") or {}
+    self_indent = _indent_actions(actions)
+    parent_flds = _parent_fields(struct)
+    # A move/reparent action paired with a parent-ish target field hints a select-command
+    # tree (TIER 3) — but node-selection may hit the virtualized-tree wall.
+    move_actions = [a for a in actions if "move" in a.lower()]
+
+    # Companion "Import ..." screens: scan the site map for a form whose title says
+    # "Import" and shares a keyword with this screen's title, then probe it for indent
+    # actions (TIER 1 companion) — this is exactly how EP204060 rescues EP204061.
+    client = _client(instance)
+    smap = await client.run_dac("SiteMap", {"$select": "ScreenID,Title", "$top": 5000})
+    rows = smap.get("value", []) if isinstance(smap, dict) else []
+    title = next((r.get("Title") for r in rows
+                  if (r.get("ScreenID") or "").upper() == sid), None)
+    tokens = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", title or "")
+              } - {"import", "maintenance", "form", "preferences"}
+    candidates = []
+    for r in rows:
+        t = (r.get("Title") or "")
+        cid = (r.get("ScreenID") or "").upper()
+        if cid == sid or "import" not in t.lower():
+            continue
+        if tokens & {w.lower() for w in re.findall(r"[A-Za-z]{4,}", t)}:
+            candidates.append({"ScreenID": cid, "Title": t})
+    candidates = candidates[:5]
+    companion_indent = []
+    for c in candidates:
+        try:
+            async with ScreenClient(inst, c["ScreenID"]) as cs:
+                cstruct = await cs.get_ui_structure()
+            ind = _indent_actions([a["name"] for a in cstruct.get("actions") or []])
+            entry = {"screen_id": c["ScreenID"], "title": c["Title"],
+                     "indent_actions": ind,
+                     "grids": sorted((cstruct.get("grids") or {}).keys())}
+            companion_indent.append(entry)
+        except Exception as e:  # noqa: BLE001 — a companion may 403/err; note and move on
+            companion_indent.append({"screen_id": c["ScreenID"], "title": c["Title"],
+                                     "error": str(e)[:120]})
+
+    companion_with_indent = [c for c in companion_indent if c.get("indent_actions")]
+
+    # Rank: pick the highest (lowest-number) tier with evidence.
+    if self_indent:
+        tier, verdict, tool = (1,
+            f"TIER 1 — this screen exposes indent actions {self_indent}; drive it directly.",
+            f"ui_insert_grid_row(grid) + ui_screen_action('{self_indent[0]}')xdepth + Save")
+    elif companion_with_indent:
+        c = companion_with_indent[0]
+        tier, verdict, tool = (1,
+            f"TIER 1 — companion '{c['title']}' ({c['screen_id']}) exposes indent "
+            f"{c['indent_actions']}; build on THAT screen, not {sid}.",
+            f"ui_insert_grid_row('{(c['grids'] or ['<grid>'])[0]}' on {c['screen_id']}) "
+            f"+ ui_screen_action('{c['indent_actions'][0]}')xdepth + Save "
+            f"(see build_company_tree for the pattern)")
+    elif parent_flds:
+        tier, verdict, tool = (2,
+            f"TIER 2 — a settable parent field is present ({parent_flds}); set it on insert.",
+            "ui_insert_grid_row(grid, values={... parent field ...})")
+    elif move_actions and parent_flds is not None and (move_actions or self_indent):
+        tier, verdict, tool = (3,
+            f"TIER 3 — move/reparent action(s) {move_actions} suggest a select-command tree. "
+            f"CAVEAT: check ui_read_grid(tree) first — if only the root row returns, the tree "
+            f"is virtualized and node-selection will null-ref (dead, like EP204061).",
+            "ui_screen_action(tree_select=..., action=<move>) OR ui_tree_dialog_insert")
+    elif candidates:
+        tier, verdict, tool = (4,
+            f"TIER 4 — companion Import screen(s) exist "
+            f"({', '.join(c['screen_id'] for c in companion_indent)}) but without indent "
+            f"actions; they may still load a flat file with a parent column.",
+            "run_import_scenario / load_from_excel into the companion screen")
+    else:
+        tier, verdict, tool = (5,
+            "TIER 5 — no API lever found (no indent actions, no parent field, no move "
+            "action, no companion Import screen). Last resort is browser automation.",
+            "Playwright / kapture (browser) — no API path detected")
+
+    return {
+        "screen_id": sid, "title": title, "best_tier": tier, "verdict": verdict,
+        "recommended_tool": tool,
+        "levers": {
+            "self_indent_actions": self_indent,
+            "parent_fields": parent_flds,
+            "move_actions": move_actions,
+            "companion_import_screens": companion_indent,
+        },
+    }
 
 
 @mcp.tool()

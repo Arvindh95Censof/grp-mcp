@@ -1596,6 +1596,41 @@ def test_logout_session_cache_best_effort_on_failure(monkeypatch):
     assert key not in scr._SESSION_CACHE      # and still dropped
 
 
+# ---- v0.47: tree_triage ------------------------------------------------------
+
+def test_indent_actions_detects_indent_not_reorder():
+    from grp_mcp.server import _indent_actions
+    # Left/Right and indent/outdent/promote/demote count; Up/Down (reorder) do NOT.
+    acts = ["Save", "Up", "Down", "Left", "Right", "AddWorkGroup", "Indent", "Promote"]
+    got = _indent_actions(acts)
+    assert set(got) == {"Left", "Right", "Indent", "Promote"}
+    assert "Up" not in got and "Down" not in got
+
+
+def test_parent_fields_finds_settable_parent_link():
+    from grp_mcp.server import _parent_fields
+    struct = {
+        "grids": {"Nodes": {"columns": ["NodeID", "ParentID", "Description"]}},
+        "views": {
+            "Header": [
+                {"field": "ParentGroupID", "readonly": False},
+                {"field": "ReadOnlyParent", "readonly": True},   # read-only -> ignored
+                {"field": "Name", "readonly": False},
+            ]
+        },
+    }
+    got = _parent_fields(struct)
+    assert "Nodes.ParentID" in got
+    assert "Header.ParentGroupID" in got
+    assert "Header.ReadOnlyParent" not in got   # read-only parent isn't settable
+    assert "Nodes.NodeID" not in got
+
+
+def test_tree_triage_is_registered_tool():
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert "tree_triage" in names
+
+
 def test_flatten_tree_preorder_depths():
     f = server._flatten_tree
     struct = [{"name": "R", "children": [
