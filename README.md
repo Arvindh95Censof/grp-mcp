@@ -558,6 +558,12 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.48.1 — docs: the **OData v4 role prerequisite** is now surfaced inside the MCP itself —
+`guide` gains an `env_prerequisites.odata_v4_role` note (and the OData plane description says
+it), and `get_setup_guidance` carries a cross-cutting rule. Without OData access on the login
+account the DAC-based OData v4 interface 403s and all probing fails (`run_dac_odata`,
+`get_dac_metadata`, `tree_triage`, DAC-metadata screen checks); contract REST is unaffected.
+
 v0.48 — **full-codebase audit: 8 findings, all fixed.**
 - 🔴 **`activate_features` was not a registered tool since v0.43.1** — that release
   removed the stolen decorator from a helper instead of restoring it to its owner. Restored;

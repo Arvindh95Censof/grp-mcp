@@ -1631,6 +1631,17 @@ def test_tree_triage_is_registered_tool():
     assert "tree_triage" in names
 
 
+def test_guide_and_setupmap_document_odata_role():
+    # The OData v4 role prerequisite must be discoverable IN the MCP (guide +
+    # get_setup_guidance), not only in the external Word doc.
+    g = server.guide()
+    assert "odata_v4_role" in g.get("env_prerequisites", {})
+    assert "OData v4" in g["env_prerequisites"]["odata_v4_role"]
+    assert "OData v4" in g["the_four_planes"]["DAC / GI OData (raw read)"]
+    ids = {r["id"] for r in server._setup_map()["cross_cutting_rules"]}
+    assert "odata-v4-role-required-for-probing" in ids
+
+
 # ---- v0.48 audit fixes -------------------------------------------------------
 
 def test_save_config_excludes_session_only(tmp_path):

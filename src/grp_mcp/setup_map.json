@@ -7,6 +7,10 @@
   },
   "cross_cutting_rules": [
     {
+      "id": "odata-v4-role-required-for-probing",
+      "rule": "The login account MUST have OData access (the 'OData v4' role — Acumatica Users SM201010 -> User Roles; roles at SM201005). Without it the DAC-based OData v4 interface 403s, so ALL probing fails: run_dac_odata, get_dac_metadata, tree_triage, setup_readiness's DAC checks, and screen_preflight's mandatory-field lookup. Contract REST read/write is unaffected. A 403 on a probe with otherwise-valid credentials = check this role first."
+    },
+    {
       "id": "numbering-gates-prefs",
       "rule": "Numbering sequences (CS201010) gate EVERY module Preferences form. GL/AP/AR/CA Prefs mark specific numbering IDs required and won't Save without them. Seeded datasets have the predefined set; a bare tenant needs them created first."
     },

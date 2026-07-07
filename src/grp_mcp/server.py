@@ -4294,8 +4294,23 @@ _GUIDE = {
         "get_setup_guidance for financial-foundation setup. Golden rules: (a) KB-FIRST "
         "before any write (search_kb/read_kb_file for the screen's prerequisites); "
         "(b) a clean ok is NOT proof — read back (run_dac_odata/screen_get/get_entity); "
-        "(c) writes need allow_write, deletes allow_delete, publish allow_publish."
+        "(c) writes need allow_write, deletes allow_delete, publish allow_publish. "
+        "NOTE env_prerequisites below — the OData plane needs the OData v4 role or it 403s."
     ),
+    "env_prerequisites": {
+        "odata_v4_role": (
+            "The login account MUST have OData access (the 'OData v4' role — Acumatica "
+            "Users SM201010 -> User Roles; roles managed at SM201005). WITHOUT it the "
+            "DAC-based OData v4 interface returns HTTP 403, so all PROBING fails: "
+            "run_dac_odata, get_dac_metadata, tree_triage, and any screen check that reads "
+            "DAC metadata. Contract-REST read/write is unaffected. If a probe 403s and "
+            "credentials are otherwise valid, this role is the first thing to check."
+        ),
+        "api_seats": (
+            "A trial license allows only 2 concurrent Web Services API users. On "
+            "'API Login Limit', call release_sessions (the server also self-heals once)."
+        ),
+    },
     "the_four_planes": {
         "contract REST (entities)": "the endpoint's typed entities — default for CRUD on "
             "anything on the endpoint. Tools: get_entity, fetch_all_entities, "
@@ -4304,7 +4319,10 @@ _GUIDE = {
         "DAC / GI OData (raw read)": "read tables/inquiries the endpoint doesn't expose. "
             "Tools: run_dac_odata (any DAC incl. config singletons), get_dac_metadata "
             "(mandatory-field discovery), run_generic_inquiry, list_dacs, "
-            "list_generic_inquiries. Read-only.",
+            "list_generic_inquiries. Read-only. REQUIRES the login account to have OData "
+            "access (the 'OData v4' role, Users/SM201010) — without it this whole plane "
+            "403s and probing tools (incl. get_dac_metadata, tree_triage, screen "
+            "DAC-metadata checks) fail; contract REST still works. See env_prerequisites.",
         "classic screen SOAP": "drive a SCREEN the REST API can't (context / master-detail "
             "/ wizard screens). Tools: screen_get, screen_get_schema, screen_submit, "
             "screen_record, screen_insert_rows, screen_preflight. Uses FRIENDLY "
