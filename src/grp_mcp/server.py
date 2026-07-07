@@ -1370,6 +1370,23 @@ def _parent_fields(struct: dict) -> list[str]:
     return sorted(hits)
 
 
+def _indent_pref(indent_actions: list[str]) -> str:
+    """Pick the INDENT (nest-deeper) verb — the one that reparents a node under its
+    preceding sibling. Left/Outdent/Promote go shallower, so prefer Right/Indent/Demote."""
+    for p in ("Right", "Indent", "Demote"):
+        if p in indent_actions:
+            return p
+    return indent_actions[0] if indent_actions else "Right"
+
+
+def _list_grid_guess(grid_names: list[str]) -> str:
+    """Best guess at the flat 'list of nodes' grid to INSERT into — i.e. not the tree
+    control itself, not a members/detail grid. (EP204060: Folders=tree, Members=detail,
+    so this lands on Items — the correct insert grid.)"""
+    prefer = [g for g in grid_names if not re.search(r"tree|folder|member", g, re.I)]
+    return prefer[0] if prefer else (grid_names[0] if grid_names else "<grid>")
+
+
 @mcp.tool()
 async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
     """Diagnose HOW (if at all) a hierarchical/tree screen can be built via API — which
@@ -1409,8 +1426,13 @@ async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
     grids = struct.get("grids") or {}
     self_indent = _indent_actions(actions)
     parent_flds = _parent_fields(struct)
-    # A move/reparent action paired with a parent-ish target field hints a select-command
-    # tree (TIER 3) — but node-selection may hit the virtualized-tree wall.
+    # Select-command tree (TIER 3) signals: a grid rendered as a TREE (name carries
+    # "tree", e.g. SM207060 EntityTree) and/or node-scoped actions (InsertNew/DeleteNode
+    # or anything with "node"/"move"). Node-selection may still hit the virtualized-tree
+    # wall, so this is a candidate to VERIFY, not a guarantee.
+    tree_grids = [g for g in grids if re.search(r"tree", g, re.I)]
+    node_actions = [a for a in actions
+                    if re.search(r"node", a, re.I) or "move" in a.lower()]
     move_actions = [a for a in actions if "move" in a.lower()]
 
     # Companion "Import ..." screens: scan the site map for a form whose title says
@@ -1450,27 +1472,40 @@ async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
 
     # Rank: pick the highest (lowest-number) tier with evidence.
     if self_indent:
+        act = _indent_pref(self_indent)
+        grid = _list_grid_guess(list(grids))
         tier, verdict, tool = (1,
             f"TIER 1 — this screen exposes indent actions {self_indent}; drive it directly.",
-            f"ui_insert_grid_row(grid) + ui_screen_action('{self_indent[0]}')xdepth + Save")
+            f"ui_insert_grid_row('{grid}') + ui_screen_action('{act}')xdepth + Save "
+            f"('{act}' nests the just-inserted node under its preceding sibling)")
     elif companion_with_indent:
         c = companion_with_indent[0]
+        act = _indent_pref(c["indent_actions"])
+        grid = _list_grid_guess(c.get("grids") or [])
         tier, verdict, tool = (1,
             f"TIER 1 — companion '{c['title']}' ({c['screen_id']}) exposes indent "
             f"{c['indent_actions']}; build on THAT screen, not {sid}.",
-            f"ui_insert_grid_row('{(c['grids'] or ['<grid>'])[0]}' on {c['screen_id']}) "
-            f"+ ui_screen_action('{c['indent_actions'][0]}')xdepth + Save "
-            f"(see build_company_tree for the pattern)")
+            f"ui_insert_grid_row('{grid}' on {c['screen_id']}) "
+            f"+ ui_screen_action('{act}')xdepth + Save "
+            f"(for the Company Tree just call build_company_tree)")
     elif parent_flds:
         tier, verdict, tool = (2,
             f"TIER 2 — a settable parent field is present ({parent_flds}); set it on insert.",
             "ui_insert_grid_row(grid, values={... parent field ...})")
-    elif move_actions and parent_flds is not None and (move_actions or self_indent):
+    elif tree_grids or node_actions:
+        why = []
+        if tree_grids:
+            why.append(f"tree grid(s) {tree_grids}")
+        if node_actions:
+            why.append(f"node action(s) {node_actions}")
+        tv = tree_grids[0] if tree_grids else "<tree_view>"
         tier, verdict, tool = (3,
-            f"TIER 3 — move/reparent action(s) {move_actions} suggest a select-command tree. "
-            f"CAVEAT: check ui_read_grid(tree) first — if only the root row returns, the tree "
-            f"is virtualized and node-selection will null-ref (dead, like EP204061).",
-            "ui_screen_action(tree_select=..., action=<move>) OR ui_tree_dialog_insert")
+            f"TIER 3 — {' + '.join(why)} indicate a select-command tree (drivable via the "
+            f"modern plane's node-select, like SM207060). CAVEAT: run ui_read_grid('{tv}') "
+            f"first — if only the ROOT row returns, the tree is virtualized and node-select "
+            f"null-refs (dead, as EP204061's Folders proved). Verify before trusting.",
+            f"ui_tree_dialog_insert(tree_view='{tv}', ...) OR "
+            f"ui_screen_action(tree_select={{'view':'{tv}',...}}, action=...)")
     elif candidates:
         tier, verdict, tool = (4,
             f"TIER 4 — companion Import screen(s) exist "
@@ -1479,8 +1514,9 @@ async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
             "run_import_scenario / load_from_excel into the companion screen")
     else:
         tier, verdict, tool = (5,
-            "TIER 5 — no API lever found (no indent actions, no parent field, no move "
-            "action, no companion Import screen). Last resort is browser automation.",
+            "TIER 5 — no API lever auto-detected (no indent actions, no parent field, no "
+            "tree/node action, no companion Import screen). Likely browser-only — but "
+            "manually confirm there's no tree+insert-dialog before falling back.",
             "Playwright / kapture (browser) — no API path detected")
 
     return {
@@ -1489,7 +1525,10 @@ async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
         "levers": {
             "self_indent_actions": self_indent,
             "parent_fields": parent_flds,
+            "tree_grids": tree_grids,
+            "node_actions": node_actions,
             "move_actions": move_actions,
+            "target_grids": sorted(grids.keys()),
             "companion_import_screens": companion_indent,
         },
     }

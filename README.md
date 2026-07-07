@@ -558,6 +558,13 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.47.1 — `tree_triage` bugfix caught by its own live test: the select-command tree case
+(T3) now keys on a **tree grid** (name carries "tree", e.g. SM207060 `EntityTree`) and
+node-scoped actions (`InsertNew`/`DeleteNode`), not just a "move" action — so SM207060 no
+longer mis-reports as browser-only (it's drivable via `ui_tree_dialog_insert`). The T1 hint
+also now names the correct **indent verb** (`Right`, nest-deeper — not `Left`) and the correct
+**insert grid** (skips the tree/members grids → `Items`, not `Folders`). +2 tests (137 total).
+
 v0.47 — **`tree_triage(screen_id)`** — answers "does this tree need Playwright, or is there
 an API path?" without manual probing. A tree's parent link is normally set only by clicking a
 node (no API), but a screen usually ships an alternative lever. This probes the target's

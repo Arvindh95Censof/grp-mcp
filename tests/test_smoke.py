@@ -1631,6 +1631,21 @@ def test_tree_triage_is_registered_tool():
     assert "tree_triage" in names
 
 
+def test_indent_pref_prefers_indent_verb():
+    from grp_mcp.server import _indent_pref
+    assert _indent_pref(["Left", "Right"]) == "Right"      # Right = nest deeper
+    assert _indent_pref(["Left"]) == "Left"                # fall back to what's there
+    assert _indent_pref(["Outdent", "Indent"]) == "Indent"
+
+
+def test_list_grid_guess_skips_tree_and_members():
+    from grp_mcp.server import _list_grid_guess
+    # EP204060's grids — the insert target is Items, not the tree/detail grids.
+    assert _list_grid_guess(["Folders", "Items", "Members"]) == "Items"
+    assert _list_grid_guess(["EntityTree"]) == "EntityTree"   # nothing else -> use it
+    assert _list_grid_guess([]) == "<grid>"
+
+
 def test_flatten_tree_preorder_depths():
     f = server._flatten_tree
     struct = [{"name": "R", "children": [
