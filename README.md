@@ -558,6 +558,12 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.43.1 — bugfix: in 0.43.0 a helper (`_dedup_rows`) accidentally took `run_dac_odata`'s
+`@mcp.tool()` decorator, so **`run_dac_odata` was not exposed as a tool** on the 0.43.0
+release (and the internal `_activation_status` poller leaked as one). Both fixed; a
+tool-registration integrity test now guards against a decorator landing on the wrong
+`def`. No API changes. Upgrade from 0.43.0.
+
 v0.43 — 82 tools across four client planes (v0.43: a backlog batch from a live endpoint-build
 session. **CRITICAL — `publish_customization` no longer silently unpublishes.** Acumatica's
 publishBegin publishes EXACTLY the set you pass (dropping everything else); the tool now reads

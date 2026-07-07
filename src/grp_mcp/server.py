@@ -2467,7 +2467,6 @@ async def enable_features(
     return {"staged": staged, "activated": activated}
 
 
-@mcp.tool()
 async def _activation_status(inst, poll_interval: float, budget: float) -> str | None:
     """Poll CS100000 ActivationStatus for up to `budget` seconds, tolerating the
     transient errors the site restart throws; return the last status seen (or
@@ -3739,7 +3738,6 @@ async def list_dacs(instance: str | None = None) -> Any:
     return await _client(instance).list_dacs()
 
 
-@mcp.tool()
 def _dedup_rows(rows: list) -> tuple[list, int]:
     """Collapse byte-identical duplicate rows (a DAC-OData paging artifact), order-
     preserving. Returns (unique_rows, removed_count)."""
@@ -3757,6 +3755,7 @@ def _dedup_rows(rows: list) -> tuple[list, int]:
     return unique, len(rows) - len(unique)
 
 
+@mcp.tool()
 async def run_dac_odata(
     dac: str,
     filter: str | None = None,

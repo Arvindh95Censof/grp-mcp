@@ -1543,3 +1543,21 @@ def test_edm_to_valuetype_mapping():
     assert f("Int32") == "IntValue"
     assert f("DateTime") == "DateTimeValue"
     assert f("WeirdType") == "StringValue"   # safe default
+
+
+# ---- tool-registration integrity (guards the decorator-on-helper bug) --------
+
+def test_tool_registration_integrity():
+    tools = asyncio.run(server.mcp.list_tools())
+    names = {t.name for t in tools}
+    # every real tool must be registered
+    for must in ("run_dac_odata", "publish_customization", "screen_health",
+                 "generate_endpoint_entity", "list_published", "get_endpoint_definition"):
+        assert must in names, f"{must} is not a registered MCP tool"
+    # module-private helpers must NOT leak as tools (a @mcp.tool() landing on the wrong
+    # def steals the tool's decorator — how run_dac_odata briefly de-registered)
+    for helper in ("_dedup_rows", "_published_project_names", "_activation_status",
+                   "_edm_to_valuetype"):
+        assert helper not in names, f"internal helper {helper} wrongly exposed as a tool"
+    # belt-and-suspenders: no underscore-prefixed tool names at all
+    assert not [n for n in names if n.startswith("_")]
