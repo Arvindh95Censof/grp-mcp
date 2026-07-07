@@ -1631,6 +1631,43 @@ def test_tree_triage_is_registered_tool():
     assert "tree_triage" in names
 
 
+def test_reframe_ui_validation_is_actionable():
+    # A screen business-rule rejection must read as "fixable — supply field + retry",
+    # NOT as "this screen can't be set up".
+    from grp_mcp.server import _reframe_ui_validation, _flagged_field_names, _UI_VALIDATION_PAT
+    struct = {"views": {"CurrentCompany": [
+        {"field": "CashAcctID", "required": True, "readonly": False},
+        {"field": "BranchID", "required": True, "readonly": True},   # readonly -> not askable
+        {"field": "RetirementAge", "required": False, "readonly": False},
+    ]}}
+    out = _reframe_ui_validation("PY301000", "Save",
+                                 "ui_command Save on PY301000: PCB Pay Code can not be empty.",
+                                 struct)
+    assert out["ok"] is False and out["status"] == "validation_failed"
+    assert out["reachable"] is True and out["writable"] is True
+    assert "PCB Pay Code" in out["flagged_fields"]
+    assert "CurrentCompany.CashAcctID" in out["required_fields"]
+    assert "CurrentCompany.BranchID" not in out["required_fields"]   # readonly excluded
+    assert "not a 'cannot set up'" in out["guidance"].lower()
+    # the classifier recognizes the common phrasings, and ignores unrelated errors
+    assert _UI_VALIDATION_PAT.search("Field X is required")
+    assert _UI_VALIDATION_PAT.search("PREREQUISITE NOT MET — configure ARSetup")
+    assert not _UI_VALIDATION_PAT.search("Object reference not set to an instance")
+
+
+def test_flagged_field_names_parsing():
+    from grp_mcp.server import _flagged_field_names
+    assert _flagged_field_names("PCB Pay Code can not be empty") == ["PCB Pay Code"]
+    assert "Cash Account" in _flagged_field_names("'Cash Account' is required")
+
+
+def test_guide_teaches_validation_is_not_dead_end():
+    g = server.guide()
+    assert "can't be set up" in g["start_here"] or "can't be driven" in g["start_here"] \
+        or "not a 'this screen" in g["start_here"].lower()
+    assert "validation error" in g["start_here"].lower()
+
+
 def test_guide_names_every_registered_tool():
     # guide() is the START-HERE router — every registered tool must be discoverable
     # through it, or an agent leaning on guide alone can't find the tool (e.g. a poll

@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.48.3 — **"can't set up" false-negative fix.** A screen business-rule rejection on a modern
+Save (e.g. `PCB Pay Code can not be empty`) used to raise a bare error string, which an agent
+reads as "this screen can't be driven" and gives up — when it actually proves the screen IS
+reachable and writable (the write reached Acumatica's validation). `ui_screen_action` now
+returns an **actionable** result instead: `{ok:false, status:"validation_failed",
+reachable:true, writable:true, message, flagged_fields, required_fields, guidance}` telling the
+agent to supply the missing field(s) and retry. `guide` gains golden rule (d): a validation /
+`PREREQUISITE NOT MET` error is a fixable prerequisite, not a dead end. +3 tests (152 total).
+
 v0.48.2 — `guide` now names **every** registered tool (was 74/85). The 11 missing were
 companion/teardown/diagnostic tools (`load_status`, `activate_features_status`,
 `reset_calendar`, `delete_financial_year`, `delete_segmented_key`, `snapshot_entity`,

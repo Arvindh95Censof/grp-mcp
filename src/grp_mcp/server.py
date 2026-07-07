@@ -297,6 +297,69 @@ def _oq(v: Any) -> str:
     return str(v).replace("'", "''")
 
 
+# A screen's own business-rule rejection (missing required field, unconfigured module).
+# It means the screen IS reachable and the write WAS evaluated — the OPPOSITE of "can't
+# be driven" — so we must reframe it as an actionable prerequisite, not a dead end, or an
+# agent reads "PCB Pay Code can not be empty" as "this screen can't be set up" and gives up.
+_UI_VALIDATION_PAT = re.compile(
+    r"can ?not be empty|cannot be empty|is required|must be (?:set|specified|entered|filled|"
+    r"selected|greater|less|equal)|enter a value|please (?:enter|specify|select)|"
+    r"required field|PREREQUISITE NOT MET|does not exist|is not valid|invalid value",
+    re.I,
+)
+
+
+def _flagged_field_names(msg: str) -> list[str]:
+    """Best-effort: pull the field label(s) a validation message names."""
+    out: list[str] = []
+    for pat in (
+        r"([A-Za-z][\w .()/&%-]{1,48}?)\s+can ?not be empty",
+        r"([A-Za-z][\w .()/&%-]{1,48}?)\s+is required",
+        r"'([^']{1,60})'\s+(?:is required|can ?not be empty)",
+    ):
+        for m in re.finditer(pat, msg or "", re.I):
+            out.append((m.group(1) or "").strip())
+    seen: set[str] = set()
+    dedup = []
+    for f in out:
+        if f and f.lower() not in seen:
+            seen.add(f.lower())
+            dedup.append(f)
+    return dedup
+
+
+def _reframe_ui_validation(screen_id: str, action: str, msg: str, struct: dict) -> dict:
+    """Turn a screen business-rule/validation ScreenError into an ACTIONABLE result.
+
+    Distinguishes 'this screen can't be driven' (a real dead end) from 'the write went
+    through and Acumatica wants a required value' (fixable — supply it and retry)."""
+    required = sorted(
+        f"{v}.{f['field']}"
+        for v, fs in (struct.get("views") or {}).items()
+        for f in fs
+        if f.get("required") and not f.get("readonly")
+    )
+    return {
+        "screen_id": screen_id.upper(),
+        "action": action,
+        "ok": False,
+        "status": "validation_failed",
+        "reachable": True,
+        "writable": True,
+        "message": msg,
+        "flagged_fields": _flagged_field_names(msg),
+        "required_fields": required,
+        "guidance": (
+            "This is NOT a 'cannot set up' condition. The screen is REACHABLE and the write "
+            "WAS accepted and evaluated by Acumatica's own business rules — a required value "
+            "is missing/invalid (or a module prerequisite isn't met). Supply the flagged "
+            "field(s), plus any required_fields still empty, in set_fields and retry the SAME "
+            "action. Read current values with screen_get/run_dac_odata; consult kb-mcp for the "
+            "correct value if unsure. Do NOT conclude the screen is un-drivable."
+        ),
+    }
+
+
 def _require_range(name: str, value: Any, lo: float, hi: float) -> None:
     """Validate a numeric argument is within [lo, hi]; raise ValueError otherwise."""
     if value is None:
@@ -1648,10 +1711,14 @@ async def ui_screen_action(
         asking (useful when an action raises an UNEXPECTED secondary dialog you
         don't want blindly confirmed) and re-fire with an explicit answer.
 
-    Business/validation errors surface as clear messages (the screen's own
-    `messages[]`), not opaque HTTP codes. PRECONDITION (KB-first policy): consult
-    kb-mcp for the screen's prerequisites first — an unconfigured module returns
-    "PREREQUISITE NOT MET". Requires allow_write; a DESTRUCTIVE action (Delete,
+    Business/validation errors are returned as an ACTIONABLE result, not raised:
+    {ok:false, status:"validation_failed", reachable:true, writable:true, message,
+    flagged_fields, required_fields, guidance}. This is deliberate — a rejection like
+    "PCB Pay Code can not be empty" proves the screen IS reachable and writable (the
+    write reached Acumatica's business rules); it means "supply the missing field and
+    retry", NOT "this screen can't be set up". Fill the flagged/required fields and
+    re-call. PRECONDITION (KB-first policy): consult kb-mcp for the screen's
+    prerequisites first — an unconfigured module returns "PREREQUISITE NOT MET". Requires allow_write; a DESTRUCTIVE action (Delete,
     ...) additionally requires allow_delete. Only FORM-view fields are supported;
     grid-cell edits aren't yet (no per-row addressing). Verify the write with
     ui_get_structure, screen_get, or run_dac_odata.
@@ -1738,7 +1805,18 @@ async def ui_screen_action(
                                          tree_select.get("parent_key"))
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
-        result = await s.ui_command(action, answer=dialog_answer)
+        try:
+            result = await s.ui_command(action, answer=dialog_answer)
+        except ScreenError as e:
+            # A business-rule/validation rejection here proves the screen IS reachable &
+            # writable (auth+gate+plane passed and Acumatica evaluated the record). Reframe
+            # it as an actionable prerequisite so an agent supplies the missing field and
+            # retries, instead of reading a raw "X can not be empty" as "can't set up".
+            # Genuine non-validation failures still propagate as errors.
+            msg = str(e)
+            if _UI_VALIDATION_PAT.search(msg):
+                return _reframe_ui_validation(screen_id, action, msg, struct)
+            raise
         if isinstance(result, dict) and result.get("dialog_open"):
             # dialog_answer="none": surface the unanswered dialog instead of a result
             return {"screen_id": screen_id.upper(), "action": action, "ok": None,
@@ -4294,7 +4372,12 @@ _GUIDE = {
         "get_setup_guidance for financial-foundation setup. Golden rules: (a) KB-FIRST "
         "before any write (search_kb/read_kb_file for the screen's prerequisites); "
         "(b) a clean ok is NOT proof — read back (run_dac_odata/screen_get/get_entity); "
-        "(c) writes need allow_write, deletes allow_delete, publish allow_publish. "
+        "(c) writes need allow_write, deletes allow_delete, publish allow_publish; "
+        "(d) a screen VALIDATION error ('X can not be empty', 'X is required', "
+        "'PREREQUISITE NOT MET') means the screen IS reachable and writable — the write "
+        "was evaluated by Acumatica's rules and a required value is missing. Supply the "
+        "field(s) and RETRY; it is NOT a 'this screen can't be set up' verdict. Use "
+        "screen_health(screen_id) to confirm reachability if unsure. "
         "NOTE env_prerequisites below — the OData plane needs the OData v4 role or it 403s."
     ),
     "env_prerequisites": {
