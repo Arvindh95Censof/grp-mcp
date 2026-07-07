@@ -2658,7 +2658,17 @@ async def screen_health(screen_id: str, instance: str | None = None) -> Any:
             planes["cp_published"] = {"ok": True,
                                       "projects": _published_project_names(await c.get_published())}
     except Exception as e:  # noqa: BLE001
-        planes["cp_published"] = {"ok": False, "error": str(e)[:200]}
+        emsg = str(e)[:200]
+        entry = {"ok": False, "error": emsg}
+        if "403" in emsg or "forbidden" in emsg.lower():
+            # NON-FATAL: the customization-LIST API (getPublished) is a separate permission.
+            # A 403 here does NOT mean the screen's CP is unpublished or the screen is dead —
+            # agents misread it as "no access" and give up (observed). Trust modern_ui /
+            # soap_getschema for the actual reachability verdict.
+            entry["note"] = ("NON-FATAL — the customization-list API (getPublished) denied "
+                             "access; this does NOT indicate the screen is unpublished or "
+                             "unreachable. Judge reachability from modern_ui / soap_getschema.")
+        planes["cp_published"] = entry
 
     # infer the most likely root cause
     m_ok = planes.get("modern_ui", {}).get("ok")
@@ -2711,7 +2721,7 @@ async def whoami(instance: str | None = None) -> Any:
         entity_count = len((rec.get("paths") or {})) if isinstance(rec, dict) else None
     except Exception as e:  # noqa: BLE001
         ok, detail = False, str(e)[:200]
-    return {
+    out = {
         "instance": name,
         "username": inst.username,
         "login_name_screen_api": f"{inst.username}@{inst.tenant}" if inst.tenant else inst.username,
@@ -2719,10 +2729,24 @@ async def whoami(instance: str | None = None) -> Any:
         "base_url": inst.base_url,
         "endpoint": f"{inst.endpoint_name}/{inst.endpoint_version}",
         "reachable": ok,
+        # `reachable` probes the CONTRACT-REST endpoint (swagger.json) ONLY. The screen
+        # SOAP + modern-UI planes are independent — a custom/undeployed endpoint 404s here
+        # while those planes work fine (proven live: csmdev CSPY payroll). Without this
+        # scope note, agents read reachable:false as "instance dead" and give up (observed).
+        "reachable_scope": "contract-REST endpoint (swagger.json) only — screen SOAP and "
+                           "modern-UI planes are independent and may work even when false",
         "error": detail,
         "cached_sessions_holding_seats": list(_clients.keys()),
         "note": "Free seats with release_sessions (trial = 2 Web Services API Users).",
     }
+    if not ok:
+        out["hint"] = (
+            "reachable=false is the CONTRACT-REST plane ONLY. Do NOT conclude the instance "
+            "or a screen is unusable — screen SOAP (screen_get/screen_submit/screen_record) "
+            "and modern UI (ui_get_structure/ui_screen_action) frequently still work. Run "
+            "screen_health(screen_id) to probe every plane before giving up."
+        )
+    return out
 
 
 @mcp.tool()

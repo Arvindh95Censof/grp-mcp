@@ -558,6 +558,18 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.48.4 — **wrong-plane give-up hints** (informed by a live agent eval). Two capable agents,
+run against a custom-payroll instance, both succeeded but independently flagged the same
+give-up traps: `whoami → reachable:false` (+ REST `404 Endpoint not found`) reads as a *global*
+"instance dead" when it only tests the contract-REST plane, and `screen_health → cp_published
+403` reads as "no access" when it's just the customization-list permission. Fixes: `whoami`
+now carries `reachable_scope` ("contract-REST endpoint only…") + a `hint` (unreachable → run
+`screen_health`, screen SOAP/modern-UI planes are independent); the REST endpoint-404 is
+annotated at source (`get_swagger`) with the same plane note; `screen_health` labels a
+`cp_published` 403 as **NON-FATAL**. Router enforcement was considered and rejected — the eval
+showed agents already use the router (one router-first by instinct); the real fix is
+self-correcting error signals, not forcing a preflight. +2 tests (154 total).
+
 v0.48.3 — **"can't set up" false-negative fix.** A screen business-rule rejection on a modern
 Save (e.g. `PCB Pay Code can not be empty`) used to raise a bare error string, which an agent
 reads as "this screen can't be driven" and gives up — when it actually proves the screen IS

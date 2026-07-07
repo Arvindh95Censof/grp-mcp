@@ -1661,6 +1661,46 @@ def test_flagged_field_names_parsing():
     assert "Cash Account" in _flagged_field_names("'Cash Account' is required")
 
 
+def test_get_swagger_404_scopes_error_to_rest_plane(monkeypatch):
+    # A contract-REST endpoint 404 must NOT read as a hard dead end — it should say the
+    # screen SOAP / modern-UI planes are independent (the give-up trap the eval found).
+    from grp_mcp.acumatica import AcumaticaError
+    c = _acu("https://host/Site")
+
+    async def boom(method, url, **kw):
+        raise AcumaticaError(
+            "GET https://host/Site/entity/GRPSetup/24.200.001/swagger.json -> "
+            "404: Endpoint [GRPSetup/24.200.001] not found")
+
+    monkeypatch.setattr(c, "_request", boom)
+    try:
+        asyncio.run(c.get_swagger())
+        assert False, "should raise"
+    except AcumaticaError as e:
+        s = str(e)
+        assert "CONTRACT-REST endpoint only" in s
+        assert "screen_health" in s and "modern-UI" in s
+
+
+def test_whoami_scopes_reachability_and_hints(monkeypatch):
+    from grp_mcp.config import Config
+    cfg = Config(default="t", instances={"t": _inst()})
+    monkeypatch.setattr(server, "_cfg", lambda: cfg)
+    monkeypatch.setattr(server, "_clients", {})
+
+    class FakeClient:
+        async def get_swagger(self, refresh=False):
+            raise server.AcumaticaError(
+                "GET .../swagger.json -> 404: Endpoint [X/Y] not found")
+
+    monkeypatch.setattr(server, "_client", lambda instance=None: FakeClient())
+    out = asyncio.run(server.whoami())
+    assert out["reachable"] is False
+    assert "contract-REST" in out["reachable_scope"]          # scope always present
+    assert "screen_health" in out["hint"]                     # hint only when unreachable
+    assert "CONTRACT-REST plane ONLY" in out["hint"]
+
+
 def test_guide_teaches_validation_is_not_dead_end():
     g = server.guide()
     assert "can't be set up" in g["start_here"] or "can't be driven" in g["start_here"] \

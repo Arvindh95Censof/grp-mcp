@@ -307,7 +307,23 @@ class AcumaticaClient:
         """
         if self._swagger is None or refresh:
             url = f"{self.instance.entity_base}/swagger.json"
-            doc = await self._request("GET", url)
+            try:
+                doc = await self._request("GET", url)
+            except AcumaticaError as e:
+                # An endpoint-not-found 404 is CONTRACT-REST-only — it does NOT mean the
+                # instance or a screen is unreachable. Screen SOAP + modern-UI planes are
+                # independent (proven live: csmdev custom payroll). Say so, or an agent
+                # reads this as a hard dead end and gives up (observed in eval).
+                msg = str(e)
+                if "404" in msg and ("endpoint" in msg.lower() or "not found" in msg.lower()):
+                    raise AcumaticaError(
+                        f"{msg}  — NOTE: this is the CONTRACT-REST endpoint only "
+                        f"({self.instance.endpoint_name}/{self.instance.endpoint_version} is "
+                        f"not deployed/named correctly on this tenant). It does NOT mean the "
+                        f"screen or instance is unreachable — the screen SOAP (screen_*) and "
+                        f"modern-UI (ui_*) planes are independent; run screen_health(screen_id) "
+                        f"or list_endpoints to find the right endpoint.") from e
+                raise
             # An unknown/odd endpoint version (e.g. GRP9/1) often returns a text/HTML
             # error page instead of an OpenAPI object — guard so callers get an
             # actionable message, not a cryptic "'str' object has no attribute 'get'".
