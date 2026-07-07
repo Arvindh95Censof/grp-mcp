@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import base64
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
+from .acumatica import SeatReliever, looks_like_seat_limit
 from .config import Instance
 
 
@@ -29,11 +30,17 @@ class CustomizationError(RuntimeError):
 
 
 class CustomizationClient:
+    # Set once by server.py to _relieve_api_seats — a cookie login here holds a Web
+    # Services API seat like any other, so a publish during a seat jam must be able
+    # to free seats and retry instead of hard-failing.
+    default_seat_reliever: Optional[SeatReliever] = None
+
     def __init__(self, instance: Instance) -> None:
         self.instance = instance
         self._http = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
         self._logged_in = False
         self._base = instance.base_url.rstrip("/")
+        self.seat_reliever: Optional[SeatReliever] = None
 
     async def aclose(self) -> None:
         if self._logged_in:
@@ -43,7 +50,7 @@ class CustomizationClient:
                 pass
         await self._http.aclose()
 
-    async def _login(self) -> None:
+    async def _login(self, _seat_retried: bool = False) -> None:
         if self._logged_in:
             return
         body: dict[str, Any] = {
@@ -56,8 +63,29 @@ class CustomizationClient:
             body["branch"] = self.instance.branch
         resp = await self._http.post(f"{self._base}/entity/auth/login", json=body)
         if resp.status_code not in (200, 204):
+            # seat exhaustion: free the other cached sessions, retry once (parity with
+            # the AcumaticaClient/ScreenClient login paths).
+            if not _seat_retried and looks_like_seat_limit(resp.text, resp.status_code):
+                reliever = self.seat_reliever or type(self).default_seat_reliever
+                if reliever is not None:
+                    try:
+                        await reliever(self)
+                    except Exception:  # noqa: BLE001 — best-effort; fall through
+                        reliever = None
+                    if reliever is not None:
+                        return await self._login(_seat_retried=True)
+            # surface only a structured error message — never echo the raw body of
+            # the credential-bearing request's response (parity with _fetch_token).
+            detail = ""
+            try:
+                err = resp.json()
+                detail = err.get("exceptionMessage") or err.get("message") or ""
+            except Exception:  # noqa: BLE001 — non-JSON body; omit it
+                detail = ""
             raise CustomizationError(
-                f"login failed ({resp.status_code}): {resp.text}"
+                f"login failed ({resp.status_code})"
+                + (f": {detail}" if detail else "")
+                + ". Check the instance's username/password/tenant."
             )
         self._logged_in = True
 

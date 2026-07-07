@@ -392,7 +392,7 @@ class ScreenClient:
         self._logged_in = True
         self._cookie_session = False
 
-    async def _cookie_login(self) -> None:
+    async def _cookie_login(self, _seat_retried: bool = False) -> None:
         """NON-SOAP cookie login via the contract endpoint POST /entity/auth/login.
 
         Returns 204 + the ASP.NET forms-auth cookie (.ASPXAUTH + session), which
@@ -415,6 +415,19 @@ class ScreenClient:
         resp = await self._http.post(url, json=body,
                                      headers={"Content-Type": "application/json"})
         if resp.status_code not in (200, 204):
+            # "API Login Limit" self-heal — parity with classic _call: free the other
+            # cached sessions this process holds, then retry ONCE. Without this, an
+            # instance whose SOAP login is disabled (modern plane = cookie only, e.g.
+            # csmdev) could never recover from a seat jam.
+            if not _seat_retried and looks_like_seat_limit(resp.text):
+                reliever = self.seat_reliever or type(self).default_seat_reliever
+                if reliever is not None:
+                    try:
+                        await reliever(self)
+                    except Exception:  # noqa: BLE001 — best-effort; fall through to raise
+                        reliever = None
+                    if reliever is not None:
+                        return await self._cookie_login(_seat_retried=True)
             raise ScreenError(
                 f"cookie login (/entity/auth/login) failed: HTTP {resp.status_code} "
                 f"{resp.text[:200]}")
@@ -1155,15 +1168,27 @@ class ScreenClient:
             result["value"] = {"id": rows[0].get(vf), "text": rows[0].get(df)}
         return result
 
-    async def ui_command(self, name: str) -> dict:
-        """Fire a modern UI-screen command; auto-answers OK if it opens a dialog.
+    # WebDialogResult values accepted as a dialog answer (public PX.Data enum).
+    _DIALOG_ANSWERS = {"ok": 1, "cancel": 2, "yes": 6, "no": 7}
+
+    async def ui_command(self, name: str, answer: str = "ok") -> dict:
+        """Fire a modern UI-screen command; answers a confirmation dialog if one opens.
 
         Field values set via ui_set_field() beforehand persist server-side in the
         session and don't need to be resent here. `name` is the internal command
-        (from get_ui_structure `actions`), e.g. "Save", "generateYears". A 302
-        `openDialog` reply is auto-confirmed (WebDialogResult.OK). Raises with the
+        (from get_ui_structure `actions`), e.g. "Save", "generateYears".
+
+        answer: how to respond if the command opens a 302 `openDialog` confirmation —
+        "ok" (default; WebDialogResult.OK), "yes", "no", "cancel", or "none" to NOT
+        answer: the command returns {dialog_open: true, dialog_view} so the caller
+        can inspect what the screen is asking before committing. Raises with the
         parsed `messages[]` on a business/validation error.
         """
+        ans = (answer or "ok").lower()
+        if ans != "none" and ans not in self._DIALOG_ANSWERS:
+            raise ScreenError(
+                f"ui_command: unknown dialog answer {answer!r} — "
+                f"use one of {sorted(self._DIALOG_ANSWERS)} or 'none'")
         resp = await self._ui_post({
             "command": [{"name": name}], "data": [],
             "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
@@ -1176,9 +1201,14 @@ class ScreenClient:
                 if settings.get("type") == "openDialog":
                     view = settings.get("viewName")
                     break
+            if ans == "none":
+                return {"dialog_open": True, "dialog_view": view, "command": name,
+                        "note": "confirmation dialog NOT answered (answer='none') — "
+                                "re-fire with answer='ok'/'yes'/... to commit"}
             resp = await self._ui_post({
                 "command": [{"name": name}], "data": [],
-                "dialogCallback": {"dialogResult": 1, "validateInput": False, "viewName": view},
+                "dialogCallback": {"dialogResult": self._DIALOG_ANSWERS[ans],
+                                    "validateInput": False, "viewName": view},
                 "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
             })
         err = self._ui_error(resp)

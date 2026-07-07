@@ -208,9 +208,10 @@ async def _relieve_api_seats(exclude: object | None = None) -> None:
         pass
 
 
-# Both client types self-recover from a seat-limit fault via this reliever (retry once).
+# All three client types self-recover from a seat-limit fault via this reliever (retry once).
 AcumaticaClient.default_seat_reliever = staticmethod(_relieve_api_seats)
 ScreenClient.default_seat_reliever = staticmethod(_relieve_api_seats)
+CustomizationClient.default_seat_reliever = staticmethod(_relieve_api_seats)
 
 
 @asynccontextmanager
@@ -287,6 +288,13 @@ def _require_admin(op: str) -> None:
             f"for a session-only change. (Guards against an agent silently rewriting your "
             f"credential file.)"
         )
+
+
+def _oq(v: Any) -> str:
+    """Escape a value for an OData single-quoted string literal (' doubles to '').
+    Without this, a value containing an apostrophe (scenario "O'Brien Import",
+    workgroup "Bob's Team") breaks the $filter with an opaque 400."""
+    return str(v).replace("'", "''")
 
 
 def _require_range(name: str, value: Any, lo: float, hi: float) -> None:
@@ -1589,6 +1597,7 @@ async def ui_screen_action(
     record_key: dict | None = None,
     skip_validation: bool = False,
     verify: bool = False,
+    dialog_answer: str = "ok",
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
@@ -1632,8 +1641,12 @@ async def ui_screen_action(
         Preferences/Setup screens don't need this (nothing to select).
     action:      the internal command to fire after setting (from ui_get_structure
         `actions`), e.g. "Save" to commit a record edit, or a screen action like
-        "generateYears". If the action opens a confirmation dialog it's
-        auto-answered OK.
+        "generateYears".
+    dialog_answer: how to answer a confirmation dialog the action opens — "ok"
+        (default), "yes", "no", "cancel", or "none" to NOT answer it: the call then
+        returns {dialog_open: true, dialog_view} so you can see what the screen is
+        asking (useful when an action raises an UNEXPECTED secondary dialog you
+        don't want blindly confirmed) and re-fire with an explicit answer.
 
     Business/validation errors surface as clear messages (the screen's own
     `messages[]`), not opaque HTTP codes. PRECONDITION (KB-first policy): consult
@@ -1725,7 +1738,11 @@ async def ui_screen_action(
                                          tree_select.get("parent_key"))
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
-        result = await s.ui_command(action)
+        result = await s.ui_command(action, answer=dialog_answer)
+        if isinstance(result, dict) and result.get("dialog_open"):
+            # dialog_answer="none": surface the unanswered dialog instead of a result
+            return {"screen_id": screen_id.upper(), "action": action, "ok": None,
+                    **result}
         # Honest persistence signal: the plane echoes graphIsDirty. After a Save it
         # should be False; still-True means the commit didn't take (a silent no-op the
         # HTTP 200 hides). Best-effort verify=true re-reads /structure to confirm the
@@ -2527,7 +2544,7 @@ async def screen_health(screen_id: str, instance: str | None = None) -> Any:
     # 1) sitemap (doubles as the DAC-OData reachability check)
     try:
         res = await _client(instance).run_dac(
-            "SiteMap", {"$select": "ScreenID,Title", "$filter": f"ScreenID eq '{sid}'"})
+            "SiteMap", {"$select": "ScreenID,Title", "$filter": f"ScreenID eq '{_oq(sid)}'"})
         rows = res.get("value", []) if isinstance(res, dict) else []
         planes["sitemap"] = ({"ok": True, "title": rows[0].get("Title")} if rows
                              else {"ok": False, "reason": "ScreenID not found in site map"})
@@ -2699,6 +2716,7 @@ async def _activation_status(inst, poll_interval: float, budget: float) -> str |
         elapsed += poll_interval
 
 
+@mcp.tool()
 async def activate_features(wait_seconds: float = 40.0, instance: str | None = None) -> Any:
     """Activate/install the staged feature set on CS100000 (the "Enable" button) —
     NON-BLOCKING (won't hang on the recompile).
@@ -3495,7 +3513,7 @@ async def delete_segmented_key(key_id: str, instance: str | None = None) -> Any:
     client = _client(instance)
 
     async def _rows(dac: str) -> list[dict]:
-        r = await client.run_dac(dac, {"$filter": f"DimensionID eq '{key_id}'"})
+        r = await client.run_dac(dac, {"$filter": f"DimensionID eq '{_oq(key_id)}'"})
         return r.get("value", []) if isinstance(r, dict) else []
 
     steps: list[str] = []
@@ -4010,7 +4028,7 @@ async def run_import_scenario(
         out["import"] = await _act(import_action)
     # read back the status/result of the selected record
     try:
-        rec = await client.get_entity(entity, None, {"$filter": f"{key_field} eq '{scenario_name}'", "$top": 1})
+        rec = await client.get_entity(entity, None, {"$filter": f"{key_field} eq '{_oq(scenario_name)}'", "$top": 1})
         if isinstance(rec, list) and rec:
             rec = rec[0]
         out["status"] = {
@@ -4120,7 +4138,7 @@ async def run_dac_odata(
         field, values = next(iter(filter_in.items()))
         merged: list = []
         for v in values:
-            cond = f"{field} eq '{v}'" if isinstance(v, str) else f"{field} eq {v}"
+            cond = f"{field} eq '{_oq(v)}'" if isinstance(v, str) else f"{field} eq {v}"
             f = f"({filter}) and {cond}" if filter else cond
             r = await client.run_dac(dac, {**base, "$filter": f}, timeout=timeout)
             if isinstance(r, dict) and isinstance(r.get("value"), list):

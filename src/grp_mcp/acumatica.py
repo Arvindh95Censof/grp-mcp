@@ -27,7 +27,11 @@ _SEAT_LIMIT_PAT = re.compile(
     r"|maximum number of .{0,40}(users?|logins?|sessions?)"
     r"|number of .{0,20}licen[sc]e|licen[sc]e limit"
     r"|concurrent (?:user|login|session)"
-    r"|you have exceeded",
+    # scoped to login/session context: a bare "you have exceeded" also matched
+    # BUSINESS errors ("you have exceeded the credit limit"), which then logged out
+    # every cached session, retried the request, and raised LoginLimitError masking
+    # the real error.
+    r"|you have exceeded .{0,40}\b(users?|logins?|sessions?)\b",
     re.I,
 )
 

@@ -1631,6 +1631,168 @@ def test_tree_triage_is_registered_tool():
     assert "tree_triage" in names
 
 
+# ---- v0.48 audit fixes -------------------------------------------------------
+
+def test_save_config_excludes_session_only(tmp_path):
+    # persist=false is a promise: those credentials must NEVER land on disk —
+    # even when a LATER persisting call writes the config.
+    from grp_mcp.config import Config, Instance, save_config
+    import json as _json
+    kw = dict(client_id="x", client_secret="y", username="u", password="SECRET")
+    cfg = Config(
+        default="mem",
+        instances={"disk": Instance(base_url="http://a/A", **kw),
+                   "mem": Instance(base_url="http://b/B", **kw)},
+        session_only={"mem"},
+    )
+    target = str(tmp_path / "connections.json")
+    save_config(cfg, target)
+    data = _json.loads((tmp_path / "connections.json").read_text(encoding="utf-8"))
+    assert "mem" not in data["instances"]          # session-only stayed in memory
+    assert "disk" in data["instances"]
+    assert data["default"] == "disk"               # on-disk default must exist on disk
+    assert "SECRET" not in (tmp_path / "connections.json").read_text(encoding="utf-8") \
+        or data["instances"]["disk"]["password"] == "SECRET"  # only via the disk profile
+
+
+def test_save_config_all_session_only_refuses(tmp_path):
+    from grp_mcp.config import Config, Instance, save_config
+    kw = dict(client_id="x", client_secret="y", username="u", password="p")
+    cfg = Config(default="mem",
+                 instances={"mem": Instance(base_url="http://b/B", **kw)},
+                 session_only={"mem"})
+    try:
+        save_config(cfg, str(tmp_path / "c.json"))
+        assert False, "should refuse to write an empty instance set"
+    except RuntimeError as e:
+        assert "session-only" in str(e)
+
+
+def test_seat_limit_regex_not_fooled_by_business_errors():
+    from grp_mcp.acumatica import looks_like_seat_limit
+    # business errors must NOT trigger session logouts + LoginLimitError masking
+    assert not looks_like_seat_limit("You have exceeded the credit limit for this customer")
+    assert not looks_like_seat_limit("you have exceeded the maximum row count")
+    # real seat-limit phrasings still match
+    assert looks_like_seat_limit("API Login Limit")
+    assert looks_like_seat_limit("You have exceeded the maximum number of concurrent sessions")
+    assert looks_like_seat_limit("you have exceeded the allowed number of users")
+    assert looks_like_seat_limit("", status=429)
+
+
+def test_oq_escapes_odata_quotes():
+    from grp_mcp.server import _oq
+    assert _oq("O'Brien Import") == "O''Brien Import"
+    assert _oq("plain") == "plain"
+    assert _oq(123) == "123"
+
+
+def test_customization_login_sanitizes_error_and_relieves_seats(monkeypatch):
+    import httpx as _httpx
+    from grp_mcp.customization import CustomizationClient, CustomizationError
+    inst = _inst()
+    calls = {"n": 0, "relieved": 0}
+
+    # 1) seat-limit 500 -> reliever fires, retry succeeds
+    async def fake_post_seat(url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _httpx.Response(500, text='{"exceptionMessage":"API Login Limit"}')
+        return _httpx.Response(204)
+
+    async def fake_reliever(exclude=None):
+        calls["relieved"] += 1
+
+    c = CustomizationClient(inst)
+    monkeypatch.setattr(c._http, "post", fake_post_seat)
+    monkeypatch.setattr(c, "seat_reliever", fake_reliever)
+    asyncio.run(c._login())
+    assert calls == {"n": 2, "relieved": 1} and c._logged_in
+
+    # 2) credential failure -> structured message, raw body NOT echoed
+    async def fake_post_bad(url, **kw):
+        return _httpx.Response(401, text='{"message":"Invalid credentials",'
+                                         '"secretEcho":"do-not-leak"}')
+    c2 = CustomizationClient(inst)
+    monkeypatch.setattr(c2._http, "post", fake_post_bad)
+    try:
+        asyncio.run(c2._login())
+        assert False, "should have raised"
+    except CustomizationError as e:
+        assert "Invalid credentials" in str(e)
+        assert "do-not-leak" not in str(e)     # raw body never echoed
+
+
+def test_cookie_login_relieves_seat_limit_and_retries(monkeypatch):
+    # Seat-limit self-heal parity: /entity/auth/login 500 "API Login Limit" must
+    # trigger the reliever and retry ONCE (previously only classic SOAP _call did;
+    # a SOAP-disabled instance could never recover from a seat jam).
+    import httpx as _httpx
+    calls = {"n": 0, "relieved": 0}
+
+    async def fake_post(url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _httpx.Response(500, text='{"exceptionMessage":"API Login Limit"}')
+        return _httpx.Response(204)
+
+    async def fake_reliever(exclude=None):
+        calls["relieved"] += 1
+
+    s = ScreenClient(_inst(), "GL101000")
+    monkeypatch.setattr(s._http, "post", fake_post)
+    monkeypatch.setattr(s, "seat_reliever", fake_reliever)
+    asyncio.run(s._cookie_login())
+    assert calls == {"n": 2, "relieved": 1}   # relieved once, retried once, succeeded
+    assert s._logged_in and s._cookie_session
+
+
+def test_cookie_login_non_seat_error_no_retry(monkeypatch):
+    # A non-seat 500 must NOT loop the reliever — raise immediately.
+    import httpx as _httpx
+    calls = {"n": 0}
+
+    async def fake_post(url, **kw):
+        calls["n"] += 1
+        return _httpx.Response(500, text='{"exceptionMessage":"boom"}')
+
+    s = ScreenClient(_inst(), "GL101000")
+    monkeypatch.setattr(s._http, "post", fake_post)
+    try:
+        asyncio.run(s._cookie_login())
+        assert False, "should have raised"
+    except ScreenError as e:
+        assert "cookie login" in str(e)
+    assert calls["n"] == 1
+
+
+def test_ui_command_dialog_answer_none_returns_dialog(monkeypatch):
+    # answer="none" must NOT auto-confirm — it returns the unanswered dialog info.
+    import httpx as _httpx
+    posted = []
+
+    async def fake_ui_post(payload, _auth_retried=False):
+        posted.append(payload)
+        return _httpx.Response(302, json={"redirects": [
+            {"settings": {"type": "openDialog", "viewName": "ConfirmView"}}]})
+
+    s = ScreenClient(_inst(), "GL101000")
+    monkeypatch.setattr(s, "_ui_post", fake_ui_post)
+    out = asyncio.run(s.ui_command("Generate", answer="none"))
+    assert out["dialog_open"] is True and out["dialog_view"] == "ConfirmView"
+    assert len(posted) == 1                     # never sent a dialogCallback
+    assert "dialogCallback" not in posted[0]
+
+
+def test_ui_command_rejects_unknown_answer():
+    s = ScreenClient(_inst(), "GL101000")
+    try:
+        asyncio.run(s.ui_command("Save", answer="maybe"))
+        assert False, "should have raised"
+    except ScreenError as e:
+        assert "unknown dialog answer" in str(e)
+
+
 def test_indent_pref_prefers_indent_verb():
     from grp_mcp.server import _indent_pref
     assert _indent_pref(["Left", "Right"]) == "Right"      # Right = nest deeper
@@ -1680,7 +1842,8 @@ def test_tool_registration_integrity():
     names = {t.name for t in tools}
     # every real tool must be registered
     for must in ("run_dac_odata", "publish_customization", "screen_health",
-                 "generate_endpoint_entity", "list_published", "get_endpoint_definition"):
+                 "generate_endpoint_entity", "list_published", "get_endpoint_definition",
+                 "activate_features"):
         assert must in names, f"{must} is not a registered MCP tool"
     # module-private helpers must NOT leak as tools (a @mcp.tool() landing on the wrong
     # def steals the tool's decorator — how run_dac_odata briefly de-registered)
@@ -1689,3 +1852,30 @@ def test_tool_registration_integrity():
         assert helper not in names, f"internal helper {helper} wrongly exposed as a tool"
     # belt-and-suspenders: no underscore-prefixed tool names at all
     assert not [n for n in names if n.startswith("_")]
+
+
+def test_every_public_function_is_a_registered_tool():
+    # STRUCTURAL guard for the decorator-theft bug class: any PUBLIC module-level
+    # function in server.py is either a registered tool or on the explicit non-tool
+    # allowlist. This is what a hand-picked must-list can't do — activate_features
+    # was silently unregistered for 4 releases (v0.43.1..v0.47.1) because the fix
+    # for a stolen decorator DELETED it instead of moving it back, and no list
+    # mentioned the tool. Grow the allowlist only for a function that is genuinely
+    # not meant to be a tool.
+    import inspect
+    NOT_TOOLS = {
+        "extend_endpoint",   # deliberately deregistered (REST PUT is a verified no-op)
+        "main",              # console entry point
+    }
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    missing = []
+    for fname, fn in inspect.getmembers(server, inspect.isfunction):
+        if fn.__module__ != server.__name__:   # imported, not defined here
+            continue
+        if fname.startswith("_") or fname in NOT_TOOLS:
+            continue
+        if fname not in names:
+            missing.append(fname)
+    assert not missing, (
+        f"public function(s) in server.py not registered as MCP tools (lost/stolen "
+        f"@mcp.tool() decorator?): {missing} — if intentional, add to NOT_TOOLS")

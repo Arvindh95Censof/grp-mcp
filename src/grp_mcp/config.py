@@ -120,9 +120,20 @@ def save_config(cfg: Config, path: str | None = None) -> str:
     target = path or cfg.source_path or os.getenv("GRP_MCP_CONNECTIONS") or str(
         Path.cwd() / "connections.json"
     )
+    # NEVER write session-only profiles to disk: persist=false is an explicit promise
+    # that the profile's credentials stay in memory. Without this filter, ANY later
+    # persisting call (add/set_active/remove with persist=true) silently wrote every
+    # in-memory profile — including session-only passwords — into connections.json.
+    persisted = {n: i for n, i in cfg.instances.items() if n not in cfg.session_only}
+    if not persisted:
+        raise RuntimeError(
+            "save_config: every configured instance is session-only (persist=false) — "
+            "nothing to write. Re-add the profile with persist=true to save it.")
+    # the on-disk default must reference an on-disk instance
+    default = cfg.default if cfg.default in persisted else next(iter(persisted))
     data = {
-        "default": cfg.default,
-        "instances": {n: i.model_dump() for n, i in cfg.instances.items()},
+        "default": default,
+        "instances": {n: i.model_dump() for n, i in persisted.items()},
     }
     Path(target).write_text(
         json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"

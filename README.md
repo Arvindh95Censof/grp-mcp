@@ -558,6 +558,33 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.48 — **full-codebase audit: 8 findings, all fixed.**
+- 🔴 **`activate_features` was not a registered tool since v0.43.1** — that release
+  removed the stolen decorator from a helper instead of restoring it to its owner. Restored;
+  a new STRUCTURAL test asserts every public function in server.py is either a registered
+  tool or explicitly allowlisted, killing the decorator-theft bug class for good.
+- 🔴 **Session-only credentials no longer leak to disk** — `save_config` wrote ALL
+  in-memory instances, so a later persist of any other profile silently wrote a
+  `persist=false` profile's password into connections.json. Now filtered out (with default
+  fallback + refusal when everything is session-only).
+- 🔴 **Cookie login gained seat-limit self-heal** — the "API Login Limit" relief+retry
+  existed only on classic SOAP; `/entity/auth/login` (the modern plane's auth, and the ONLY
+  auth on SOAP-disabled instances) now relieves + retries once too. Same for the
+  Customization API login (a publish during a seat jam now recovers).
+- 🟠 **Seat-limit regex no longer matches business errors** — bare "you have exceeded"
+  classified "credit limit exceeded" as seat exhaustion → logged out every cached session,
+  retried, and masked the real error as LoginLimitError. Now scoped to users/logins/sessions.
+- 🟡 Dialog auto-OK is now controllable: `ui_screen_action(dialog_answer="ok"|"yes"|"no"|
+  "cancel"|"none")` — `none` returns the unanswered dialog for inspection instead of blindly
+  confirming an unexpected secondary prompt.
+- 🟡 OData `$filter` values are quote-escaped (`O'Brien` no longer 400s) via `_oq()`.
+- 🟡 Customization login errors are structured (raw credential-adjacent response body never
+  echoed — parity with the OAuth path).
+- 🟡 setup_map.json guidance had two wrong tool names (`get_ui_structure`,
+  `ui_populate_entity_fields`) — corrected to `ui_get_structure` /
+  `ui_populate_endpoint_entity_fields`.
++15 tests (147 total).
+
 v0.47.1 — `tree_triage` bugfix caught by its own live test: the select-command tree case
 (T3) now keys on a **tree grid** (name carries "tree", e.g. SM207060 `EntityTree`) and
 node-scoped actions (`InsertNew`/`DeleteNode`), not just a "move" action — so SM207060 no
