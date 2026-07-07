@@ -558,7 +558,27 @@ python -m pytest tests/ -q
 
 ## Status
 
-v0.42 — 80 tools across four client planes (v0.42: **non-SOAP cookie login for the modern
+v0.43 — 82 tools across four client planes (v0.43: a backlog batch from a live endpoint-build
+session. **CRITICAL — `publish_customization` no longer silently unpublishes.** Acumatica's
+publishBegin publishes EXACTLY the set you pass (dropping everything else); the tool now reads
+what's published and **merges by default** (`mode="merge"`), `mode="replace"` is **refused**
+unless `confirm_unpublish=true`, and `dry_run=true` returns `{will_publish, will_unpublish,
+currently_published}`. `import_customization(backup=true)` exports the existing project before a
+replace (aborts if the backup can't be written). `publish_status` gains a live `getPublished`
+fallback when in-memory job state is lost. **New tools:** `screen_health(screen_id)` — one
+cross-plane diagnostic (sitemap / modern `/structure` / SOAP GetSchema / published CPs) with an
+inferred root-cause; `generate_endpoint_entity(screen_id, name)` — auto-builds a `<TopLevelEntity>`
+XML block from the screen schema + DAC value-types. **Fixes:** `list_entities`/`get_swagger` raise a
+clear error (not `'str' has no attribute 'get'`) on an odd endpoint version; `screen_get_schema` now
+parses the schema as a TREE so **unnamed summary/header containers** are captured (were dropped);
+`run_dac_odata` gains `filter_in={field:[…]}` (per-value queries — dodges the multi-OR SiteMap
+timeout) + a per-call `timeout`; `list_published(names_only=|project=)` and
+`get_endpoint_definition(entities_only=)` avoid huge dumps; a clearer "unknown instance" error
+names lost session-only profiles. **Robustness:** a per-instance **shared UI-plane cookie session**
+— concurrent `ui_*` calls reuse one login instead of each opening one (was blowing the concurrent-
+login cap); a stale reused cookie self-heals (invalidate + re-login once); `release_sessions` clears
+it. (Verified-good, now documented: the v0.42 cookie login also revives classic SOAP GetSchema/Submit
+on SOAP-login-disabled instances — cookie auth is honored there too.) v0.42: **non-SOAP cookie login for the modern
 UI plane.** The modern `/ui/screen/` plane used to ride the classic SOAP Login cookie, so on
 an instance where the SOAP screen API is disabled (e.g. csmdev — SOAP login off + OData 403)
 the whole modern plane was dead even though the browser's cookie route worked. `ScreenClient`

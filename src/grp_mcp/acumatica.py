@@ -303,7 +303,21 @@ class AcumaticaClient:
         """
         if self._swagger is None or refresh:
             url = f"{self.instance.entity_base}/swagger.json"
-            self._swagger = await self._request("GET", url)
+            doc = await self._request("GET", url)
+            # An unknown/odd endpoint version (e.g. GRP9/1) often returns a text/HTML
+            # error page instead of an OpenAPI object — guard so callers get an
+            # actionable message, not a cryptic "'str' object has no attribute 'get'".
+            if not isinstance(doc, dict) or "paths" not in doc:
+                preview = doc[:200] if isinstance(doc, str) else repr(doc)[:200]
+                raise AcumaticaError(
+                    f"swagger.json for endpoint "
+                    f"{self.instance.endpoint_name}/{self.instance.endpoint_version} did not "
+                    f"return an OpenAPI document (got {type(doc).__name__}"
+                    f"{'' if isinstance(doc, dict) else ''}). Verify the endpoint name + "
+                    f"version exist and are published (list_endpoints); an unknown or "
+                    f"non-standard version frequently returns an error page instead of JSON. "
+                    f"Response starts: {preview!r}")
+            self._swagger = doc
         return self._swagger
 
     async def list_entities(self, refresh: bool = False) -> list[str]:
@@ -322,7 +336,7 @@ class AcumaticaClient:
         prefix = f"/{entity}/"
         acts: set[str] = set()
         for path, ops in (doc.get("paths") or {}).items():
-            if not path.startswith(prefix):
+            if not path.startswith(prefix) or not isinstance(ops, dict):
                 continue
             seg = path[len(prefix):]
             if seg and "{" not in seg and "/" not in seg:
@@ -515,12 +529,17 @@ class AcumaticaClient:
             "GET", self.instance.dac_odata_base, params={"$format": "json"}
         )
 
-    async def run_dac(self, dac: str, params: dict | None = None) -> Any:
-        """Query one DAC through the DAC-based OData v4 interface (<dac base>/<DAC>)."""
+    async def run_dac(self, dac: str, params: dict | None = None,
+                      timeout: float | None = None) -> Any:
+        """Query one DAC through the DAC-based OData v4 interface (<dac base>/<DAC>).
+        timeout (seconds) overrides the client's default read timeout for this call."""
         url = f"{self.instance.dac_odata_base}/{dac}"
         p = {"$format": "json"}
         p.update(params or {})
-        return await self._request("GET", url, params=p)
+        kw: dict[str, Any] = {"params": p}
+        if timeout is not None:
+            kw["timeout"] = httpx.Timeout(timeout, connect=min(30.0, timeout))
+        return await self._request("GET", url, **kw)
 
     async def dac_metadata(self) -> str:
         """Fetch the DAC-based OData CSDL ($metadata) as XML text.

@@ -19,7 +19,7 @@ from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
-from .screen import ScreenClient, ScreenError
+from .screen import ScreenClient, ScreenError, clear_session_cache
 
 _KB_FIRST_POLICY = (
     "TOOL SELECTION: this server has ~77 tools across FOUR Acumatica planes (contract "
@@ -678,17 +678,141 @@ async def get_endpoint_definition(
     endpoint_name: str,
     endpoint_version: str,
     expand: str = "EntityTree,EntityProperties",
+    entities_only: bool = False,
     instance: str | None = None,
 ) -> Any:
     """Read an endpoint's contract definition from SM207060 (read-only).
 
     Returns the endpoint record with its entity tree / properties expanded, so you
     can see how a contract is built before extending it. Key = name + version.
+
+    entities_only=true: the full definition can be huge (400KB+ — every field of every
+    entity). This drops the per-field EntityProperties expand and returns just the list
+    of top-level entity names ({endpoint, entities, count}) — enough to see what's on the
+    contract without the field dump. Falls back to the raw EntityTree if names can't be
+    parsed.
     """
     rid = f"{endpoint_name}/{endpoint_version}"
+    if entities_only:
+        raw = await _client(instance).get_entity(
+            "WebServiceEndpoints", rid, {"$expand": "EntityTree"})
+        tree = raw.get("EntityTree") if isinstance(raw, dict) else None
+        names: list[str] = []
+        if isinstance(tree, list):
+            for node in tree:
+                if not isinstance(node, dict):
+                    continue
+                for key in ("ObjectName", "EntityName", "Name"):
+                    v = node.get(key)
+                    val = v.get("value") if isinstance(v, dict) else v
+                    if val:
+                        names.append(str(val))
+                        break
+        if names:
+            return {"endpoint": rid, "entities": sorted(set(names)), "count": len(set(names))}
+        return {"endpoint": rid, "entities": None,
+                "note": "could not parse entity names from EntityTree; returning it raw",
+                "EntityTree": tree}
     return await _client(instance).get_entity(
         "WebServiceEndpoints", rid, {"$expand": expand}
     )
+
+
+_EDM_VALUETYPE = {
+    "string": "StringValue", "boolean": "BooleanValue", "int16": "ShortValue",
+    "int32": "IntValue", "int64": "LongValue", "decimal": "DecimalValue",
+    "double": "DoubleValue", "single": "DoubleValue", "datetime": "DateTimeValue",
+    "datetimeoffset": "DateTimeValue", "guid": "GuidValue", "byte": "ByteValue",
+}
+
+
+def _edm_to_valuetype(t: str | None) -> str:
+    """Map a CSDL/Edm scalar type (e.g. 'Edm.String', 'Int16') to an Acumatica endpoint
+    Field value-type (StringValue/BooleanValue/…). Unknown -> StringValue (safe default)."""
+    key = (t or "").split(".")[-1].strip().lower()
+    return _EDM_VALUETYPE.get(key, "StringValue")
+
+
+@mcp.tool()
+async def generate_endpoint_entity(
+    screen_id: str,
+    name: str,
+    container: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Auto-build a <TopLevelEntity> XML block for a web-service endpoint from a screen.
+
+    Turns "I want screen X on my endpoint" into a ready-to-paste customization block —
+    the format hand-authored today, generated in one call. It reads the screen's schema
+    (friendly field names + their view/DAC bindings) and infers each field's value-type
+    from the DAC CSDL metadata, emitting:
+
+        <TopLevelEntity name="<name>" screen="<SCREEN>">
+          <Fields>
+            <Field name="<FriendlyField>" type="StringValue|BooleanValue|…" />
+            ...
+          </Fields>
+        </TopLevelEntity>
+
+    screen_id: the screen to expose (e.g. "PY302000").
+    name:      the entity name on the contract (e.g. "PayCode").
+    container: which schema container's fields to use (default: the screen's first/primary
+               container — call screen_get_schema(screen_id) to see them; a master-detail
+               screen has one per view).
+
+    Paste the block into a customization project's <EntityEndpoint><Endpoint> and
+    import_customization + publish_customization, OR use ui_tree_dialog_insert to add it
+    via the SM207060 wizard. Types are best-effort (unknown → StringValue) — review before
+    publishing. Read-only (generates text; writes nothing).
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        sch = await s.get_schema()
+    conts = sch.get("containers") or {}
+    if not conts:
+        return {"error": f"no containers in schema for {screen_id.upper()}",
+                "note": "the screen may be modern-only (no classic .aspx) — check "
+                        "screen_health(screen_id)."}
+    cname = container or next(iter(conts))
+    if cname not in conts:
+        return {"error": f"container {container!r} not found",
+                "containers": list(conts)}
+    fields_map = conts[cname]
+
+    # value-type inference: match each field's underlying DAC field name against the CSDL
+    dac_types: dict[str, str] = {}
+    try:
+        meta = await get_dac_metadata(instance=instance)  # {Dac: [{name,type,...}]}
+        if isinstance(meta, dict):
+            for flds in meta.values():
+                if isinstance(flds, list):
+                    for f in flds:
+                        if isinstance(f, dict) and f.get("name"):
+                            dac_types.setdefault(str(f["name"]).lower(),
+                                                 _edm_to_valuetype(f.get("type")))
+    except Exception:  # noqa: BLE001 — types default to StringValue
+        pass
+
+    lines = [f'<TopLevelEntity name="{name}" screen="{screen_id.upper()}">', "  <Fields>"]
+    typed, defaulted = 0, 0
+    for friendly, fo in fields_map.items():
+        vt = dac_types.get(str(fo.get("field", "")).lower())
+        if vt:
+            typed += 1
+        else:
+            vt, _d = "StringValue", defaulted
+            defaulted += 1
+        lines.append(f'    <Field name="{friendly}" type="{vt}" />')
+    lines.append("  </Fields>")
+    lines.append("</TopLevelEntity>")
+    return {
+        "screen_id": screen_id.upper(), "entity_name": name, "container": cname,
+        "field_count": len(fields_map), "types_inferred": typed,
+        "types_defaulted_to_string": defaulted, "xml": "\n".join(lines),
+        "note": "Review the value-types (defaulted fields → StringValue). Add the block to "
+                "an <EntityEndpoint><Endpoint> project and import_customization + "
+                "publish_customization.",
+    }
 
 
 # NOT a registered MCP tool (deliberately un-decorated): a PUT to
@@ -2131,7 +2255,19 @@ async def release_sessions(instance: str | None = None) -> Any:
             except Exception:
                 pass
             released.append(name)
-    return {"released": released, "remaining_cached": list(_clients.keys())}
+    # Also drop cached shared UI-plane (cookie) sessions so their seats free too. The
+    # cache is keyed by site+user+tenant, not profile name, so a per-instance release maps
+    # to its identity key; omit instance to clear all.
+    if instance is not None:
+        try:
+            inst = _cfg().get(instance)
+            ui_cleared = clear_session_cache(f"{inst.base_url}|{inst.username}|{inst.tenant}")
+        except Exception:  # noqa: BLE001
+            ui_cleared = []
+    else:
+        ui_cleared = clear_session_cache()
+    return {"released": released, "ui_sessions_cleared": ui_cleared,
+            "remaining_cached": list(_clients.keys())}
 
 
 @mcp.tool()
@@ -2154,6 +2290,99 @@ async def list_screens(query: str, top: int = 50, instance: str | None = None) -
     ]
     hits.sort(key=lambda h: (len(h["Title"] or ""), h["Title"] or ""))
     return {"query": query, "count": len(hits), "screens": hits[: int(top)]}
+
+
+@mcp.tool()
+async def screen_health(screen_id: str, instance: str | None = None) -> Any:
+    """One-shot cross-plane diagnostic for a screen — is it reachable, and if not, WHY?
+
+    Probes every plane and returns per-plane pass/fail plus an inferred cause, collapsing
+    a multi-tool debugging session into one call:
+      • sitemap        — is the ScreenID in the site map? (also proves DAC-OData works)
+      • modern_ui      — does GET /ui/screen/<id>/structure return a descriptor?
+      • soap_getschema — does the classic SOAP GetSchema work? (a "file does not exist"
+                         fault means the screen has no classic .aspx page — modern-only)
+      • cp_published   — the customization projects currently published (a custom module's
+                         screen is dead on every plane if its CP isn't published)
+    Read-only. Uses one session (cookie login, so it works on SOAP-login-disabled
+    instances). `inferred` names the most likely root cause (missing file / feature off /
+    no access / not authenticated / module not configured / healthy).
+    """
+    sid = screen_id.upper()
+    inst = _cfg().get(instance or _cfg().default)
+    planes: dict[str, Any] = {}
+
+    # 1) sitemap (doubles as the DAC-OData reachability check)
+    try:
+        res = await _client(instance).run_dac(
+            "SiteMap", {"$select": "ScreenID,Title", "$filter": f"ScreenID eq '{sid}'"})
+        rows = res.get("value", []) if isinstance(res, dict) else []
+        planes["sitemap"] = ({"ok": True, "title": rows[0].get("Title")} if rows
+                             else {"ok": False, "reason": "ScreenID not found in site map"})
+        planes["dac_odata"] = {"ok": True}
+    except Exception as e:  # noqa: BLE001
+        planes["sitemap"] = {"ok": False, "error": str(e)[:200]}
+        planes["dac_odata"] = {"ok": False, "error": str(e)[:200]}
+
+    # 2/3) modern /structure + classic SOAP GetSchema (one cookie session)
+    soap_err = ""
+    try:
+        async with ScreenClient(inst, sid) as s:
+            try:
+                st = await s.get_ui_structure()
+                planes["modern_ui"] = {"ok": True, "primary_dac": st.get("primary_dac"),
+                                       "views": list((st.get("views") or {}))[:8]}
+            except Exception as e:  # noqa: BLE001
+                planes["modern_ui"] = {"ok": False, "error": str(e)[:200]}
+            try:
+                sch = await s.get_schema()
+                planes["soap_getschema"] = {"ok": True,
+                                            "containers": list(sch.get("containers") or {})}
+            except Exception as e:  # noqa: BLE001
+                soap_err = str(e)
+                planes["soap_getschema"] = {"ok": False, "error": soap_err[:200]}
+    except Exception as e:  # noqa: BLE001 — session/login itself failed
+        planes["modern_ui"] = planes.get("modern_ui") or {"ok": False, "error": str(e)[:200]}
+        planes["soap_getschema"] = planes.get("soap_getschema") or {"ok": False, "error": str(e)[:200]}
+
+    # 4) published customization projects (is the module's CP live?)
+    try:
+        async with _customization(instance) as c:
+            planes["cp_published"] = {"ok": True,
+                                      "projects": _published_project_names(await c.get_published())}
+    except Exception as e:  # noqa: BLE001
+        planes["cp_published"] = {"ok": False, "error": str(e)[:200]}
+
+    # infer the most likely root cause
+    m_ok = planes.get("modern_ui", {}).get("ok")
+    s_ok = planes.get("soap_getschema", {}).get("ok")
+    both_txt = f"{planes.get('modern_ui')} {planes.get('soap_getschema')}".lower()
+    missing_file = "does not exist" in both_txt
+    if not planes.get("sitemap", {}).get("ok"):
+        inferred = ("ScreenID not in the site map — check the ID (list_screens), or the "
+                    "module/CP isn't installed on this instance.")
+    elif "not authenticated" in both_txt or "login.aspx" in both_txt:
+        inferred = "NOT AUTHENTICATED / session lockout — credentials or a concurrent-login cap."
+    elif missing_file and m_ok and not s_ok:
+        inferred = ("Modern-only screen — no classic .aspx page, so classic SOAP "
+                    "(screen_get/submit) can't drive it; use the modern UI plane (ui_*).")
+    elif missing_file and not m_ok:
+        inferred = ("Screen page (.aspx) is NOT deployed on this instance — it's in the "
+                    "sitemap and its CP may be published, but the screen file is missing. "
+                    "Verify the module's customization is fully published (list_published / "
+                    "publish_customization), or the module isn't fully installed here.")
+    elif "setupnotentered" in both_txt or "prerequisite not met" in both_txt:
+        inferred = "Module not configured — fill its Preferences/Setup form first."
+    elif not m_ok and "403" in both_txt:
+        inferred = "Modern plane 403 — the feature is off or the user lacks access rights."
+    elif m_ok or s_ok:
+        good = [p for p in ("modern_ui", "soap_getschema") if planes.get(p, {}).get("ok")]
+        inferred = f"Healthy — reachable via {good}."
+    else:
+        inferred = "Unreachable on all planes — see per-plane errors."
+
+    return {"screen_id": sid, "instance": instance or _cfg().default,
+            "planes": planes, "inferred": inferred}
 
 
 @mcp.tool()
@@ -3511,6 +3740,23 @@ async def list_dacs(instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+def _dedup_rows(rows: list) -> tuple[list, int]:
+    """Collapse byte-identical duplicate rows (a DAC-OData paging artifact), order-
+    preserving. Returns (unique_rows, removed_count)."""
+    seen: set[str] = set()
+    unique: list = []
+    for r in rows:
+        try:
+            sig = json.dumps(r, sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            sig = repr(r)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(r)
+    return unique, len(rows) - len(unique)
+
+
 async def run_dac_odata(
     dac: str,
     filter: str | None = None,
@@ -3519,6 +3765,8 @@ async def run_dac_odata(
     top: int | None = None,
     skip: int | None = None,
     dedup: bool = True,
+    filter_in: dict | None = None,
+    timeout: float | None = None,
     instance: str | None = None,
 ) -> Any:
     """Query a single DAC through the DAC-based OData v4 interface.
@@ -3528,44 +3776,55 @@ async def run_dac_odata(
     Read-only. Use this to read tables/screens NOT exposed on the contract endpoint
     (the contract API only sees entities added to the endpoint). Requires `tenant`.
 
-    dedup (default True): this platform's DAC-OData layer occasionally returns the
-    SAME row more than once across internal server-side page boundaries (observed on
-    FinPeriod). With dedup on, identical rows in the `value` array are collapsed
-    (order preserved) and a `@grp.deduped` count is added when any were removed.
-    Set dedup=false to see the raw payload verbatim.
+    filter_in={"Field": [v1, v2, ...]}: match a field against a LIST of values WITHOUT
+    a big `Field eq v1 or Field eq v2 or …` filter — that multi-OR form frequently
+    TIMES OUT server-side on this platform (e.g. SiteMap) where single-value filters
+    return instantly. This runs one small query per value and MERGES + de-dups the
+    results. Combine with `filter` (ANDed into each per-value query). Only one field.
+    timeout: per-call read timeout override (seconds) — raise it for a heavy query, or
+    lower it to fail fast instead of hanging on the default 120s.
+
+    dedup (default True): the DAC-OData layer occasionally returns the SAME row twice
+    across internal page boundaries (observed on FinPeriod). Identical rows in `value`
+    are collapsed (order preserved) with a `@grp.deduped` count. dedup=false = raw.
     """
-    params: dict[str, Any] = {}
-    if filter:
-        params["$filter"] = filter
+    base: dict[str, Any] = {}
     if select:
-        params["$select"] = select
+        base["$select"] = select
     if expand:
-        params["$expand"] = expand
+        base["$expand"] = expand
     if top:
-        params["$top"] = top
+        base["$top"] = top
     if skip:
-        params["$skip"] = skip
-    result = await _client(instance).run_dac(dac, params)
+        base["$skip"] = skip
+    client = _client(instance)
+
+    if filter_in:
+        if len(filter_in) != 1:
+            raise ValueError("filter_in takes exactly one {field: [values]} pair")
+        field, values = next(iter(filter_in.items()))
+        merged: list = []
+        for v in values:
+            cond = f"{field} eq '{v}'" if isinstance(v, str) else f"{field} eq {v}"
+            f = f"({filter}) and {cond}" if filter else cond
+            r = await client.run_dac(dac, {**base, "$filter": f}, timeout=timeout)
+            if isinstance(r, dict) and isinstance(r.get("value"), list):
+                merged.extend(r["value"])
+        rows, removed = _dedup_rows(merged) if dedup else (merged, 0)
+        out: dict[str, Any] = {"value": rows, "@grp.filter_in": {field: list(values)}}
+        if removed:
+            out["@grp.deduped"] = removed
+        return out
+
+    if filter:
+        base["$filter"] = filter
+    result = await client.run_dac(dac, base, timeout=timeout)
     if dedup and isinstance(result, dict) and isinstance(result.get("value"), list):
-        rows = result["value"]
-        seen: set[str] = set()
-        unique: list = []
-        for r in rows:
-            # Signature = the full row (paging dupes are byte-identical); sort keys so
-            # dict ordering never splits a true duplicate. Fall back to id() if a row
-            # isn't JSON-serializable (never expected for OData scalars).
-            try:
-                sig = json.dumps(r, sort_keys=True, default=str)
-            except Exception:  # noqa: BLE001
-                sig = repr(r)
-            if sig in seen:
-                continue
-            seen.add(sig)
-            unique.append(r)
-        if len(unique) != len(rows):
+        unique, removed = _dedup_rows(result["value"])
+        if removed:
             result = dict(result)
             result["value"] = unique
-            result["@grp.deduped"] = len(rows) - len(unique)
+            result["@grp.deduped"] = removed
     return result
 
 
@@ -4140,10 +4399,28 @@ async def set_note(
 
 
 @mcp.tool()
-async def list_published(instance: str | None = None) -> Any:
-    """List customization projects currently published on the instance (read-only)."""
+async def list_published(
+    names_only: bool = False, project: str | None = None, instance: str | None = None
+) -> Any:
+    """List customization projects currently published on the instance (read-only).
+
+    The full response includes every published ITEM (screens/DACs/graphs) and can be
+    large (250KB+). Narrow it:
+      names_only=true  -> just {"projects": [name, ...]} (what publish_customization merges).
+      project="X"      -> only the published items whose key mentions project X, plus the
+                          project name list.
+    """
     async with _customization(instance) as c:
-        return await c.get_published()
+        raw = await c.get_published()
+    if names_only:
+        return {"projects": _published_project_names(raw)}
+    if project:
+        items = raw.get("items") if isinstance(raw, dict) else None
+        hit = [i for i in (items or []) if isinstance(i, dict)
+               and project.lower() in str(i.get("key", "")).lower()]
+        return {"project": project, "projects": _published_project_names(raw),
+                "item_count": len(hit), "items": hit}
+    return raw
 
 
 @mcp.tool()
@@ -4180,24 +4457,74 @@ async def import_customization(
     is_replace_if_exists: bool = True,
     project_level: int | None = None,
     project_description: str | None = None,
+    backup: bool = False,
+    backup_path: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Import a customization package (.zip on disk) into the instance.
 
     Creates/replaces the project; does NOT publish it. Requires the instance's
     profile to have "allow_publish": true.
+
+    backup=true: before a REPLACE, export the EXISTING project to disk first (cheap
+    insurance — lets you restore it if the import is wrong). Defaults the backup to
+    `<project_name>.backup.zip` beside `zip_path`; override with backup_path (must be
+    within the instance's write_roots). If the backup CANNOT be written, the import is
+    ABORTED (fail-safe) — nothing is overwritten. Skipped automatically if the project
+    doesn't exist yet (nothing to back up).
     """
     _require_publish(instance)
     _check_read_path(zip_path, instance)  # sandbox + size cap
+    backup_result: Any = None
+    if backup and is_replace_if_exists:
+        import base64
+        from pathlib import Path
+
+        dest = backup_path or str(Path(zip_path).with_name(f"{project_name}.backup.zip"))
+        try:
+            bpath = _check_write_path(dest, instance)  # write sandbox
+            async with _customization(instance) as bc:
+                ex = await bc.get_project(project_name)
+            content0 = ex.get("projectContentBase64") if isinstance(ex, dict) else None
+            if content0:
+                data = base64.b64decode(content0)
+                bpath.write_bytes(data)
+                backup_result = {"backed_up_to": str(dest), "bytes": len(data)}
+            else:
+                backup_result = {"skipped": "project not found or empty — nothing to back up"}
+        except Exception as e:  # noqa: BLE001 — do NOT overwrite without a backup
+            return {"error": f"backup failed before replace import: {str(e)[:200]}",
+                    "note": "refusing to import over the existing project without a backup. "
+                            "Pass a writable backup_path (within write_roots), or backup=false "
+                            "to skip the safety export."}
     content = encode_zip(zip_path)
     async with _customization(instance) as c:
-        return await c.import_project(
+        res = await c.import_project(
             project_name,
             content_base64=content,
             is_replace_if_exists=is_replace_if_exists,
             project_level=project_level,
             project_description=project_description,
         )
+    if backup_result is not None:
+        return {"import": res, "backup": backup_result}
+    return res
+
+
+def _published_project_names(raw: Any) -> list[str]:
+    """Extract currently-published project names from a getPublished() response —
+    shape {"projects": [{"name": ...}], "items": [...], "log": [...]} (verified live)."""
+    projects = raw.get("projects") if isinstance(raw, dict) else raw
+    names: list[str] = []
+    if isinstance(projects, list):
+        for p in projects:
+            if isinstance(p, str):
+                names.append(p)
+            elif isinstance(p, dict):
+                n = p.get("name") or p.get("Name") or p.get("projectName")
+                if n:
+                    names.append(str(n))
+    return names
 
 
 @mcp.tool()
@@ -4206,23 +4533,35 @@ async def publish_customization(
     tenant_mode: str = "Current",
     tenant_login_names: list[str] | None = None,
     options: dict | None = None,
+    mode: str = "merge",
+    dry_run: bool = False,
+    confirm_unpublish: bool = False,
     wait_seconds: float = 40.0,
     instance: str | None = None,
 ) -> Any:
-    """Publish customization project(s) — NON-BLOCKING (won't hang on the recompile).
+    """Publish customization project(s) — MERGE-safe + NON-BLOCKING.
 
-    A site recompile takes 1-3 min, longer than the MCP request timeout, so this
-    used to return a spurious timeout error even though the publish completed. Now
-    it runs the publish in a BACKGROUND task (which owns the login session and
-    polls to completion) and returns after up to `wait_seconds`:
-      • status "completed" — finished within wait_seconds (incl. fast validation
-        FAILURES, which surface here with the error log in `result`);
-      • status "in_progress" — still working server-side (phase "begin" = the
-        publishBegin call itself, which can exceed 60s on a cold site; phase
-        "publishing" = recompiling); it WILL finish on its own. Poll
-        `publish_status(job)` until status != in_progress. Do NOT re-publish
-        (that would start a second recompile). Begin/auth failures surface via
-        publish_status as status "error".
+    ⚠️ Acumatica's publishBegin publishes EXACTLY the set you pass — every currently
+    published project NOT in that set gets UNPUBLISHED. To prevent silently wiping other
+    modules (a real incident), this tool now reads what's already published and, by
+    default, MERGES:
+
+    mode="merge" (DEFAULT): publishes (currently-published ∪ project_names) — nothing is
+        ever unpublished. This is what you almost always want.
+    mode="replace": publishes ONLY project_names. Any currently-published project not in
+        the list would be unpublished — so this is REFUSED (returns `refused: true` +
+        `would_unpublish`) unless you pass confirm_unpublish=true.
+
+    dry_run=true: returns {currently_published, will_publish, will_unpublish} and writes
+        NOTHING — always run this first for a replace.
+
+    NON-BLOCKING: a recompile takes 1-3 min (longer than the MCP request timeout), so the
+    publish runs in a BACKGROUND task and returns after up to `wait_seconds`:
+      • status "completed" — finished in time (incl. fast validation FAILURES, with the
+        error log in `result`);
+      • status "in_progress" — still working (phase "begin" = publishBegin, can exceed 60s
+        on a cold site; "publishing" = recompiling). Poll `publish_status(job)` until
+        status != in_progress. Do NOT re-publish an in-progress one.
 
     WARNING: website-level — recompiles the site and affects ALL tenants. tenant_mode:
     Current | All | List (with tenant_login_names). `options` passes extra publishBegin
@@ -4230,15 +4569,57 @@ async def publish_customization(
     """
     _require_publish(instance)
     _require_range("wait_seconds", wait_seconds, 0, 120)
+    if mode not in ("merge", "replace"):
+        raise ValueError("mode must be 'merge' or 'replace'")
     inst = _cfg().get(instance or _cfg().default)
+
+    requested = list(dict.fromkeys(project_names))  # de-dupe, keep order
+    # Read the currently-published set so we never unpublish it by omission.
+    try:
+        async with _customization(instance) as rc:
+            currently = _published_project_names(await rc.get_published())
+    except Exception as e:  # noqa: BLE001 — can't confirm current state -> fail safe
+        if mode == "merge" or not confirm_unpublish:
+            return {"error": f"could not read currently-published projects to publish safely: "
+                             f"{str(e)[:200]}", "note": "publishBegin unpublishes anything not "
+                             "in the list; refusing to guess. Retry, or use mode='replace' + "
+                             "confirm_unpublish=true to publish ONLY the named set."}
+        currently = []
+
+    cur_set, req_set = set(currently), set(requested)
+    if mode == "merge":
+        publish_set = list(dict.fromkeys(currently + requested))  # union, keep others
+        will_unpublish: list[str] = []
+    else:  # replace
+        publish_set = requested
+        will_unpublish = sorted(cur_set - req_set)
+
+    if dry_run:
+        return {"dry_run": True, "mode": mode, "currently_published": sorted(cur_set),
+                "requested": requested, "will_publish": publish_set,
+                "will_unpublish": will_unpublish,
+                "note": ("merge keeps everything already published."
+                         if mode == "merge" else
+                         (f"replace would UNPUBLISH {will_unpublish} — pass "
+                          "confirm_unpublish=true to proceed." if will_unpublish
+                          else "replace set matches; nothing would be unpublished."))}
+
+    if mode == "replace" and will_unpublish and not confirm_unpublish:
+        return {"refused": True, "mode": mode, "would_unpublish": will_unpublish,
+                "currently_published": sorted(cur_set), "requested": requested,
+                "note": "These currently-published projects would be UNPUBLISHED. Re-run "
+                        "with confirm_unpublish=true to proceed, or mode='merge' to keep them."}
+
     client = CustomizationClient(inst)
     # The job is registered BEFORE publishBegin and begin runs INSIDE the background
     # task: on a cold IIS site publishBegin alone can exceed the MCP request timeout,
     # which used to kill the call with NO job recorded (publish_status said "none"
     # and you couldn't tell whether the publish had started). Begin/auth errors now
     # surface via publish_status as status "error" with phase "begin".
-    job = "+".join(project_names)
-    state: dict[str, Any] = {"job": job, "project_names": project_names, "phase": "begin",
+    job = "+".join(publish_set)
+    state: dict[str, Any] = {"job": job, "project_names": publish_set, "phase": "begin",
+                             "mode": mode, "requested": requested,
+                             "currently_published": sorted(cur_set),
                              "completed": False, "failed": None, "result": None, "error": None}
     _publish_jobs[job] = state
 
@@ -4246,7 +4627,7 @@ async def publish_customization(
         waited = 0.0
         last: Any = None
         try:
-            await client.publish_begin(project_names, tenant_mode, tenant_login_names, options)
+            await client.publish_begin(publish_set, tenant_mode, tenant_login_names, options)
             state["phase"] = "publishing"
             while waited < 1800:
                 last = await client.publish_end()
@@ -4272,7 +4653,7 @@ async def publish_customization(
 
 
 @mcp.tool()
-async def publish_status(job: str | None = None) -> Any:
+async def publish_status(job: str | None = None, instance: str | None = None) -> Any:
     """Check a background publish started by publish_customization (in-memory read,
     no API call — instant).
 
@@ -4280,16 +4661,40 @@ async def publish_status(job: str | None = None) -> Any:
     Returns the same shape (status completed | in_progress | error). A site recompile
     finishes on its own, so just poll this until status != "in_progress" — never
     re-run publish_customization to "retry" one that's still in_progress.
+
+    LIVE FALLBACK: in-memory job state is lost on a server restart (or if the request
+    that started the publish died before registering). When no in-memory job matches,
+    this queries the server's live state (getPublished) and returns the projects that
+    are actually published now, so you can still see the outcome — set `instance` to
+    enable it (else it only reports that no in-memory job exists).
     """
+    async def _live_or(default_status: str, reason: str, extra: dict | None = None) -> Any:
+        if instance is not None:
+            try:
+                async with _customization(instance) as c:
+                    names = _published_project_names(await c.get_published())
+                return {"status": "unknown_live", "in_memory": False,
+                        "currently_published": sorted(names),
+                        "note": reason + " Showing the LIVE published set from the server "
+                        "(in-memory job state was unavailable — a publish either finished or "
+                        "was never registered). If your project is listed, the publish took.",
+                        **(extra or {})}
+            except Exception as e:  # noqa: BLE001
+                return {"status": default_status, "in_memory": False,
+                        "live_error": str(e)[:200], "note": reason, **(extra or {})}
+        return {"status": default_status,
+                "note": reason + " Pass instance=<name> to read the live published state "
+                "from the server (getPublished).", **(extra or {})}
+
     if not _publish_jobs:
-        return {"status": "none",
-                "note": "No publish started in this server session (state is in-memory; "
-                        "a server restart clears it — verify via list_published instead)."}
+        return await _live_or("none", "No publish job in this server session (state is "
+                              "in-memory; a restart clears it).")
     if job is None:
         job = next(reversed(_publish_jobs))
     state = _publish_jobs.get(job)
     if state is None:
-        return {"status": "unknown", "job": job, "known_jobs": list(_publish_jobs)}
+        return await _live_or("unknown", f"No in-memory job {job!r}.",
+                              {"known_jobs": list(_publish_jobs)})
     return _publish_job_view(state)
 
 

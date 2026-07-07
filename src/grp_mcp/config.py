@@ -102,7 +102,10 @@ class Config(BaseModel):
         key = name or self.default
         if key not in self.instances:
             raise KeyError(
-                f"Unknown instance '{key}'. Configured: {', '.join(self.instances)}"
+                f"Unknown instance '{key}'. Configured: {', '.join(self.instances)}. "
+                f"If '{key}' was added session-only (add_instance persist=false), it does "
+                f"NOT survive a server restart — re-add it, or use persist=true to save it "
+                f"to connections.json (needs GRP_MCP_ALLOW_ADMIN=1)."
             )
         return self.instances[key]
 

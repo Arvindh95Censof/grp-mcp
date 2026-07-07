@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import re
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from html import escape, unescape
@@ -28,6 +29,32 @@ import httpx
 
 from .acumatica import looks_like_seat_limit
 from .config import Instance
+
+# --- shared UI-plane session cache (one login per instance identity) ----------
+# Each ScreenClient used to log in independently, so N concurrent ui_* calls opened N
+# logins and blew the "concurrent API logins" cap (a ~2-min lockout). This caches the
+# forms-auth COOKIES per instance identity so concurrent/subsequent ScreenClients reuse a
+# single login instead of each minting one. Entries idle-expire; a reused cookie that the
+# server has since dropped is invalidated on the next auth failure so the next call re-logs.
+_SESSION_CACHE: dict[str, dict] = {}          # key -> {"cookies": httpx.Cookies, "at": ts, "kind": str}
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}  # key -> lock (serialize logins per identity)
+_SESSION_TTL = 240.0                          # reuse a cached cookie for up to 4 min
+
+
+def _session_lock(key: str) -> asyncio.Lock:
+    lock = _SESSION_LOCKS.get(key)
+    if lock is None:
+        lock = _SESSION_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+def clear_session_cache(key: str | None = None) -> list[str]:
+    """Drop cached UI-plane sessions (all, or one identity key). Returns keys cleared."""
+    if key is None:
+        cleared = list(_SESSION_CACHE)
+        _SESSION_CACHE.clear()
+        return cleared
+    return [key] if _SESSION_CACHE.pop(key, None) is not None else []
 
 _XSI = "http://www.w3.org/2001/XMLSchema-instance"
 ET.register_namespace("xsi", _XSI)
@@ -238,6 +265,7 @@ class ScreenClient:
         self.seat_reliever = None
         self._logged_in = False
         self._cookie_session = False  # True if logged in via /entity/auth/login (non-SOAP)
+        self._shared = False          # True if reusing a cached shared session (don't logout)
         self._tree: ET.Element | None = None
         self._ui_booted = False
         self._classic_used = False  # guard: don't mix classic + modern graph state
@@ -354,22 +382,60 @@ class ScreenClient:
         self._logged_in = True
         self._cookie_session = True
 
+    @property
+    def _session_key(self) -> str:
+        """Identity a login is shareable across (same site + user + tenant)."""
+        i = self.instance
+        return f"{i.base_url}|{i.username}|{i.tenant}"
+
     async def _ensure_login(self) -> None:
-        """Establish a session for the MODERN plane. Tries classic SOAP Login first
-        (also required for classic ops + sets the same cookie), and on failure falls
-        back to the non-SOAP /entity/auth/login cookie — so modern-plane tools work even
-        where the SOAP screen API is disabled. No-op if already logged in either way."""
+        """Establish a session for the MODERN plane, REUSING a cached per-instance login
+        when one is warm (so N concurrent ScreenClients don't each mint a login and blow
+        the concurrent-login cap). Serialized per identity. Tries classic SOAP Login first
+        (also required for classic ops + sets the same cookie), and on failure falls back
+        to the non-SOAP /entity/auth/login cookie — so modern-plane tools work even where
+        the SOAP screen API is disabled. No-op if already logged in."""
         if self._logged_in:
             return
-        try:
-            await self.login()
-        except Exception:  # noqa: BLE001 — SOAP login disabled/blocked; try cookie login
-            await self._cookie_login()
+        key = self._session_key
+        async with _session_lock(key):
+            if self._logged_in:
+                return
+            cached = _SESSION_CACHE.get(key)
+            if cached and (time.monotonic() - cached["at"]) < _SESSION_TTL:
+                # reuse the shared cookie — no new login, no extra seat
+                self._http.cookies.update(cached["cookies"])
+                self._logged_in = True
+                self._cookie_session = cached["kind"] == "cookie"
+                self._shared = True
+                return
+            try:
+                await self.login()
+                kind = "soap"
+            except Exception:  # noqa: BLE001 — SOAP login disabled/blocked; try cookie login
+                await self._cookie_login()
+                kind = "cookie"
+            # Cache a COPY of the cookies (survives this client's aclose) and mark this
+            # client shared too, so the CREATOR doesn't log the session out on exit either
+            # — the cached session is owned by the cache (TTL / release_sessions prune it).
+            _SESSION_CACHE[key] = {"cookies": httpx.Cookies(self._http.cookies),
+                                   "at": time.monotonic(), "kind": kind}
+            self._shared = True
+
+    def _invalidate_session(self) -> None:
+        """Drop this identity's cached session — call when a reused cookie is rejected so
+        the next _ensure_login re-authenticates instead of replaying a dead cookie."""
+        _SESSION_CACHE.pop(self._session_key, None)
 
     async def logout(self) -> None:
         if not self._logged_in:
             return
         self._logged_in = False
+        # A SHARED (cache-reused) session is owned by the cache, not this client — logging
+        # it out would kill it for every other in-flight ScreenClient. Leave it; cached
+        # sessions idle-expire server-side and are pruned by TTL / release_sessions.
+        if self._shared:
+            return
         try:
             if self._cookie_session:
                 await self._http.post(
@@ -521,7 +587,7 @@ class ScreenClient:
         if err:
             raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
 
-    async def _ui_post(self, payload: dict) -> httpx.Response:
+    async def _ui_post(self, payload: dict, _auth_retried: bool = False) -> httpx.Response:
         # The modern plane rides the SOAP login cookie (same ASP.NET app). If no
         # login has run this session, self-authenticate rather than silently
         # bouncing to Login.aspx (which _ui_error would now flag, but self-healing
@@ -559,7 +625,20 @@ class ScreenClient:
             for view, block in self._active_tree_context_views.items():
                 vp.setdefault(view, block)
             payload = {**payload, "viewsParams": vp}
-        return await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
+        resp = await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
+        # If we REUSED a cached shared cookie and the server has since dropped it, the
+        # reply is a Login redirect. Invalidate the stale cache entry, re-login fresh, and
+        # retry once. Only for reused sessions — a fresh login that "fails auth" is a real
+        # credential problem, not a stale-cookie one.
+        if not _auth_retried and self._shared:
+            err = self._ui_error(resp)
+            if err and "not authenticated" in err.lower():
+                self._invalidate_session()
+                self._logged_in = False
+                self._shared = False
+                self._ui_booted = False
+                return await self._ui_post(payload, _auth_retried=True)
+        return resp
 
     async def ui_select_tree_node(self, tree_view: str, node_key: dict,
                                    parent_key: dict | None = None,
@@ -836,6 +915,15 @@ class ScreenClient:
         await self._ensure_login()
         resp = await self._http.get(self.ui_url + "/structure", headers={"Accept": "application/json"})
         err = self._ui_error(resp)
+        if err and self._shared and "not authenticated" in err.lower():
+            # reused cookie was dropped server-side — re-login fresh and retry once
+            self._invalidate_session()
+            self._logged_in = False
+            self._shared = False
+            await self._ensure_login()
+            resp = await self._http.get(self.ui_url + "/structure",
+                                        headers={"Accept": "application/json"})
+            err = self._ui_error(resp)
         if err:
             raise ScreenError(f"get_ui_structure {self.screen_id}: {err}")
         d = resp.json()
@@ -1555,22 +1643,36 @@ class ScreenClient:
         per-container service commands (NewRow/Key/DeleteRow). This is what you
         feed back into submit().
         """
-        xml = await self.get_schema_xml()
+        # Parse the schema as a TREE, not by regex. The old regex required each
+        # container to open with a paired <DisplayName>…</DisplayName>, so a container
+        # with an empty/self-closing/absent DisplayName — an "unnamed" SUMMARY/header
+        # container (e.g. PY302000's PayCodeCD/Description/Type header) — was dropped
+        # ENTIRELY, leaving the record un-navigable. A tree walk keys every direct
+        # child that holds field descriptors, named or not (falling back to _Summary).
+        tree = await self._ensure_tree()
+
+        def _local(tag: str) -> str:
+            return tag.rsplit("}", 1)[-1]
+
         containers: dict[str, dict] = {}
-        # each top-level container is <Name>...<DisplayName>..</DisplayName>...</Name>
-        for cm in re.finditer(r"<(\w+)><DisplayName>(.*?)</DisplayName>(.*?)</\1>", xml, re.S):
-            cname, _disp, body = cm.group(1), cm.group(2), cm.group(3)
+        for cont in tree:
+            cname = _local(cont.tag)
+            # skip the action container (its children are toolbar actions, not data
+            # fields — use {"action": ...} in submit) + schema-level scalars.
+            if cname in ("ServiceCommands", "DisplayName", "Actions"):
+                continue
             fields: dict[str, dict] = {}
-            for fm in re.finditer(
-                r"<(\w+)><FieldName>([^<]*)</FieldName><ObjectName>([^<]*)</ObjectName>",
-                body,
-            ):
-                friendly, field, obj = fm.group(1), fm.group(2), fm.group(3)
-                if friendly in ("ServiceCommands",):
+            for fld in cont:
+                fname = _local(fld.tag)
+                if fname in ("DisplayName", "ServiceCommands"):
                     continue
-                fields.setdefault(friendly, {"object": obj, "field": field})
+                field = fld.findtext("FieldName")
+                obj = fld.findtext("ObjectName")
+                if field is not None and obj is not None:
+                    fields.setdefault(fname, {"object": obj, "field": field})
             if fields:
-                containers[cname] = fields
+                # an unnamed container has a real XML tag anyway; only fall back if blank
+                containers.setdefault(cname or "_Summary", fields)
         return {"screen_id": self.screen_id, "containers": containers}
 
     # ---- schema tree (for descriptor-based commands) -------------------

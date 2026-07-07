@@ -15,6 +15,7 @@ import pytest
 from grp_mcp import server
 from grp_mcp.acumatica import AcumaticaClient, AcumaticaError
 from grp_mcp.config import Config, Instance
+from grp_mcp.customization import CustomizationClient
 from grp_mcp.screen import ScreenClient, ScreenError
 
 
@@ -26,6 +27,15 @@ def _inst(**over) -> Instance:
     )
     base.update(over)
     return Instance(**base)
+
+
+@pytest.fixture(autouse=True)
+def _clear_ui_session_cache():
+    """The shared UI-plane cookie cache is module-global; isolate tests from each other."""
+    from grp_mcp import screen as _screen
+    _screen._SESSION_CACHE.clear()
+    yield
+    _screen._SESSION_CACHE.clear()
 
 
 @pytest.fixture
@@ -1172,7 +1182,7 @@ def test_dac_dedup_collapses_identical_rows(cfg, monkeypatch):
     dup = {"value": [{"FinPeriodID": "01-2026"}, {"FinPeriodID": "01-2026"},
                      {"FinPeriodID": "02-2026"}]}
 
-    async def fake_run_dac(self, dac, params=None):
+    async def fake_run_dac(self, dac, params=None, timeout=None):
         return json.loads(json.dumps(dup))  # fresh copy
 
     monkeypatch.setattr(AcumaticaClient, "run_dac", fake_run_dac)
@@ -1346,3 +1356,190 @@ def test_ensure_login_prefers_soap_and_is_noop_when_logged_in():
     assert calls == {"soap": 1, "cookie": 0} and s._cookie_session is False
     asyncio.run(s._ensure_login())          # already logged in -> no-op
     assert calls == {"soap": 1, "cookie": 0}
+
+
+# ---- v0.43: publish merge-not-replace safety (#1/#2) ------------------------
+
+def test_published_project_names_extractor():
+    f = server._published_project_names
+    assert f({"projects": [{"name": "A"}, {"name": "B"}], "items": []}) == ["A", "B"]
+    assert f(["X", {"name": "Y"}]) == ["X", "Y"]
+    assert f({"nope": 1}) == []
+
+
+def _mock_published(monkeypatch, names):
+    async def fake_get_published(self):
+        return {"projects": [{"name": n} for n in names]}
+
+    async def fake_aclose(self):
+        return None
+
+    monkeypatch.setattr(CustomizationClient, "get_published", fake_get_published)
+    monkeypatch.setattr(CustomizationClient, "aclose", fake_aclose)
+
+
+def test_publish_merge_dry_run_keeps_existing(cfg, monkeypatch):
+    _mock_published(monkeypatch, ["grp_mcp"])
+    out = asyncio.run(server.publish_customization(["NewThing"], mode="merge",
+                                                   dry_run=True, instance="rw"))
+    assert out["will_publish"] == ["grp_mcp", "NewThing"]
+    assert out["will_unpublish"] == []
+
+
+def test_publish_replace_dry_run_flags_unpublish(cfg, monkeypatch):
+    _mock_published(monkeypatch, ["grp_mcp"])
+    out = asyncio.run(server.publish_customization(["NewThing"], mode="replace",
+                                                   dry_run=True, instance="rw"))
+    assert out["will_publish"] == ["NewThing"]
+    assert out["will_unpublish"] == ["grp_mcp"]
+
+
+def test_publish_replace_refuses_without_confirm(cfg, monkeypatch):
+    _mock_published(monkeypatch, ["grp_mcp", "other"])
+    out = asyncio.run(server.publish_customization(["NewThing"], mode="replace",
+                                                   instance="rw"))
+    assert out["refused"] is True
+    assert set(out["would_unpublish"]) == {"grp_mcp", "other"}
+
+
+def test_publish_requires_allow_publish(cfg):
+    # 'ro' profile has allow_publish=False
+    with pytest.raises(PermissionError):
+        asyncio.run(server.publish_customization(["X"], dry_run=True, instance="ro"))
+
+
+def test_publish_invalid_mode_raises(cfg):
+    with pytest.raises(ValueError):
+        asyncio.run(server.publish_customization(["X"], mode="bogus", instance="rw"))
+
+
+# ---- v0.44: parser & robustness fixes ---------------------------------------
+
+def test_get_swagger_raises_clear_error_on_non_json(monkeypatch):
+    from grp_mcp.acumatica import AcumaticaError
+
+    inst = _inst(endpoint_name="GRP9", endpoint_version="1")
+    client = AcumaticaClient(inst)
+
+    async def fake_request(method, url, **kw):
+        return "<html>error page</html>"  # non-JSON -> a str, not a dict
+
+    client._request = fake_request
+    with pytest.raises(AcumaticaError) as ei:
+        asyncio.run(client.get_swagger())
+    assert "OpenAPI" in str(ei.value) and "GRP9/1" in str(ei.value)
+
+
+def test_get_schema_captures_unnamed_container(monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    # a summary container with NO DisplayName (the old regex dropped it) + a named one
+    root = ET.fromstring(
+        "<root>"
+        "<SummaryHeader>"
+        "  <PayCodeCD><FieldName>PayCodeCD</FieldName><ObjectName>PayCode</ObjectName></PayCodeCD>"
+        "  <Type><FieldName>PayType</FieldName><ObjectName>PayCode</ObjectName></Type>"
+        "</SummaryHeader>"
+        "<Actions><Save><FieldName>Save</FieldName><ObjectName>x</ObjectName></Save></Actions>"
+        "<Details>"
+        "  <DisplayName>Detail Lines</DisplayName>"
+        "  <Amount><FieldName>Amount</FieldName><ObjectName>Line</ObjectName></Amount>"
+        "</Details>"
+        "</root>")
+    s = ScreenClient(_inst(), "PY302000")
+
+    async def fake_tree():
+        return root
+
+    s._ensure_tree = fake_tree
+    out = asyncio.run(s.get_schema())
+    conts = out["containers"]
+    assert "SummaryHeader" in conts                       # unnamed (no DisplayName) captured
+    assert conts["SummaryHeader"]["PayCodeCD"] == {"object": "PayCode", "field": "PayCodeCD"}
+    assert "Details" in conts                              # named still works
+    assert "Actions" not in conts                          # action container excluded
+
+
+def test_run_dac_filter_in_runs_per_value(cfg, monkeypatch):
+    calls = []
+
+    async def fake_run_dac(self, dac, params=None, timeout=None):
+        calls.append((params or {}).get("$filter"))
+        v = (params or {}).get("$filter", "").split("'")[1]
+        return {"value": [{"ScreenID": v}]}
+
+    monkeypatch.setattr(AcumaticaClient, "run_dac", fake_run_dac)
+    out = asyncio.run(server.run_dac_odata(
+        "SiteMap", select="ScreenID",
+        filter_in={"ScreenID": ["GL101000", "GL201000"]}, instance="rw"))
+    assert len(calls) == 2 and "or" not in " ".join(calls)   # per-value, no giant OR
+    assert {r["ScreenID"] for r in out["value"]} == {"GL101000", "GL201000"}
+
+
+def test_config_unknown_instance_error_mentions_session_only():
+    c = Config(default="a", instances={"a": _inst()})
+    try:
+        c.get("csmstg")
+        assert False
+    except KeyError as e:
+        assert "session-only" in str(e) and "persist" in str(e)
+
+
+# ---- v0.45: shared cookie session + endpoint-entity generator ---------------
+
+def test_shared_session_reuse_across_clients(monkeypatch):
+    from grp_mcp import screen as scr
+    scr._SESSION_CACHE.clear()
+    logins = {"soap": 0}
+
+    async def fake_login(self):
+        logins["soap"] += 1
+        self._logged_in = True
+        self._cookie_session = False
+
+    monkeypatch.setattr(ScreenClient, "login", fake_login)
+    inst = _inst()
+    # first client logs in + caches; second reuses the cache (no new login)
+    a = ScreenClient(inst, "GL101000")
+    asyncio.run(a._ensure_login())
+    b = ScreenClient(inst, "GL201000")
+    asyncio.run(b._ensure_login())
+    assert logins["soap"] == 1               # only ONE login for both clients
+    assert a._shared and b._shared           # both defer logout to the cache
+    key = a._session_key
+    assert key in scr._SESSION_CACHE
+    assert scr.clear_session_cache(key) == [key]
+    assert key not in scr._SESSION_CACHE
+
+
+def test_shared_session_not_logged_out(monkeypatch):
+    from grp_mcp import screen as scr
+    scr._SESSION_CACHE.clear()
+
+    async def fake_login(self):
+        self._logged_in = True
+
+    called = {"soap_logout": 0}
+
+    async def fake_call(self, op, inner, _seat_retried=False):
+        if op == "Logout":
+            called["soap_logout"] += 1
+        return ""
+
+    monkeypatch.setattr(ScreenClient, "login", fake_login)
+    monkeypatch.setattr(ScreenClient, "_call", fake_call)
+    s = ScreenClient(_inst(), "GL101000")
+    asyncio.run(s._ensure_login())     # creates + caches -> _shared True
+    asyncio.run(s.logout())            # must NOT log out a shared session
+    assert called["soap_logout"] == 0
+    assert s._session_key in scr._SESSION_CACHE
+
+
+def test_edm_to_valuetype_mapping():
+    f = server._edm_to_valuetype
+    assert f("Edm.String") == "StringValue"
+    assert f("Boolean") == "BooleanValue"
+    assert f("Int16") == "ShortValue"
+    assert f("Int32") == "IntValue"
+    assert f("DateTime") == "DateTimeValue"
+    assert f("WeirdType") == "StringValue"   # safe default
