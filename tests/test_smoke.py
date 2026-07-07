@@ -1279,9 +1279,9 @@ def test_reset_calendar_needs_delete_gate(cfg):
 
 # ---- v0.43: company-tree limitation is documented ---------------------------
 
-def test_setup_map_documents_company_tree_limitation():
+def test_setup_map_documents_company_tree_recipe():
     ids = {r["id"] for r in server._setup_map()["cross_cutting_rules"]}
-    assert "company-tree-select-not-api-driveable" in ids
+    assert "company-tree-build-via-ep204060" in ids
 
 
 # ---- v0.42: non-SOAP cookie login for the modern plane ----------------------
@@ -1533,6 +1533,23 @@ def test_shared_session_not_logged_out(monkeypatch):
     asyncio.run(s.logout())            # must NOT log out a shared session
     assert called["soap_logout"] == 0
     assert s._session_key in scr._SESSION_CACHE
+
+
+def test_flatten_tree_preorder_depths():
+    f = server._flatten_tree
+    struct = [{"name": "R", "children": [
+        {"name": "A", "children": ["A1", "A2"]},
+        "B"]}]
+    assert f(struct) == [("R", 0), ("A", 1), ("A1", 2), ("A2", 2), ("B", 1)]
+    assert f(["X"]) == [("X", 0)]
+    with pytest.raises(ValueError):
+        f([{"children": []}])   # node without a name
+
+
+def test_build_company_tree_is_registered_tool():
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert "build_company_tree" in names
+    assert "_flatten_tree" not in names   # helper stays private
 
 
 def test_edm_to_valuetype_mapping():

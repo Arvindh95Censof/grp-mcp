@@ -2844,6 +2844,110 @@ async def chart_of_accounts(
         )
 
 
+def _flatten_tree(nodes: list, depth: int = 0, out: list | None = None) -> list:
+    """Pre-order (DFS) flatten of a nested workgroup structure to [(name, depth), ...].
+    Each node is {"name": str, "children": [...]} (children optional) or a bare "name"."""
+    out = [] if out is None else out
+    for n in nodes:
+        if isinstance(n, str):
+            name, kids = n, []
+        else:
+            name, kids = n.get("name"), (n.get("children") or [])
+        if not name:
+            raise ValueError(f"tree node missing 'name': {n!r}")
+        out.append((str(name), depth))
+        _flatten_tree(kids, depth + 1, out)
+    return out
+
+
+@mcp.tool()
+async def build_company_tree(
+    structure: Any,
+    skip_if_root_exists: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Build a Company Tree workgroup hierarchy (EP204060) — the ONLY headless way.
+
+    The Company Tree screen (EP204061) can't be driven by the API — its parent link is
+    set by clicking a tree node, and no field/path/command reproduces that (exhaustively
+    proven). But the *Import Company Tree* form (EP204060) exposes a GRID + indent
+    actions instead, which ARE drivable. This builds any hierarchy through it:
+    pre-order (DFS), and for each node — bootstrap, insert into the "List of Groups"
+    (Items) grid, fire `Right` (indent) `depth` times to nest it under the correct
+    ancestor, then Save. Proven live (parents verified against EPCompanyTree).
+
+    structure: the tree, as nested {"name": str, "children": [...]} dicts — a single
+        root dict, or a LIST of root dicts for a multi-root tree. `children` is optional
+        (a leaf). A bare string is a leaf shorthand. Example:
+            {"name": "YM SETUP", "children": [
+                {"name": "Acc Receivables", "children": [
+                    {"name": "AR Invoice and Memo", "children": [
+                        "AR Invoice Approver", "AR Invoice Reviewer"]}]},
+                "General Ledger", "Cash Book"]}
+    skip_if_root_exists: if the first root name already exists on the instance, refuse
+        (return skipped=true) so a re-run can't duplicate the tree. Set false to force.
+
+    Requires allow_write. Members are NOT added here (add separately). Returns the built
+    node list + a per-node parent verification read back from EPCompanyTree.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    roots = structure if isinstance(structure, list) else [structure]
+    flat = _flatten_tree(roots)
+    if not flat:
+        return {"error": "empty structure"}
+
+    async def _existing() -> dict:
+        try:
+            r = await _client(instance).run_dac(
+                "EPCompanyTree", {"$select": "WorkGroupID,Description,ParentWGID"}, timeout=110)
+            return {x.get("Description"): x for x in (r.get("value") or [])}
+        except Exception as e:  # noqa: BLE001
+            return {"__error__": str(e)[:200]}
+
+    before = await _existing()
+    root_name = flat[0][0]
+    if skip_if_root_exists and root_name in before:
+        return {"skipped": True, "root": root_name,
+                "note": f"root '{root_name}' already exists — refusing to duplicate. "
+                        "Pass skip_if_root_exists=false to build anyway."}
+
+    built: list[dict] = []
+    async with ScreenClient(inst, "EP204060") as s:
+        for name, depth in flat:
+            await s.ui_bootstrap(["Folders", "Items", "Members"])
+            await s.ui_insert_grid_row("Items", {"Description": name}, skip_validation=True)
+            for _ in range(depth):
+                await s.ui_command("Right")   # indent the just-inserted (current) node
+            await s.ui_command("Save")
+            built.append({"name": name, "depth": depth})
+
+    # verify parents against the DB
+    after = await _existing()
+    by_id = {v["WorkGroupID"]: k for k, v in after.items() if isinstance(v, dict)}
+    checks: list[dict] = []
+    ok_all = True
+
+    def _verify(nodes: list, parent: str | None) -> None:
+        nonlocal ok_all
+        for n in nodes:
+            name = n if isinstance(n, str) else n.get("name")
+            kids = [] if isinstance(n, str) else (n.get("children") or [])
+            row = after.get(name)
+            got = by_id.get(row["ParentWGID"], "ROOT") if isinstance(row, dict) else "MISSING"
+            want = parent or "ROOT"
+            good = got == want
+            ok_all = ok_all and good
+            checks.append({"name": name, "parent": got, "expected": want, "ok": good})
+            _verify(kids, name)
+
+    _verify(roots, None)
+    return {"built": len(built), "root": root_name,
+            "verified": ok_all, "nodes": checks,
+            "note": ("all parents verified against EPCompanyTree." if ok_all
+                     else "SOME parents differ — review nodes[].ok=false.")}
+
+
 @mcp.tool()
 async def generate_master_calendar(
     from_year: str, to_year: str | None = None, instance: str | None = None

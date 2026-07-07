@@ -558,6 +558,16 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.44 — **`build_company_tree`** — build a Company Tree workgroup hierarchy headlessly. The
+Company Tree screen (EP204061) can't be API-driven (its parent link is set only by clicking a
+tree node — exhaustively proven across 13 techniques), but the **Import Company Tree** form
+(EP204060) exposes a grid + indent actions that *are* drivable. The tool takes a nested
+`{"name","children":[…]}` structure and builds it pre-order — for each node: insert into the
+"List of Groups" grid, fire `Right` (indent) ×depth to nest it, Save — then **verifies every
+parent** against `EPCompanyTree`. Proven live: a full 15-node YM tree built + verified. The old
+"company tree is browser-only" limitation is **corrected** (memory + setup_map now carry the
+EP204060 recipe). Still open: workgroup members + the EP205015 approval-map tree.
+
 v0.43.1 — bugfix: in 0.43.0 a helper (`_dedup_rows`) accidentally took `run_dac_odata`'s
 `@mcp.tool()` decorator, so **`run_dac_odata` was not exposed as a tool** on the 0.43.0
 release (and the internal `_activation_status` poller leaked as one). Both fixed; a
