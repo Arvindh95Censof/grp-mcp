@@ -1535,6 +1535,67 @@ def test_shared_session_not_logged_out(monkeypatch):
     assert s._session_key in scr._SESSION_CACHE
 
 
+def _fake_async_client(sink):
+    """A stand-in httpx.AsyncClient that records POST urls instead of hitting the net."""
+    import httpx as _httpx
+
+    class _Fake:
+        def __init__(self, *a, **k):
+            self._cookies = k.get("cookies")
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, *a, **k):
+            sink.append(url)
+            return _httpx.Response(204)
+    return _Fake
+
+
+def test_logout_session_cache_ends_session_serverside(monkeypatch):
+    # The leak fix: dropping a shared cookie session must LOG IT OUT server-side
+    # (POST /entity/auth/logout with its cookies), not just forget it locally.
+    from grp_mcp import screen as scr
+    import httpx as _httpx
+    scr._SESSION_CACHE.clear()
+    key = "http://localhost/AcumaticaERP|admin|Company"
+    scr._SESSION_CACHE[key] = {"cookies": _httpx.Cookies(), "at": 0.0, "kind": "cookie"}
+    posted: list[str] = []
+    monkeypatch.setattr(scr.httpx, "AsyncClient", _fake_async_client(posted))
+
+    done = asyncio.run(scr.logout_session_cache())
+
+    assert done == [key]                                   # returned the identity logged out
+    assert key not in scr._SESSION_CACHE                   # dropped locally
+    # base_url parsed from the key, contract logout endpoint hit
+    assert posted == ["http://localhost/AcumaticaERP/entity/auth/logout"]
+
+
+def test_logout_session_cache_best_effort_on_failure(monkeypatch):
+    # A failed server logout must still drop the entry (idle-timeout is the backstop) —
+    # never leave a dead cookie wedged in the cache.
+    from grp_mcp import screen as scr
+    import httpx as _httpx
+    scr._SESSION_CACHE.clear()
+    key = "http://localhost/AcumaticaERP|admin|Company"
+    scr._SESSION_CACHE[key] = {"cookies": _httpx.Cookies(), "at": 0.0, "kind": "cookie"}
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, *a, **k):
+            raise _httpx.ConnectError("network down")
+
+    monkeypatch.setattr(scr.httpx, "AsyncClient", _Boom)
+    done = asyncio.run(scr.logout_session_cache())
+    assert done == [key]                     # still reported handled
+    assert key not in scr._SESSION_CACHE      # and still dropped
+
+
 def test_flatten_tree_preorder_depths():
     f = server._flatten_tree
     struct = [{"name": "R", "children": [

@@ -558,6 +558,20 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.46 — **seat-leak fix.** Shared UI-plane cookie sessions are marked `_shared` so nobody
+logs them out on close (the cache owns them) — but the only disposal path,
+`clear_session_cache`, merely dropped the local dict entry, leaving the ASP.NET forms-auth
+session (and its "Max Web Services API Users" seat) **alive server-side until idle-timeout**.
+On a trial (2 seats) this jams the next login with "API Login Limit" — and `_relieve_api_seats`
+only reclaimed contract-REST clients, never the UI cookie cache, so the auto-recovery freed the
+wrong pool. Fixed: new async `logout_session_cache` POSTs `/entity/auth/logout` with each
+cached session's own cookies before dropping it; `release_sessions` and `_relieve_api_seats`
+both use it, so a seat frees immediately (and a seat-limit fault self-heals). Best-effort — a
+failed logout still drops the entry, with idle-timeout as backstop. Also confirmed live: modern
+UI does **not** crack the EP204061 tree-node click (the `Folders` tree is virtualized — only the
+root node materializes, so `MoveWorkGroup` runs with a null SelectedNode → null-ref); EP204060
+stays the one working door. +2 tests (132 total).
+
 v0.44 — **`build_company_tree`** — build a Company Tree workgroup hierarchy headlessly. The
 Company Tree screen (EP204061) can't be API-driven (its parent link is set only by clicking a
 tree node — exhaustively proven across 13 techniques), but the **Import Company Tree** form

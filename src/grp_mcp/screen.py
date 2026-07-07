@@ -49,12 +49,51 @@ def _session_lock(key: str) -> asyncio.Lock:
 
 
 def clear_session_cache(key: str | None = None) -> list[str]:
-    """Drop cached UI-plane sessions (all, or one identity key). Returns keys cleared."""
+    """Drop cached UI-plane sessions LOCALLY (all, or one identity key). Returns keys
+    cleared. NOTE: this only forgets the cookie — it does NOT end the session
+    server-side, so the ASP.NET forms-auth session (and its Web Services API seat)
+    lives on until idle-timeout. To free the seat NOW, use `logout_session_cache`
+    (async). Kept sync for non-network callers (tests, _invalidate_session)."""
     if key is None:
         cleared = list(_SESSION_CACHE)
         _SESSION_CACHE.clear()
         return cleared
     return [key] if _SESSION_CACHE.pop(key, None) is not None else []
+
+
+async def logout_session_cache(key: str | None = None) -> list[str]:
+    """Server-side LOG OUT cached UI-plane sessions, then drop them — freeing the seat
+    immediately instead of at idle-timeout. Returns identity keys logged out.
+
+    Fixes the shared-session seat LEAK: a cached cookie session is marked `_shared`,
+    so neither its creator nor any reuser logs it out on aclose (by design — the cache
+    owns it). Previously the ONLY disposal path, clear_session_cache(), just dropped the
+    local dict entry, leaving the ASP.NET forms-auth session alive server-side holding a
+    'Max Web Services API Users' seat until it idle-timed-out. This posts
+    /entity/auth/logout with each cached session's own cookies first, ending it now.
+    Best-effort: a failed logout still drops the entry (idle-timeout is the backstop).
+
+    key: log out one identity (base_url|user|tenant); omit for ALL cached sessions."""
+    if key is None:
+        items = list(_SESSION_CACHE.items())
+        _SESSION_CACHE.clear()
+    else:
+        entry = _SESSION_CACHE.pop(key, None)
+        items = [(key, entry)] if entry is not None else []
+    done: list[str] = []
+    for k, entry in items:
+        if not entry:
+            continue
+        base_url = k.split("|", 1)[0].rstrip("/")  # key == base_url|username|tenant
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True,
+                                         cookies=entry.get("cookies")) as c:
+                # the contract logout ends the forms-auth session both login kinds share
+                await c.post(f"{base_url}/entity/auth/logout")
+        except Exception:  # noqa: BLE001 — best-effort; drop it regardless
+            pass
+        done.append(k)
+    return done
 
 _XSI = "http://www.w3.org/2001/XMLSchema-instance"
 ET.register_namespace("xsi", _XSI)

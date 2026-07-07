@@ -19,7 +19,7 @@ from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
-from .screen import ScreenClient, ScreenError, clear_session_cache
+from .screen import ScreenClient, ScreenError, clear_session_cache, logout_session_cache
 
 _KB_FIRST_POLICY = (
     "TOOL SELECTION: this server has ~77 tools across FOUR Acumatica planes (contract "
@@ -184,7 +184,11 @@ async def _relieve_api_seats(exclude: object | None = None) -> None:
     has 2), the client calls this to log out the OTHER cached sessions this process
     holds, then retries once. `exclude` is the client mid-request (never logged out).
     ScreenClient/CustomizationClient sessions are context-managed and self-release, so
-    the persistent seat holders are the cached contract clients in `_clients`.
+    the persistent seat holders are BOTH the cached contract clients in `_clients` AND
+    the shared UI-plane cookie sessions in the session cache — the latter are `_shared`
+    and never self-logout, so a seat-limit fault must reclaim them here too (without
+    this, relieving freed only contract seats and a leaked UI cookie session kept the
+    login blocked — observed live 2026-07-07).
     """
     for name, client in list(_clients.items()):
         if client is exclude:
@@ -194,6 +198,13 @@ async def _relieve_api_seats(exclude: object | None = None) -> None:
             await client.aclose()
         except Exception:  # noqa: BLE001 — best-effort seat relief
             pass
+    # Log out leaked shared UI cookie sessions server-side too. The client mid-login
+    # hasn't cached its own session yet (the cache entry is written only after a
+    # successful login), so `exclude` can't be in here — safe to log out all.
+    try:
+        await logout_session_cache()
+    except Exception:  # noqa: BLE001 — best-effort seat relief
+        pass
 
 
 # Both client types self-recover from a seat-limit fault via this reliever (retry once).
@@ -2237,10 +2248,13 @@ async def screen_get(
 async def release_sessions(instance: str | None = None) -> Any:
     """Log out cached API sessions to free Web Service API license seats.
 
-    Each instance's contract-REST client keeps a logged-in session (one of the
-    instance's "Max Web Services API Users" seats — a trial allows only 2). This
-    logs out and drops the cached client(s) so the seat is freed immediately
-    rather than at idle timeout; the next tool call transparently re-logs in.
+    Frees BOTH seat holders: (1) each instance's contract-REST client session, and
+    (2) the shared UI-plane cookie sessions (modern /ui/screen + classic SOAP). Both
+    consume a "Max Web Services API Users" seat (a trial allows only 2). This logs
+    them out SERVER-SIDE and drops the cache so the seat frees immediately rather than
+    at idle-timeout; the next tool call transparently re-logs in. (Before this fix,
+    the UI cookie sessions were only dropped locally and leaked their seat until
+    idle-timeout — the common cause of a stuck "API Login Limit".)
 
     instance: release just that profile; omit to release ALL cached sessions.
     Use it when you hit "API Login Limit", or after a batch of work.
@@ -2255,17 +2269,19 @@ async def release_sessions(instance: str | None = None) -> Any:
             except Exception:
                 pass
             released.append(name)
-    # Also drop cached shared UI-plane (cookie) sessions so their seats free too. The
-    # cache is keyed by site+user+tenant, not profile name, so a per-instance release maps
-    # to its identity key; omit instance to clear all.
+    # Also LOG OUT cached shared UI-plane (cookie) sessions server-side so their seats
+    # free NOW, not at idle-timeout — dropping the local cache alone leaves the ASP.NET
+    # session (and its seat) alive (the shared-session leak). The cache is keyed by
+    # site+user+tenant, not profile name, so a per-instance release maps to its identity
+    # key; omit instance to log out all.
     if instance is not None:
         try:
             inst = _cfg().get(instance)
-            ui_cleared = clear_session_cache(f"{inst.base_url}|{inst.username}|{inst.tenant}")
+            ui_cleared = await logout_session_cache(f"{inst.base_url}|{inst.username}|{inst.tenant}")
         except Exception:  # noqa: BLE001
             ui_cleared = []
     else:
-        ui_cleared = clear_session_cache()
+        ui_cleared = await logout_session_cache()
     return {"released": released, "ui_sessions_cleared": ui_cleared,
             "remaining_cached": list(_clients.keys())}
 
