@@ -403,6 +403,22 @@ def test_discover_prereqs_parses_real_payroll_errors():
     assert _DETAIL_RULE_PAT.search(tax)
 
 
+def test_endpoint_top_level_entities_parses_path_tree():
+    from grp_mcp.server import _endpoint_top_level_entities
+    tree = [
+        {"Path": {"value": "Endpoint"}, "Text": {"value": "Endpoint"}},          # root -> skip
+        {"Path": {"value": "Endpoint/Account"}, "Text": {"value": "Account"}},   # top-level
+        {"Path": {"value": "Endpoint/SalesOrder"}, "Text": {"value": "SalesOrder"}},
+        {"Path": {"value": "Endpoint/SalesOrder/Details"}, "Text": {"value": "Details"}},  # nested -> skip
+        {"Path": {"value": "Endpoint/PayGroup"}, "Text": {"value": "PayGroup ↓"}},  # inherited: strip arrow
+    ]
+    assert _endpoint_top_level_entities(tree) == ["Account", "PayGroup", "SalesOrder"]
+    # legacy tree shape fallback
+    legacy = [{"ObjectName": {"value": "PayCode"}}, {"Name": "Ledger"}]
+    assert _endpoint_top_level_entities(legacy) == ["Ledger", "PayCode"]
+    assert _endpoint_top_level_entities(None) == []
+
+
 def test_topo_order_linear_and_cycle():
     from grp_mcp.server import _topo_order
     # C depends on B depends on A  -> A, B, C

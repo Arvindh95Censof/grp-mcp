@@ -781,25 +781,55 @@ async def get_endpoint_definition(
         raw = await _client(instance).get_entity(
             "WebServiceEndpoints", rid, {"$expand": "EntityTree"})
         tree = raw.get("EntityTree") if isinstance(raw, dict) else None
-        names: list[str] = []
-        if isinstance(tree, list):
-            for node in tree:
-                if not isinstance(node, dict):
-                    continue
-                for key in ("ObjectName", "EntityName", "Name"):
-                    v = node.get(key)
-                    val = v.get("value") if isinstance(v, dict) else v
-                    if val:
-                        names.append(str(val))
-                        break
+        names = _endpoint_top_level_entities(tree)
         if names:
-            return {"endpoint": rid, "entities": sorted(set(names)), "count": len(set(names))}
+            return {"endpoint": rid, "entities": names, "count": len(names)}
         return {"endpoint": rid, "entities": None,
                 "note": "could not parse entity names from EntityTree; returning it raw",
                 "EntityTree": tree}
     return await _client(instance).get_entity(
         "WebServiceEndpoints", rid, {"$expand": expand}
     )
+
+
+def _node_val(node: dict, key: str) -> str | None:
+    """A SM207060 EntityTree node stores each field as {"value": ...}; unwrap it."""
+    v = node.get(key)
+    if isinstance(v, dict):
+        v = v.get("value")
+    return str(v) if v not in (None, "") else None
+
+
+def _endpoint_top_level_entities(tree: Any) -> list[str]:
+    """Top-level entity names from an SM207060 EntityTree (pure, unit-testable).
+
+    The tree is a flat node list; each node's `Path` is a slash path rooted at
+    "Endpoint" ("Endpoint" = root, "Endpoint/Account" = a top-level entity,
+    "Endpoint/SalesOrder/Details" = a nested detail collection). Top-level entities
+    are the depth-1 nodes (exactly one segment under Endpoint); `Text` holds the
+    display name. Falls back to legacy ObjectName/EntityName/Name keys for older
+    tree shapes. Returned sorted + de-duped."""
+    names: set[str] = set()
+    if not isinstance(tree, list):
+        return []
+    for node in tree:
+        if not isinstance(node, dict):
+            continue
+        path = _node_val(node, "Path")
+        if path:
+            parts = path.split("/")
+            if len(parts) == 2 and parts[0] == "Endpoint":
+                # `Text` decorates inherited entities with a trailing "↓" (U+2193) — strip it.
+                nm = (_node_val(node, "Text") or parts[1]).replace("↓", "").strip()
+                if nm:
+                    names.add(nm)
+            continue
+        for key in ("ObjectName", "EntityName", "Name"):  # legacy tree shape
+            val = _node_val(node, key)
+            if val:
+                names.add(val)
+                break
+    return sorted(names)
 
 
 _EDM_VALUETYPE = {
@@ -2147,6 +2177,107 @@ async def ui_populate_endpoint_entity_fields(
 
 
 @mcp.tool()
+async def ensure_entity_on_endpoint(
+    screen_id: str,
+    entity_name: str,
+    endpoint_name: str,
+    endpoint_version: str,
+    populate_views: list[str] | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Make a screen REST-drivable in ONE call: ensure its entity exists on a web-service
+    endpoint, adding it via the SM207060 wizard if missing. The gap-closer for custom
+    screens that 404 on contract REST only because their DAC was never mapped (e.g. the
+    whole CSPY payroll module on a stock endpoint).
+
+    Idempotent: reads the endpoint first — if `entity_name` is already on the contract it
+    returns {already_present:true} and changes nothing. Otherwise it drives the real
+    SM207060 flow end-to-end:
+      1. resolves the screen in CreateEntityView.ScreenID (searches + picks by screen_id),
+      2. ui_tree_dialog_insert — adds the entity shell under ROOT#<endpoint>,
+      3. ui_populate_endpoint_entity_fields — exposes each view in `populate_views` (so the
+         fields show on the contract; without this the entity is an empty shell),
+      4. re-reads the endpoint to CONFIRM the entity is really there.
+
+    screen_id:        the screen to expose (e.g. "PY302000").
+    entity_name:      the entity name to create on the contract (e.g. "PayCode").
+    endpoint_name/version: the target endpoint (e.g. "GRPMCP", "25.200.001") — extend a
+        CUSTOM endpoint, not stock Default, so an upgrade can't clobber it.
+    populate_views:   display names of the screen's data views whose scalar fields to
+        expose (from ui_get_structure / the SM207060 Populate picker; e.g.
+        ["Pay Code Summary"]). Omit to add just the shell (add fields later).
+
+    Returns {ok, already_present, entity, endpoint, screen_id, resolved_screen,
+    populated_views, verified_present, entities_after?}. `ok`/`verified_present` reflect
+    the RE-READ, not the wizard's own optimistic reply. Requires allow_write; KB-first
+    policy applies (endpoint edits are a customization change). After this, drive the
+    screen with create_or_update_entity / get_entity like any endpoint entity.
+    """
+    _require_write(instance)
+    # 1. Idempotency — already on the contract?
+    before = await get_endpoint_definition(
+        endpoint_name, endpoint_version, entities_only=True, instance=instance)
+    present = set(before.get("entities") or []) if isinstance(before, dict) else set()
+    if entity_name in present:
+        return {"ok": True, "already_present": True, "entity": entity_name,
+                "endpoint": f"{endpoint_name}/{endpoint_version}", "screen_id": screen_id.upper(),
+                "note": "entity already on the contract — no change made."}
+    # 2. Resolve the screen selector. The CreateEntityView.ScreenID lookup matches on the
+    #    screen TITLE, not the ID — so fetch the title from the site map first, search by
+    #    it, and disambiguate by the exact screenID (titles repeat across modules).
+    sm = await run_dac_odata("SiteMap", filter=f"ScreenID eq '{_oq(screen_id.upper())}'",
+                             select="Title,ScreenID", top=1, instance=instance)
+    smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+    title = smv[0].get("Title") if smv else None
+    r = await ui_resolve_selector(
+        "SM207060", "CreateEntityView", "ScreenID", search=title or screen_id.upper(),
+        pick={"screenID": screen_id.upper()}, instance=instance)
+    if not r.get("value"):
+        return {"ok": False, "error": "could not resolve the screen in CreateEntityView.ScreenID",
+                "screen_id": screen_id.upper(), "screen_title": title, "candidates": r.get("rows"),
+                "hint": "the title search matched 0 or >1 rows — the screen may lack a classic "
+                        "page (modern-only screens can't be endpoint entities), or the site map "
+                        "has no Title for it."}
+    # 3. Insert the entity shell under the endpoint root.
+    await ui_tree_dialog_insert(
+        "SM207060", tree_view="EntityTree", node_key={"Key": f"ROOT#{endpoint_name}"},
+        open_action="InsertNew", dialog_view="CreateEntityView",
+        record_key={"view": "Endpoint",
+                    "key": {"InterfaceName": endpoint_name, "GateVersion": endpoint_version}},
+        fields=[{"field": "ObjectName", "value": entity_name},
+                {"field": "ScreenID", "value": r["value"]}],
+        instance=instance)
+    # 4. Expose fields from the requested views.
+    populated, populate_errors = [], []
+    for v in (populate_views or []):
+        try:
+            await ui_populate_endpoint_entity_fields(
+                endpoint_name, endpoint_version, entity_object_name=entity_name,
+                data_view=v, instance=instance)
+            populated.append(v)
+        except ScreenError as e:
+            populate_errors.append({"view": v, "error": str(e)})
+    # 5. Verify against a fresh read of the contract.
+    after = await get_endpoint_definition(
+        endpoint_name, endpoint_version, entities_only=True, instance=instance)
+    ents_after = set(after.get("entities") or []) if isinstance(after, dict) else set()
+    verified = entity_name in ents_after
+    out = {
+        "ok": verified, "already_present": False, "entity": entity_name,
+        "endpoint": f"{endpoint_name}/{endpoint_version}", "screen_id": screen_id.upper(),
+        "resolved_screen": r.get("value"), "populated_views": populated,
+        "verified_present": verified,
+    }
+    if populate_errors:
+        out["populate_errors"] = populate_errors
+    if not verified:
+        out["warning"] = ("Entity NOT found on the re-read contract — the wizard reply was "
+                          "optimistic. Check SM207060 state; the endpoint may need a Save/publish.")
+        out["entities_after"] = sorted(ents_after)
+    return out
+
+
+@mcp.tool()
 async def ui_read_grid(
     screen_id: str,
     grid_view: str,
@@ -2461,6 +2592,103 @@ async def screen_insert_rows(
             container, rows, header=header, save=save,
             auto_answer=auto_answer, dry_run=dry_run,
         )
+
+
+@mcp.tool()
+async def screen_bulk_load(
+    screen_id: str,
+    rows: list[dict],
+    extra_commands: list[dict] | None = None,
+    save_each: bool = True,
+    dry_run: bool = True,
+    stop_on_error: bool = False,
+    offset: int = 0,
+    limit: int | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Bulk-load N INDEPENDENT master records to a screen via the SOAP plane — each row
+    is its own set-fields-then-Save, written THROUGH the screen's graph (so every
+    business rule + prerequisite is honoured), with NO endpoint entity required.
+
+    The screen-plane peer of load_from_excel: load_from_excel needs the entity on a
+    contract endpoint (custom screens have none); screen_insert_rows adds many DETAIL
+    rows under ONE header. This fills the remaining gap — many SEPARATE master records
+    on ANY screen with a classic page (e.g. 50 Pay Codes on PY302000, no endpoint). Each
+    row is isolated: one failing row is recorded and the rest continue, so a partial
+    batch tells you exactly which rows need attention.
+
+    rows:      list of {FriendlyField: value} — one master record each (friendly names
+               from screen_get_schema; qualify "Container.Field" if a name repeats). The
+               key field(s) must be among them so each row is a distinct record.
+    extra_commands: optional raw screen_submit command(s) appended to EVERY row before
+               Save (e.g. a {"new_row": "..."} + detail sets, or an {"answer": ...}).
+    save_each: append a Save per row (default True). Under dry_run the Save is dropped.
+    dry_run    (DEFAULT True): runs each row's field SETs but drops Save — nothing
+               persists; surfaces per-row field errors. Re-run with dry_run=false to write.
+    stop_on_error: halt at the first failing row (its index is `next_offset` to resume).
+    offset/limit: process rows[offset : offset+limit] — use `next_offset` from a prior
+               run to RESUME an interrupted load.
+
+    Returns {screen_id, dry_run, total_rows, processed, ok, failed, results:[{index, ok,
+    messages?/error?}], next_offset?}. Requires allow_write; KB-first policy applies.
+    Reuses ONE SOAP session across all rows (schema fetched once; classic SOAP frees the
+    seat per call). Preview with dry_run FIRST, then write.
+    """
+    _require_write(instance)
+    _require_range("offset", offset, 0, 100_000_000)
+    if limit is not None:
+        _require_range("limit", limit, 1, 1_000_000)
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list of {field: value} objects")
+    inst = _cfg().get(instance or _cfg().default)
+    end = (offset + limit) if limit is not None else len(rows)
+    batch = list(enumerate(rows))[offset:end]
+    results: list[dict] = []
+    ok_count = 0
+    async with ScreenClient(inst, screen_id) as s:
+        for i, row in batch:
+            if not isinstance(row, dict) or not row:
+                results.append({"index": i, "ok": False,
+                                "error": "row is not a non-empty {field: value} object"})
+                if stop_on_error:
+                    break
+                continue
+            commands = [{"set": k, "to": v} for k, v in row.items()]
+            commands += list(extra_commands or [])
+            if save_each:
+                commands.append({"action": "Save"})  # dropped internally under dry_run
+            try:
+                r = await s.submit(commands, dry_run=dry_run)
+                row_ok = bool(r.get("ok"))
+                entry: dict[str, Any] = {"index": i, "ok": row_ok}
+                if r.get("messages"):
+                    entry["messages"] = r["messages"]
+                if not row_ok and r.get("error"):
+                    entry["error"] = r["error"]
+                results.append(entry)
+                if row_ok:
+                    ok_count += 1
+                elif stop_on_error:
+                    entry["stopped_here"] = True
+                    break
+            except ScreenError as e:
+                results.append({"index": i, "ok": False, "error": str(e)})
+                if stop_on_error:
+                    break
+    processed = len(results)
+    out: dict[str, Any] = {
+        "screen_id": screen_id.upper(), "dry_run": dry_run, "total_rows": len(rows),
+        "processed": processed, "ok": ok_count, "failed": processed - ok_count,
+        "results": results,
+    }
+    if offset + processed < len(rows):
+        out["next_offset"] = offset + processed
+    if dry_run:
+        out["note"] = ("DRY RUN — field SETs ran, Save dropped, nothing persisted. "
+                       "Re-run with dry_run=false to write.")
+    elif out.get("next_offset") is not None:
+        out["note"] = "More rows remain — re-run with offset=next_offset to continue."
+    return out
 
 
 @mcp.tool()
@@ -4805,12 +5033,14 @@ _GUIDE = {
         "lookups / reference data": ["ui_lookup (search any selector's table)",
             "ui_resolve_selector (resolve one selector field to {id,text} for a write)"],
         "web-service endpoints / customization": ["get_endpoint_definition",
+            "ensure_entity_on_endpoint (one-call: add a screen's entity to an endpoint, idempotent)",
             "generate_endpoint_entity (emit an endpoint entity XML block for a screen)",
             "import_customization + publish_customization (poll publish_status)",
             "list_published, unpublish_customization, export_customization",
             "ui_tree_dialog_insert + ui_populate_endpoint_entity_fields (add entity via SM207060)"],
         "import / export data": ["run_import_scenario (SM206036)",
-            "load_from_excel (then poll load_status for a background load)",
+            "load_from_excel (endpoint entity — then poll load_status)",
+            "screen_bulk_load (N master records to any classic screen via SOAP — no endpoint)",
             "setup_data_provider, setup_readiness"],
         "files / notes / attachments": ["attach_file", "attach_file_to_provider "
             "(GET-free, for Data Providers)", "download_file", "list_attachments", "set_note"],

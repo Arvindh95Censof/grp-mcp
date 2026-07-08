@@ -558,6 +558,21 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.50.0 — **setup-execution tools** (2 new) + an endpoint bug fix. The write half of the
+setup story that pairs with v0.49.0's discovery half:
+- `screen_bulk_load` — bulk-load N independent **master** records to any classic screen via
+  SOAP, written through the graph (honours every prerequisite), **no endpoint entity needed**.
+  Per-row isolation, dry-run default, resume via `next_offset`. Fills the gap between
+  `load_from_excel` (needs an endpoint) and `screen_insert_rows` (detail rows under one header).
+  Live dry-run proven on CS204000.
+- `ensure_entity_on_endpoint` — one call to make a screen REST-drivable: idempotently adds its
+  entity to a web-service endpoint via the SM207060 wizard (resolves the screen by title,
+  inserts, populates, **re-reads to confirm**). Live-proven end-to-end on localhost
+  (idempotency + real add of Countries/States → verified on the contract).
+- Fix: `get_endpoint_definition(entities_only=true)` parsed the wrong tree keys and fell back
+  to a 400KB+ dump; now reads `Path`/`Text`, strips the inherited-entity "↓" decorator, and
+  returns just the top-level entity names.
+
 v0.49.0 — **source-free setup-discovery suite** (4 new tools). Drive a blind instance's
 setup with no customization source in hand — infer prerequisites, order, and fields from
 what a live screen exposes:
