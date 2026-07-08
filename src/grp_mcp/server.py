@@ -20,7 +20,7 @@ from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
-from .screen import ScreenClient, ScreenError, clear_session_cache, logout_session_cache
+from .screen import ScreenClient, ScreenError, _leaf, clear_session_cache, logout_session_cache
 
 _KB_FIRST_POLICY = (
     "TOOL SELECTION: this server has ~77 tools across FOUR Acumatica planes (contract "
@@ -302,9 +302,10 @@ def _oq(v: Any) -> str:
 # be driven" — so we must reframe it as an actionable prerequisite, not a dead end, or an
 # agent reads "PCB Pay Code can not be empty" as "this screen can't be set up" and gives up.
 _UI_VALIDATION_PAT = re.compile(
-    r"can ?not be empty|cannot be empty|is required|must be (?:set|specified|entered|filled|"
-    r"selected|greater|less|equal)|enter a value|please (?:enter|specify|select)|"
-    r"required field|PREREQUISITE NOT MET|does not exist|is not valid|invalid value",
+    r"can ?not be empty|cannot be empty|(?:is|are) required|must be (?:set|specified|entered|"
+    r"filled|selected|greater|less|equal)|enter a value|please (?:enter|specify|select)|"
+    r"required field|at ?least one|one or more|PREREQUISITE NOT MET|does not exist|"
+    r"is not valid|invalid value",
     re.I,
 )
 
@@ -3721,6 +3722,331 @@ async def screen_preflight(
 
 
 @mcp.tool()
+async def screen_prereqs(screen_id: str, instance: str | None = None) -> Any:
+    """Discover a screen's SETUP PREREQUISITES on any live instance — SOURCE-FREE.
+
+    Answers "what must already exist before I can save this screen?" without the
+    customization source in hand. Reads the modern /structure for the screen's
+    REQUIRED + enabled fields, then — for each required SELECTOR (lookup) field —
+    actually queries its lookup grid to see if the source table has any rows. A
+    required lookup with ZERO candidates is a hard prerequisite: that field can
+    never be set until the screen feeding it is populated first (e.g. PY301000's
+    PCB Pay Code needs Pay Codes on PY302000). Metadata alone can't reveal this —
+    only hitting the lookup can. All probes reuse one session (one API seat).
+
+    Returns:
+      • `prereq_gaps`  — required selector fields whose source is EMPTY. Each names
+                         the field + its lookup graph. THESE BLOCK the save until
+                         their source screen is populated. `ok` is false iff non-empty.
+      • `satisfiable`  — required selectors that DO have candidates (ready to set).
+      • `supply`       — required non-lookup fields YOU must provide a value for
+                         (enum → `allowed` list; scalar → `type`).
+      • `probe_errors` — selectors that couldn't be probed (reported, not fatal).
+
+    IMPORTANT — this catches the *visible* (schema-declared) requirements only.
+    Rules coded purely in the screen's C# graph (a hand-thrown "X can not be empty"
+    with no `required` flag, or "at least one detail row") leave NO metadata trace
+    and will NOT appear here — use screen_discover_prereqs for those (it reads the
+    runtime error a trial save throws). Run this first (cheap, read-only), then the
+    crawler for the landmines. Read-only (no gate); KB-first policy unaffected.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        probed = await s.probe_required_selectors(struct)
+    return {
+        "screen_id": screen_id.upper(),
+        "primary_dac": struct.get("primary_dac"),
+        "ok": not probed["gaps"],
+        "prereq_gaps": probed["gaps"],
+        "satisfiable": probed["satisfiable"],
+        "supply": probed["supply"],
+        "probe_errors": probed["probe_errors"],
+        "note": ("prereq_gaps block the save until their source screens are populated. "
+                 "This sees schema-declared requirements only — run screen_discover_prereqs "
+                 "for graph-coded rules (empty-detail-grid, hand-thrown validations)."),
+    }
+
+
+_DETAIL_RULE_PAT = re.compile(
+    r"at ?least one|one or more|must have (?:a|at least|one)|no (?:rows|lines|details?|records?)\b",
+    re.I,
+)
+
+
+@mcp.tool()
+async def screen_discover_prereqs(
+    screen_id: str,
+    seed_fields: list[dict] | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Discover a screen's GRAPH-CODED prerequisites by trial-saving and reading the
+    error — the source-free way to surface rules that leave NO schema trace.
+
+    screen_prereqs sees only schema-declared requirements. Rules coded by hand in the
+    screen's C# graph — a thrown "PCB Pay Code can not be empty" on a field with no
+    `required` flag, or "at least one Tax Office detail is required" — are INVISIBLE to
+    metadata. The only source-free oracle for them is the runtime error a real save
+    throws. This drives a Save (seeded with `seed_fields`, else a bare new record),
+    and when Acumatica rejects it, parses the rejection into discovered prerequisites.
+
+    A validation rejection ROLLS BACK — nothing persists (the proven-safe pattern: a
+    PY301000 trial save left the record untouched). In the RARE case the save instead
+    SUCCEEDS (no rule blocked it), a record DID persist — the result says so loudly with
+    `persisted: true` and the identifying fields, so you can delete it. Because a save
+    is attempted, this needs the WRITE gate and follows the KB-first policy.
+
+    seed_fields: [{"view", "field", "value"}] — values to set before the trial save
+        (same shape as ui_screen_action). Start with none to find the FIRST blocker,
+        then add it to seed_fields and re-run to reveal the NEXT — crawling the chain.
+
+    Returns on rejection: {ok:false, status:"discovered", reachable:true, writable:true,
+    blocking_message, discovered:{flagged_fields, needs_detail_row, required_fields},
+    seed_fields, guidance}. On unexpected success: {ok:true, persisted:true, warning}.
+    Non-validation failures propagate as errors. Run screen_prereqs FIRST (free); use
+    this to catch what it can't see.
+    """
+    _require_write(instance)  # attempts a (normally validation-rolled-back) Save
+    inst = _cfg().get(instance or _cfg().default)
+    seed = seed_fields or []
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        primary = next(iter(struct.get("views") or {}), None)
+        load = {f["view"] for f in seed} | ({primary} if primary else set())
+        await s.ui_bootstrap(sorted(load))
+        for f in seed:
+            await s.ui_set_field(f["view"], f["field"], f["value"])
+        try:
+            result = await s.ui_command("Save", answer="ok")
+        except ScreenError as e:
+            msg = str(e)
+            if not _UI_VALIDATION_PAT.search(msg):
+                raise
+            required = sorted(
+                f"{v}.{f['field']}"
+                for v, fs in (struct.get("views") or {}).items()
+                for f in fs if f.get("required") and not f.get("readonly")
+            )
+            return {
+                "screen_id": screen_id.upper(),
+                "ok": False,
+                "status": "discovered",
+                "reachable": True,
+                "writable": True,
+                "blocking_message": msg,
+                "discovered": {
+                    "flagged_fields": _flagged_field_names(msg),
+                    "needs_detail_row": bool(_DETAIL_RULE_PAT.search(msg)),
+                    "required_fields": required,
+                },
+                "seed_fields": seed,
+                "guidance": (
+                    "These are the screen's OWN business-rule prerequisites — the write was "
+                    "reached and evaluated, then rolled back (nothing persisted). Satisfy the "
+                    "flagged field(s) / add the needed detail row, add them to seed_fields, and "
+                    "re-run to reveal the NEXT blocker (or drive the real write). Consult kb-mcp "
+                    "for correct values. This is NOT a 'cannot set up' condition."
+                ),
+            }
+    # No rule blocked the save — it went through. A record likely persisted.
+    dirty = result.get("graphIsDirty") if isinstance(result, dict) else None
+    return {
+        "screen_id": screen_id.upper(),
+        "ok": True,
+        "status": "no_blocking_rule",
+        "persisted": dirty is not True,
+        "seed_fields": seed,
+        "raw": result,
+        "warning": ("The trial Save SUCCEEDED — no business rule blocked it, so a RECORD MAY "
+                    "HAVE PERSISTED. Read it back (screen_get / run_dac_odata) and delete it if "
+                    "unwanted. There were no hidden graph-coded prerequisites to discover."),
+    }
+
+
+def _topo_order(nodes: list[str], edges: dict[str, set]) -> tuple[list[str], list[str]]:
+    """Kahn topological sort. edges[a] = {deps a needs first}. Returns (order, cyclic).
+    `order` lists dependency-free nodes first; `cyclic` holds any node in a cycle
+    (pure, unit-testable)."""
+    indeg = {n: 0 for n in nodes}
+    for n in nodes:
+        for d in edges.get(n, ()):
+            if d in indeg:
+                indeg[n] += 1  # n depends on d -> n has an in-edge from d
+    ready = sorted(n for n in nodes if indeg[n] == 0)
+    order: list[str] = []
+    while ready:
+        n = ready.pop(0)
+        order.append(n)
+        for m in nodes:
+            if n in edges.get(m, ()) and m not in order:
+                indeg[m] -= 1
+                if indeg[m] == 0:
+                    ready.append(m)
+        ready.sort()
+    cyclic = [n for n in nodes if n not in order]
+    return order, cyclic
+
+
+@mcp.tool()
+async def module_setup_plan(
+    screens: list[str] | None = None,
+    prefix: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Build a dependency-ORDERED setup plan for a set of screens — SOURCE-FREE.
+
+    Reads each screen's modern /structure, extracts its REQUIRED selector (lookup)
+    fields, and maps each selector's backing graph to whichever screen in the set
+    OWNS that graph — yielding "screen A must be set up before screen B" edges. A
+    topological sort turns those edges into a build order: screens feeding others
+    come first. Purely structural (one /structure read per screen, no row probes),
+    so it's the fast first pass for planning a blind module build.
+
+    Provide the screens one of two ways:
+      • screens: explicit list of ScreenIDs (from list_screens / list_published), OR
+      • prefix:  a ScreenID prefix (e.g. "PY3") — resolved against the site map
+                 (capped at 60 screens).
+
+    Returns {screens, build_order, cyclic, graph_index, plan:[{screen, primary_dac,
+    depends_on:[in-set screens], external_deps:[selector targets NOT in the set],
+    required_selectors, supply_fields}]}. `depends_on` is the actionable part — do
+    those screens first. `external_deps` are prerequisites OUTSIDE your set (add them
+    and re-run). Then screen_prereqs / screen_discover_prereqs each screen for the
+    field-level detail. Read-only; reuses one session.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    ids = [s.upper() for s in (screens or [])]
+    if not ids and prefix:
+        sm = await run_dac_odata("SiteMap", filter=f"startswith(ScreenID,'{_oq(prefix.upper())}')",
+                                 select="ScreenID,Title", top=60, instance=instance)
+        ids = sorted({(r.get("ScreenID") or "").strip().upper()
+                      for r in (sm.get("value") or []) if r.get("ScreenID")})
+    if not ids:
+        return {"error": "provide `screens` (list of ScreenIDs) or a `prefix` that matches the site map."}
+    structs: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    async with ScreenClient(inst, ids[0]) as s:
+        for sid in ids:
+            try:
+                # reuse the one authenticated session across screens: get_ui_structure
+                # is a stateless GET keyed off screen_id (ui_url is a property), and the
+                # cookie login is per-instance, so only screen_id needs to change.
+                s.screen_id = sid
+                s._active_tree_row = None
+                structs[sid] = await s.get_ui_structure()
+            except ScreenError as e:
+                errors[sid] = str(e)
+    # graph leaf -> owning screen (a screen's own primary DAC / graph)
+    graph_index: dict[str, str] = {}
+    for sid, st in structs.items():
+        for g in (_leaf(st.get("primary_dac")), _leaf(st.get("screen_graph"))):
+            if g:
+                graph_index.setdefault(g, sid)
+    plan, edges = [], {}
+    for sid, st in structs.items():
+        own = {_leaf(st.get("primary_dac")), _leaf(st.get("screen_graph"))} - {None}
+        req_sel, supply, deps, external = [], [], set(), set()
+        for vname, fields in (st.get("views") or {}).items():
+            for f in fields:
+                if not (f.get("required") and f.get("enabled") and not f.get("readonly")):
+                    continue
+                if f.get("selector"):
+                    tgt = _leaf((f["selector"] or {}).get("graph"))
+                    req_sel.append({"view": vname, "field": f.get("field"), "target_graph": tgt})
+                    if tgt and tgt not in own:
+                        if tgt in graph_index:
+                            deps.add(graph_index[tgt])
+                        else:
+                            external.add(tgt)
+                else:
+                    supply.append({"view": vname, "field": f.get("field"), "label": f.get("label")})
+        edges[sid] = deps
+        plan.append({"screen": sid, "primary_dac": st.get("primary_dac"),
+                     "depends_on": sorted(deps), "external_deps": sorted(external),
+                     "required_selectors": req_sel, "supply_fields": supply})
+    order, cyclic = _topo_order(list(structs), edges)
+    plan.sort(key=lambda p: (order.index(p["screen"]) if p["screen"] in order else 1e9))
+    out = {"screens": ids, "build_order": order, "cyclic": cyclic,
+           "graph_index": graph_index, "plan": plan}
+    if errors:
+        out["unreadable"] = errors
+    return out
+
+
+@mcp.tool()
+async def screen_autofill(
+    screen_id: str,
+    hints: dict | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Propose a set_fields payload for a screen — auto-resolving what CAN be resolved,
+    and surfacing ONLY the fields a human must actually decide. Read-only (proposes,
+    never writes).
+
+    For each REQUIRED + enabled field on the screen it decides how to fill it:
+      • selector with a `hints[field]` search (or, absent a hint, a blank search that
+        returns exactly ONE candidate) -> resolved to its {id,text} value, added to
+        `proposed_set_fields` ready to pass straight to ui_screen_action.
+      • selector matching MANY rows -> listed under `needs_decision` with the candidates,
+        so you disambiguate (pass a narrower hints[field]).
+      • selector with ZERO candidates -> `gaps` (its source screen is empty — a prereq).
+      • enum -> `needs_decision` with the `allowed` values (can't guess intent).
+      • plain scalar -> taken from `hints[field]` if given, else `needs_decision`.
+
+    hints: {field_name: search_or_value} — a selector's search text, or a scalar's value.
+    Returns {screen_id, proposed_set_fields, needs_decision, gaps}. Resolve the
+    needs_decision items (add to hints and re-run, or set them yourself), then drive the
+    write with ui_screen_action. All lookups reuse one session (one API seat).
+    """
+    hints = hints or {}
+    hl = {k.lower(): v for k, v in hints.items()}
+    inst = _cfg().get(instance or _cfg().default)
+    proposed, needs, gaps = [], [], []
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        own = {_leaf(struct.get("screen_graph")), _leaf(struct.get("primary_dac"))} - {None}
+        for vname, fields in (struct.get("views") or {}).items():
+            for f in fields:
+                if not (f.get("required") and f.get("enabled") and not f.get("readonly")):
+                    continue
+                fname, label = f.get("field"), f.get("label")
+                entry = {"view": vname, "field": fname, "label": label}
+                hint = hl.get((fname or "").lower())
+                if f.get("selector"):
+                    self_key = _leaf((f["selector"] or {}).get("graph")) in own
+                    try:
+                        r = await s.ui_resolve_selector(vname, fname, str(hint) if hint else "")
+                    except ScreenError as e:
+                        needs.append({**entry, "kind": "selector", "probe_error": str(e)})
+                        continue
+                    n = r.get("row_count", 0)
+                    if r.get("value") is not None:
+                        proposed.append({"view": vname, "field": fname, "value": r["value"]})
+                    elif self_key:
+                        needs.append({**entry, "kind": "new_key",
+                                      "hint": "this is the record's own key — supply a NEW code value"})
+                    elif n == 0:
+                        gaps.append({**entry, "kind": "empty_selector_source"})
+                    else:
+                        needs.append({**entry, "kind": "selector", "candidates": n,
+                                      "rows": r.get("rows", [])[:10],
+                                      "hint": "many matches — pass a narrower hints[field]"})
+                elif f.get("options"):
+                    if hint is not None:
+                        proposed.append({"view": vname, "field": fname, "value": hint})
+                    else:
+                        needs.append({**entry, "kind": "enum",
+                                      "allowed": [o.get("value") for o in f["options"]]})
+                else:
+                    if hint is not None:
+                        proposed.append({"view": vname, "field": fname, "value": hint})
+                    else:
+                        needs.append({**entry, "kind": "scalar", "type": f.get("type")})
+    return {"screen_id": screen_id.upper(), "proposed_set_fields": proposed,
+            "needs_decision": needs, "gaps": gaps}
+
+
+@mcp.tool()
 async def load_from_excel(
     entity: str,
     path: str,
@@ -4468,6 +4794,11 @@ _GUIDE = {
             "create_numbering_sequence", "set_gl_preferences", "generate_master_calendar",
             "manage_financial_periods",
             "teardown/redo: reset_calendar, delete_financial_year, delete_segmented_key"],
+        "discover setup prerequisites (blind — any instance, no source)": [
+            "screen_prereqs (required fields + empty-selector-source gaps; read-only, cheap — run FIRST)",
+            "screen_discover_prereqs (trial-save crawler — catches graph-coded rules metadata can't see)",
+            "module_setup_plan (dependency-ordered build plan for a screen-ID prefix)",
+            "screen_autofill (resolve required selectors + defaults; surface only human-decision fields)"],
         "org structure / trees / approvals": [
             "tree_triage (FIRST — is a tree screen API-buildable, and with which tool?)",
             "build_company_tree (build the EP204061 workgroup hierarchy via EP204060)"],

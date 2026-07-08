@@ -230,6 +230,18 @@ def _tree_context_views(view_names: list[str], tree_view: str, node_key: dict) -
             if v.startswith("Selected") and v != tree_view}
 
 
+def _leaf(class_name: str | None) -> str | None:
+    """Leaf class name of a dotted/nested .NET type, lowercased (pure, unit-testable).
+
+    "Payroll.Graph.Entry.CSPYOvertimeRate" -> "cspyovertimerate";
+    "Ns.Outer+Inner" -> "inner". None/empty -> None. Used to compare a selector's
+    backing graph to the screen's own graph regardless of namespace differences.
+    """
+    if not class_name:
+        return None
+    return class_name.replace("+", ".").rsplit(".", 1)[-1].lower() or None
+
+
 def _selector_meta(field_state: dict) -> dict | None:
     """Extract a selector (lookup) field's query metadata from its raw /structure
     fieldState, or None if the field isn't a selector (pure, unit-testable).
@@ -1026,6 +1038,57 @@ class ScreenClient:
                 break
         return {"screen_id": self.screen_id, "primary_dac": d.get("primaryDacName"),
                 "screen_graph": screen_graph, "views": views, "actions": actions, "grids": grids}
+
+    async def probe_required_selectors(self, struct: dict) -> dict:
+        """Source-free prereq discovery: for each REQUIRED + enabled selector field
+        on this screen, query its lookup grid (blank search) and report whether the
+        source table has ANY candidate rows. A required selector whose source is
+        EMPTY is a hard prerequisite — that field can never be set until the screen
+        feeding it is populated first. Metadata alone can't tell you this; only
+        actually hitting the lookup can. Reuses the live session (one seat).
+
+        Returns {gaps, satisfiable, supply, probe_errors} — see screen_prereqs.
+        """
+        gaps, satisfiable, supply, probe_errors = [], [], [], []
+        # A selector whose backing graph IS the screen's own graph/primary DAC is the
+        # record's OWN key (you create it HERE) — not a foreign-key prerequisite you
+        # populate on another screen. Compare on the leaf class name (namespaces vary).
+        own = {_leaf(struct.get("screen_graph")), _leaf(struct.get("primary_dac"))} - {None}
+        for vname, fields in (struct.get("views") or {}).items():
+            for f in fields:
+                if not (f.get("required") and f.get("enabled") and not f.get("readonly")):
+                    continue
+                fname, label = f.get("field"), f.get("label")
+                entry = {"view": vname, "field": fname, "label": label}
+                if f.get("selector"):
+                    sel_graph = (f["selector"] or {}).get("graph")
+                    try:
+                        r = await self.ui_resolve_selector(vname, fname, "")
+                    except ScreenError as e:
+                        probe_errors.append({**entry, "probe_error": str(e)})
+                        continue
+                    n = r.get("row_count", 0)
+                    self_key = _leaf(sel_graph) in own
+                    if n and not self_key:
+                        satisfiable.append({**entry, "kind": "selector", "candidates": n})
+                    elif self_key:
+                        # own key: you're creating this record's key value here, not
+                        # sourcing it elsewhere. Not a prereq regardless of row_count.
+                        supply.append({**entry, "kind": "new_key",
+                                       "existing": n, "selector_graph": sel_graph})
+                    else:
+                        gaps.append({**entry, "kind": "empty_selector_source",
+                                     "selector_graph": sel_graph,
+                                     "reason": "required lookup has NO candidate rows — populate "
+                                               "its source screen before this field can be set."})
+                elif f.get("options"):
+                    supply.append({**entry, "kind": "enum",
+                                   "allowed": [o.get("value") for o in f["options"]]})
+                else:
+                    supply.append({**entry, "kind": "scalar",
+                                   "type": f.get("type")})
+        return {"gaps": gaps, "satisfiable": satisfiable, "supply": supply,
+                "probe_errors": probe_errors}
 
     async def ui_coerce_validate(self, sets: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
         """Modern-plane write safety for a list of {view?, field, value} sets — the

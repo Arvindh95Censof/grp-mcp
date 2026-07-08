@@ -558,6 +558,23 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.49.0 — **source-free setup-discovery suite** (4 new tools). Drive a blind instance's
+setup with no customization source in hand — infer prerequisites, order, and fields from
+what a live screen exposes:
+- `screen_prereqs` — reads a screen's required fields and, for each required **selector**,
+  actually queries its lookup: an empty source is a hard prerequisite (self-referential
+  keys are correctly separated from foreign-key prereqs). Read-only, one seat. Live-proven
+  on custom payroll (PY301000/302000/303000).
+- `screen_discover_prereqs` — trial-saves and parses the rejection to surface the
+  **graph-coded** rules metadata can't see (hand-thrown "X can not be empty", "at least one
+  detail row"). Validation rolls back; the rare persisting save is flagged loudly. Write-gated.
+- `module_setup_plan` — reads each screen's structure, maps selector targets to owning
+  screens, and topologically sorts them into a **build order** (with external deps + cycles).
+- `screen_autofill` — resolves what it can (single-match selectors, hinted fields) and
+  surfaces only the fields a human must decide. Read-only proposer.
+Also broadened the validation-error detector to catch "are required" / "at least one" (the
+v0.48.3 reframe was silently missing the plural/detail-row forms).
+
 v0.48.4 — **wrong-plane give-up hints** (informed by a live agent eval). Two capable agents,
 run against a custom-payroll instance, both succeeded but independently flagged the same
 give-up traps: `whoami → reachable:false` (+ REST `404 Endpoint not found`) reads as a *global*

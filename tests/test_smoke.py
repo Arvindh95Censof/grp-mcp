@@ -390,6 +390,41 @@ def test_same_origin_rejects_cross_origin():
 # down since a silently-wrong field here produces a 200 with no error, not a
 # visible failure (proven live, 2026-07-02).
 
+def test_discover_prereqs_parses_real_payroll_errors():
+    from grp_mcp.server import _UI_VALIDATION_PAT, _DETAIL_RULE_PAT, _flagged_field_names
+    # the exact hand-thrown rule captured live on PY301000
+    pcb = "PCB Pay Code can not be empty"
+    assert _UI_VALIDATION_PAT.search(pcb)
+    assert "PCB Pay Code" in _flagged_field_names(pcb)
+    assert not _DETAIL_RULE_PAT.search(pcb)
+    # the detail-grid rule from CSPYPayCompanyEntry
+    tax = "Atleast one or more Tax Office details are required"
+    assert _UI_VALIDATION_PAT.search(tax)
+    assert _DETAIL_RULE_PAT.search(tax)
+
+
+def test_topo_order_linear_and_cycle():
+    from grp_mcp.server import _topo_order
+    # C depends on B depends on A  -> A, B, C
+    order, cyclic = _topo_order(["A", "B", "C"], {"B": {"A"}, "C": {"B"}})
+    assert order == ["A", "B", "C"] and cyclic == []
+    # independent nodes -> sorted, no cycle
+    order, cyclic = _topo_order(["X", "Y"], {})
+    assert order == ["X", "Y"] and cyclic == []
+    # a 2-cycle is reported, not ordered
+    order, cyclic = _topo_order(["P", "Q"], {"P": {"Q"}, "Q": {"P"}})
+    assert set(cyclic) == {"P", "Q"}
+
+
+def test_leaf_class_name():
+    from grp_mcp.screen import _leaf
+    assert _leaf("Payroll.Graph.Entry.CSPYOvertimeRate") == "cspyovertimerate"
+    assert _leaf("PX.Api.ContractBased.UI.EntityConfigurationMaint+EntityDescriptionInsertModel") == "entitydescriptioninsertmodel"
+    assert _leaf("Flat") == "flat"
+    assert _leaf(None) is None
+    assert _leaf("") is None
+
+
 def test_tree_active_row_context_root_node():
     from grp_mcp.screen import _tree_active_row_context
     ctx = _tree_active_row_context("EntityTree", {"Key": "ROOT#GRPMCP"}, None)
