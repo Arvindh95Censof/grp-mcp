@@ -1,6 +1,6 @@
 # grp-mcp — Complete Installation & Setup Guide
 
-**Version 0.52.1 · Acumatica ERP MCP Server**
+**Version 0.52.3 · Acumatica ERP MCP Server**
 
 This guide takes a **fresh Windows, macOS, or Linux PC** from nothing installed to a
 working grp-mcp connection inside Claude. It covers every dependency, every credential,
@@ -10,6 +10,11 @@ troubleshoot the result.
 grp-mcp is published on PyPI as `grp-mcp`. There is **no git clone and no manual build**
 for the normal install path — the recommended method downloads the finished package
 automatically.
+
+**Links:**
+- PyPI (package): **https://pypi.org/project/grp-mcp/**
+- Source (GitHub): **https://github.com/Arvindh95Censof/grp-mcp**
+- Releases / changelog: **https://github.com/Arvindh95Censof/grp-mcp/releases**
 
 ---
 
@@ -391,8 +396,10 @@ If it fails, the error says whether it's a **credentials** problem (recheck Sect
 
 With the `uvx` install path there is **nothing to do** — `uvx` resolves the latest published
 version of `grp-mcp` from PyPI on each run. To force a specific version, pin it in the launch
-command (e.g. `uvx grp-mcp==0.52.1`). After any upgrade, **fully restart Claude** so the host
-reloads the server.
+command (e.g. `uvx grp-mcp==0.52.3`). After any upgrade, **fully restart Claude** so the host
+reloads the server. See the release history at
+**https://github.com/Arvindh95Censof/grp-mcp/releases** (and the package page,
+**https://pypi.org/project/grp-mcp/**).
 
 ---
 
@@ -485,4 +492,4 @@ claude mcp add grp-mcp -s user -e GRP_MCP_CONNECTIONS="C:\path\to\connections.js
 
 ---
 
-*grp-mcp v0.52.1 · Published on PyPI as `grp-mcp` · Source: github.com/Arvindh95Censof/grp-mcp*
+*grp-mcp v0.52.3 · PyPI: https://pypi.org/project/grp-mcp/ · Source: https://github.com/Arvindh95Censof/grp-mcp*
