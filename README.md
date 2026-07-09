@@ -558,6 +558,17 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.51.3 — **`build_import_scenario` gains master-detail (grid line-item) support.** A mapping
+row may now be a **line-break marker** — `{"line_break": "Transactions"}` emits the `##`
+grid-new-row marker that starts each detail line — so you can map header fields then detail
+lines for documents like AR invoices / GL journals. Source is now optional per row (markers
+and `<...>` actions carry none), and the auto `<Save>` attaches to the **header** object (the
+first mapping row's object, not the last — the last row on a master-detail scenario is a
+detail field). Backward-compatible: single-view scenarios (Countries etc.) are unaffected.
+Pure logic (`_norm_map_row`, `_is_marker_field`) unit-tested; the **live AR master-detail
+round-trip is pending post-restart MCP verification** (the running server must reload to pick
+up the new mapping-row handling).
+
 v0.51.2 — **`build_import_scenario` now produces a COMMITTING mapping** (proven end to end).
 Diffing a scenario it built against the stock working `ARTEST` mapping revealed the gap: a
 real mapping ENDS with a `<Save>` **action row** — without it the import stages every field

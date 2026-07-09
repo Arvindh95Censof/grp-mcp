@@ -4544,6 +4544,25 @@ def _prepared_data_summary(rows: list[dict]) -> dict:
             "error_texts": [str(cell(r, "ErrorMessage", "Error") or "") for r in err_rows]}
 
 
+def _is_marker_field(field: str) -> bool:
+    """A mapping FieldActionName that is a STRUCTURAL marker/action, not a data field:
+    `##` (detail line-break / grid new-row), or `<...>` action (`<Save>`, `<Cancel>`)."""
+    f = str(field or "")
+    return f.startswith("##") or (f.startswith("<") and f.endswith(">"))
+
+
+def _norm_map_row(m: dict) -> dict:
+    """Normalize a build_import_scenario mapping row to {target_object, field, source?,
+    commit?} (pure, unit-testable). Sugar: {"line_break": "<Object>"} -> a `##` grid
+    new-row marker on that detail object (starts a new detail line; carries no source).
+    On a master-detail scenario you interleave line_break markers with the detail
+    object's field rows, e.g. AR301000: header fields on Document, then
+    {"line_break":"Transactions"}, then Transactions.<field> rows."""
+    if m.get("line_break"):
+        return {"target_object": m["line_break"], "field": "##"}
+    return m
+
+
 def _mapping_action_rows(rows: list[dict]) -> list[dict]:
     """SM206025 mapping rows that are STRUCTURAL, not field mappings (pure,
     unit-testable): `@@`-prefixed key restrictions, `<Cancel>`/`<Save>`/`<...>`
@@ -4918,12 +4937,20 @@ async def build_import_scenario(
     screen_id:       target screen (raw ID, e.g. "AR301000").
     provider:        Data Provider name (SM206015; see setup_data_provider).
     provider_object: the provider's schema object (= the worksheet name for Excel).
-    mapping:         [{"target_object": <screen object, e.g. "Country" / "Document">,
-                       "field": <target field LABEL as shown in the mapping combo, e.g.
+    mapping:         ordered list of rows. A FIELD row:
+                       {"target_object": <screen object, e.g. "Country" / "Document" /
+                                 "Transactions">,
+                        "field": <target field LABEL as in the mapping combo, e.g.
                                  "Country ID" — from ui_get_structure(screen)'s labels>,
-                       "source": <provider column, or a literal like "<NEW>" / "=...">,
-                       "commit": <optional bool — the row's Commit flag; set true on the
-                                  key + required fields>}]
+                        "source": <provider column, or a literal like "<NEW>" / "=...">,
+                        "commit": <optional bool — set true on the key + required fields>}
+                     MASTER-DETAIL (grid line items): put the header field rows first, then
+                     start each detail line with a LINE-BREAK marker and follow it with that
+                     detail object's field rows:
+                       {"line_break": "Transactions"}   # ## grid new-row on the detail view
+                     e.g. AR301000: Document header fields → {"line_break":"Transactions"} →
+                     Transactions.AccountID/Amount/... rows. You can also pass a raw marker
+                     row ({"target_object":"Transactions","field":"##"}) or any `<...>` action.
     add_save:        append the trailing `<Save>` ACTION row (default True). This is
                      ESSENTIAL: without it the import stages every field into the graph
                      but NEVER commits (0 rows Processed, no error — proven live). Every
@@ -4955,14 +4982,17 @@ async def build_import_scenario(
         if not r.get("ok"):
             return {"ok": False, "stage": "header", "error": r.get("error"),
                     "detail": r.get("field_errors") or r.get("messages")}
-        for i, m in enumerate(mapping):
+        norm = [_norm_map_row(m) for m in mapping]
+        for i, m in enumerate(norm):
             cmds = [
                 {"set": "ScenarioSummary.Name", "to": name},
                 {"new_row": "Mapping"},
                 {"set": "Mapping.TargetObject", "to": m["target_object"]},
                 {"set": "Mapping.FieldActionName", "to": m["field"]},
-                {"set": "Mapping.SourceFieldValue", "to": m["source"]},
             ]
+            # markers (## / <...>) and line-breaks carry no source; set it only when given.
+            if m.get("source") is not None:
+                cmds.append({"set": "Mapping.SourceFieldValue", "to": m["source"]})
             if m.get("commit") is not None:
                 cmds.append({"set": "Mapping.Commit", "to": bool(m["commit"])})
             cmds.append({"action": "Save"})
@@ -4971,10 +5001,11 @@ async def build_import_scenario(
                             **({"error": str(r.get("error"))[:200]} if not r.get("ok") else {})})
         # Append the <Save> ACTION row — WITHOUT it the import stages every field into
         # the graph but NEVER commits (0 rows Processed, no error; proven live). Every
-        # working scenario ends with it (confirmed from the stock ARTEST mapping). The
-        # object is the primary target (same as the field rows' object).
-        if add_save and mapping:
-            save_obj = mapping[-1]["target_object"]
+        # working scenario ends with it (confirmed from the stock ARTEST mapping). It sits
+        # on the PRIMARY/header object — the FIRST mapping row's object (on a master-detail
+        # scenario the last row is a DETAIL field, so mapping[-1] would be wrong).
+        if add_save and norm:
+            save_obj = norm[0]["target_object"]
             rs = await s.submit([
                 {"set": "ScenarioSummary.Name", "to": name},
                 {"new_row": "Mapping"},
@@ -5001,7 +5032,11 @@ async def build_import_scenario(
     action_rows = _mapping_action_rows(persisted)
     field_rows = [r for r in persisted if r not in action_rows]
     has_save = any((r.get("FieldName") or "") == "<Save>" for r in persisted)
-    ok = (all(x["ok"] for x in results) and len(field_rows) >= len(mapping)
+    # marker rows (## line-breaks, <...> actions) in the request aren't "field rows"
+    # in the DB — only count the real field mappings when checking persistence.
+    expected_fields = sum(1 for m in (_norm_map_row(x) for x in mapping)
+                          if not _is_marker_field(m["field"]))
+    ok = (all(x["ok"] for x in results) and len(field_rows) >= expected_fields
           and (has_save or not add_save))
     out = {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
            "requested_rows": len(mapping), "persisted_field_rows": len(field_rows),

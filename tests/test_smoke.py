@@ -473,6 +473,22 @@ def test_prepared_data_summary_reads_resolved_keys_and_gates_on_processed():
     assert "ARINVOICE" in s["error_texts"][0]
 
 
+def test_norm_map_row_and_marker_detection():
+    from grp_mcp.server import _norm_map_row, _is_marker_field
+    # line_break sugar -> ## marker on the detail object, no source
+    assert _norm_map_row({"line_break": "Transactions"}) == {
+        "target_object": "Transactions", "field": "##"}
+    # a plain field row passes through untouched
+    fld = {"target_object": "Document", "field": "Customer", "source": "CustomerID", "commit": True}
+    assert _norm_map_row(fld) == fld
+    # marker detection
+    assert _is_marker_field("##")
+    assert _is_marker_field("<Save>")
+    assert _is_marker_field("<Cancel>")
+    assert not _is_marker_field("Country ID")
+    assert not _is_marker_field("Customer")
+
+
 def test_mapping_action_rows_separates_structural_from_fields():
     from grp_mcp.server import _mapping_action_rows
     # structural rows from the real working ARTEST mapping shape
