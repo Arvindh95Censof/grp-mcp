@@ -4577,6 +4577,143 @@ def _mapping_action_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
+# Target fields whose value is a NUMBER — mapping one to a bare literal is almost always
+# the "phantom source column" trap (import reads a bare Value as a source COLUMN name).
+_NUMERIC_TARGET_PAT = re.compile(
+    r"(qty|quantity|baseqty|amount|price|cost|rate|number|count|balance)", re.I)
+
+
+def _looks_like_constant_source(source: str) -> bool:
+    """True if a mapping `source` is a BARE LITERAL (e.g. "1") — not a provider column
+    ref and not an `=` expression (pure, unit-testable). The import engine reads a bare
+    Value as a SOURCE COLUMN NAME, so "1" binds to a (non-existent) column named "1" and
+    the field imports EMPTY — the exact cause of AR301000's silent `'BaseQty' cannot be
+    empty` (Qty mapped to "1" -> empty Qty -> empty BaseQty). Fix: use a real column, or
+    an `=` expression (`="1"` / `=IsNull([Quantity],[Transactions.Qty])`)."""
+    s = str(source or "").strip()
+    if not s or s.startswith("="):
+        return False
+    return bool(re.fullmatch(r"-?\d+(?:[.,]\d+)?", s))
+
+
+def _mapping_column_refs(value: str) -> list[str]:
+    """Extract the source-column names referenced by a mapping Value (pure): the
+    `[Column]` tokens inside an `=` expression, or the whole string if it's a plain
+    column ref. Skips `[Object.Field]` self-references (they contain a dot)."""
+    s = str(value or "").strip()
+    if not s:
+        return []
+    if not s.startswith("="):
+        return [s]
+    return [m for m in re.findall(r"\[([^\]]+)\]", s) if "." not in m]
+
+
+def _detail_object_of(field_rows: list[dict]) -> str | None:
+    """The detail (grid) object in a set of persisted mapping rows (pure): the last
+    ObjectName that carries a `##` line marker, else None. Used to locate the line-item
+    object (e.g. AR301000 'Transactions') for priming-gap checks."""
+    detail = None
+    for r in field_rows:
+        if str(r.get("FieldName") or "").startswith("##"):
+            detail = r.get("ObjectName")
+    return detail
+
+
+def _detail_priming_gaps(norm_mapping: list[dict], stock_rows: list[dict]) -> list[dict]:
+    """Detail fields the STOCK scenario sets BEFORE its Qty field that the candidate
+    mapping omits (pure, unit-testable). These prime the line's unit context so Qty's
+    FieldUpdated can default computed fields (AR301000: InventoryID before Qty ->
+    BaseQty). Returns [{field, object, why}]; empty if no stock scenario / no gap."""
+    if not stock_rows:
+        return []
+    detail = _detail_object_of(stock_rows)
+    if not detail:
+        return []
+    seq = [r for r in stock_rows if r.get("ObjectName") == detail
+           and not _is_marker_field(str(r.get("FieldName") or ""))]
+    qpos = next((i for i, r in enumerate(seq)
+                 if _NUMERIC_TARGET_PAT.search(str(r.get("FieldName") or ""))
+                 and "qty" in str(r.get("FieldName") or "").lower()), None)
+    if qpos is None:
+        return []
+    before = {str(r.get("FieldName")) for r in seq[:qpos]}
+    have = {str(m.get("field")) for m in norm_mapping
+            if m.get("target_object") == detail}
+    return [{"field": f, "object": detail,
+             "why": "stock scenario sets it before Qty (primes the line — omitting it is "
+                    "the usual cause of empty computed fields like BaseQty)"}
+            for f in sorted(before - have)]
+
+
+async def _stock_scenario_for_screen(client, screen_id: str) -> list[dict]:
+    """Predefined 'ACU Import …' scenario(s) for a screen (CreatedByScreenID='SM209900').
+    These vendor scenarios are the authoritative mapping recipe — clone them instead of
+    authoring cold. Returns the SYMapping header rows (may be empty)."""
+    r = await client.run_dac("PX_Api_SYMapping", {
+        "$filter": f"ScreenID eq '{screen_id.upper()}' and CreatedByScreenID eq 'SM209900'",
+        "$select": "MappingID,Name,ProviderID,ProviderObject,ScreenID,GraphName"})
+    return (r.get("value") or []) if isinstance(r, dict) else []
+
+
+@mcp.tool()
+async def stock_scenario_info(screen_id: str, instance: str | None = None) -> dict:
+    """Surface the VENDOR predefined 'ACU Import …' scenario for a screen — the
+    authoritative import recipe to clone instead of guessing (read-only).
+
+    Acumatica ships inactive predefined scenarios for the migration screens (AR301000
+    AR Invoices, AP301000 AP Bills, GL301000 GL Transactions, AR303000 Customers,
+    AP303000 Vendors, FA303000 Fixed Assets, AM208000 BOM, …). This returns, for the
+    given screen: the scenario name + its full field mapping (ordered, with the source
+    Value each field expects and the Commit/Active flags) and the SET OF SOURCE COLUMNS
+    the mapping references. Build your data file with THOSE column names and the vendor
+    mapping resolves as-is — no reverse-engineering of field order, priming fields
+    (e.g. InventoryID before Qty), IsNull guards, or `##` structure.
+
+    Returns {ok, screen_id, scenarios:[{name, provider_object, source_columns,
+    detail_object, fields:[{object, field, source, commit, active}]}]} or ok:False with
+    a hint if the screen has no predefined scenario.
+    """
+    client = _client(instance)
+    heads = await _stock_scenario_for_screen(client, screen_id)
+    if not heads:
+        allrows = await client.run_dac("PX_Api_SYMapping", {
+            "$filter": "CreatedByScreenID eq 'SM209900'",
+            "$select": "Name,ScreenID"})
+        avail = sorted({r.get("ScreenID") for r in
+                        ((allrows.get("value") or []) if isinstance(allrows, dict) else [])
+                        if r.get("ScreenID")})
+        return {"ok": False, "screen_id": screen_id.upper(),
+                "error": f"no predefined (ACU Import) scenario for {screen_id.upper()}",
+                "screens_with_stock_scenarios": avail}
+    scenarios = []
+    for h in heads:
+        f = await client.run_dac("PX_Api_SYMappingField",
+                                 {"$filter": f"MappingID eq {h.get('MappingID')}"})
+        rows = sorted(((f.get("value") or []) if isinstance(f, dict) else []),
+                      key=lambda r: r.get("LineNbr", 0))
+        cols: list[str] = []
+        for r in rows:
+            for c in _mapping_column_refs(r.get("Value") or ""):
+                if c not in cols and not _is_marker_field(str(r.get("FieldName") or "")):
+                    cols.append(c)
+        scenarios.append({
+            "name": h.get("Name"),
+            "provider_object": h.get("ProviderObject"),
+            "graph": h.get("GraphName"),
+            "detail_object": _detail_object_of(rows),
+            "source_columns": cols,
+            "fields": [{"object": r.get("ObjectName"), "field": r.get("FieldName"),
+                        "source": r.get("Value"), "commit": r.get("NeedCommit"),
+                        "active": r.get("IsActive")} for r in rows],
+        })
+    return {"ok": True, "screen_id": screen_id.upper(),
+            "note": "Clone this recipe: build your file with `source_columns` as headers, "
+                    "map each field to its column (plain refs — classic screen_submit drops "
+                    "`=` formula values), and keep the detail field ORDER (priming fields "
+                    "like InventoryID must precede Qty).",
+            "scenarios": scenarios}
+
+
 @mcp.tool()
 async def setup_data_provider(
     name: str,
@@ -4956,6 +5093,19 @@ async def build_import_scenario(
                      but NEVER commits (0 rows Processed, no error — proven live). Every
                      working scenario ends with `<Save>` (confirmed from stock ARTEST).
 
+    RECIPE (proven on AR301000, 2026-07-09 — a committed invoice, BaseQty populated):
+      • CLONE, don't guess: call stock_scenario_info(screen_id) first. Acumatica ships a
+        vendor 'ACU Import …' scenario for the migration screens; mirror its field ORDER,
+        source columns, and which detail fields precede Qty.
+      • Map numeric fields (Qty, Amount, Unit Price) to a REAL provider COLUMN, never a
+        bare literal like "1" — a bare Value binds as a source COLUMN name and imports
+        EMPTY (this is what made every prior AR import fail 'BaseQty cannot be empty':
+        Qty="1" -> empty Qty -> empty BaseQty).
+      • Map the line's PRIMING field before Qty (AR301000: Transactions.InventoryID, even
+        blank) so Qty's FieldUpdated can default the computed base field (BaseQty).
+      • Use PLAIN column refs: classic screen_submit silently DROPS `=` formula values
+        (they persist as null). The preflight warns on all three of these.
+
     After writing, the mapping is READ BACK from the DB and verified: `persisted` lists
     every row, `action_rows` are the STRUCTURAL rows (`@@` key restrictions, `<Cancel>`/
     `<Save>` actions, `##` line markers — normal, present in every real mapping, NOT
@@ -5038,6 +5188,40 @@ async def build_import_scenario(
                           if not _is_marker_field(m["field"]))
     ok = (all(x["ok"] for x in results) and len(field_rows) >= expected_fields
           and (has_save or not add_save))
+    # PREFLIGHT: catch the two recipe landmines proven on AR301000 before an import run
+    # silently fails ("'BaseQty' cannot be empty" / 0 rows). (1) a numeric field mapped to
+    # a bare literal binds as a PHANTOM source column -> imports empty. (2) a detail mapping
+    # missing a priming field the vendor's stock scenario sets before Qty -> empty computed
+    # fields. Also: `=` formula sources that classic screen_submit dropped to null.
+    norm = [_norm_map_row(x) for x in mapping]
+    warnings = []
+    const_hits = [m for m in norm if m.get("source") is not None
+                  and _NUMERIC_TARGET_PAT.search(str(m.get("field") or ""))
+                  and _looks_like_constant_source(m["source"])]
+    for m in const_hits:
+        warnings.append(f"{m['field']}: source {m['source']!r} is a bare literal — the "
+                        "import reads it as a source COLUMN name (imports EMPTY). Map it to "
+                        "a real provider column, or use an `=` expression.")
+    dropped = [r for r in field_rows if r.get("Value") is None
+               and any(str((_norm_map_row(x)).get("source") or "").startswith("=")
+                       and (_norm_map_row(x)).get("field") == r.get("FieldName")
+                       for x in mapping)]
+    if dropped:
+        warnings.append("`=` formula sources persisted as NULL (classic screen_submit "
+                        f"drops formula values): {[r.get('FieldName') for r in dropped]}. "
+                        "Use plain column refs, or set these via the modern grid plane.")
+    try:
+        stock = await _stock_scenario_for_screen(client, screen_id)
+        if stock:
+            sf = await client.run_dac("PX_Api_SYMappingField",
+                                      {"$filter": f"MappingID eq {stock[0].get('MappingID')}"})
+            srows = sorted(((sf.get("value") or []) if isinstance(sf, dict) else []),
+                           key=lambda r: r.get("LineNbr", 0))
+            for g in _detail_priming_gaps(norm, srows):
+                warnings.append(f"detail field {g['field']!r} omitted — {g['why']}. "
+                                f"(stock scenario {stock[0].get('Name')!r} has it.)")
+    except Exception:
+        pass
     out = {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
            "requested_rows": len(mapping), "persisted_field_rows": len(field_rows),
            "has_save_action": has_save, "row_results": results, "persisted": persisted,
@@ -5045,8 +5229,10 @@ async def build_import_scenario(
            "next": f"run it with import_excel({name!r}, <file>, do_import=false) — "
                    "Prepare first, check nbr_records, then do_import=true."}
     if add_save and not has_save:
-        out["warning"] = ("No <Save> action row persisted — the scenario will stage rows "
-                          "but commit NOTHING on import. Check the mapping build.")
+        warnings.insert(0, "No <Save> action row persisted — the scenario will stage rows "
+                           "but commit NOTHING on import. Check the mapping build.")
+    if warnings:
+        out["warnings"] = warnings
     return out
 
 
@@ -5598,7 +5784,10 @@ _GUIDE = {
         "import / export data": [
             "import_excel (RUN an import scenario against a new file — classic plane, "
             "all silent 0-row/format/cache traps guarded; PREFER over run_import_scenario)",
-            "build_import_scenario (create SM206025 scenario + mapping, corruption-safe)",
+            "build_import_scenario (create SM206025 scenario + mapping, corruption-safe; "
+            "preflight warns on the phantom-constant/priming-field traps)",
+            "stock_scenario_info (read the VENDOR 'ACU Import …' scenario for a screen — "
+            "the authoritative recipe + template columns to clone instead of guessing)",
             "setup_data_provider (create + point a Data Provider — sets the FileName param)",
             "run_import_scenario (contract path — UNRELIABLE, crashes on many target screens)",
             "load_from_excel (endpoint entity — then poll load_status)",

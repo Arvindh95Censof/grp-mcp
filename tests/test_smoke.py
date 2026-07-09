@@ -504,6 +504,70 @@ def test_mapping_action_rows_separates_structural_from_fields():
     assert {r["FieldName"] for r in act} == {"@@DocType", "<Cancel>", "##", "<Save>"}
 
 
+def test_looks_like_constant_source_flags_the_phantom_column_trap():
+    from grp_mcp.server import _looks_like_constant_source
+    # bare literals: the AR301000 'BaseQty cannot be empty' cause (Qty="1" -> empty)
+    assert _looks_like_constant_source("1")
+    assert _looks_like_constant_source("1.0")
+    assert _looks_like_constant_source("-5")
+    # real column ref / expression / empty: NOT the trap
+    assert not _looks_like_constant_source("Quantity")
+    assert not _looks_like_constant_source("=IsNull([Quantity], [Transactions.Qty])")
+    assert not _looks_like_constant_source("='1'")
+    assert not _looks_like_constant_source("")
+    assert not _looks_like_constant_source(None)
+
+
+def test_mapping_column_refs_extracts_source_columns():
+    from grp_mcp.server import _mapping_column_refs
+    assert _mapping_column_refs("Quantity") == ["Quantity"]
+    # IsNull expr: pull the source column, skip the [Object.Field] self-ref (has a dot)
+    assert _mapping_column_refs("=IsNull([Quantity], [Transactions.Qty])") == ["Quantity"]
+    assert _mapping_column_refs("=IsNull([Unit Price], [Transactions.CuryUnitPrice])") == \
+        ["Unit Price"]
+    assert _mapping_column_refs("") == []
+
+
+def test_detail_priming_gaps_flags_missing_field_before_qty():
+    from grp_mcp.server import _detail_priming_gaps
+    # stock AR-shape: InventoryID precedes Qty on the detail object (Transactions)
+    stock = [
+        {"LineNbr": 32, "ObjectName": "Document", "FieldName": "DocType", "Value": "Type"},
+        {"LineNbr": 320, "ObjectName": "Transactions", "FieldName": "##", "Value": None},
+        {"LineNbr": 352, "ObjectName": "Transactions", "FieldName": "InventoryID",
+         "Value": "Inventory ID"},
+        {"LineNbr": 384, "ObjectName": "Transactions", "FieldName": "Qty",
+         "Value": "Quantity"},
+        {"LineNbr": 416, "ObjectName": "Transactions", "FieldName": "CuryUnitPrice",
+         "Value": "Unit Price"},
+    ]
+    # candidate omits InventoryID -> flagged
+    cand = [
+        {"target_object": "Document", "field": "DocType", "source": "Type"},
+        {"target_object": "Transactions", "field": "Qty", "source": "Quantity"},
+    ]
+    gaps = _detail_priming_gaps(cand, stock)
+    assert [g["field"] for g in gaps] == ["InventoryID"]
+    assert gaps[0]["object"] == "Transactions"
+    # candidate that includes it -> no gap
+    cand2 = cand + [{"target_object": "Transactions", "field": "InventoryID",
+                     "source": "Inventory ID"}]
+    assert _detail_priming_gaps(cand2, stock) == []
+    # no stock scenario -> no gaps
+    assert _detail_priming_gaps(cand, []) == []
+
+
+def test_detail_object_of_finds_last_line_marker_object():
+    from grp_mcp.server import _detail_object_of
+    rows = [
+        {"ObjectName": "Document", "FieldName": "DocType"},
+        {"ObjectName": "Transactions", "FieldName": "##"},
+        {"ObjectName": "Transactions", "FieldName": "Qty"},
+    ]
+    assert _detail_object_of(rows) == "Transactions"
+    assert _detail_object_of([{"ObjectName": "Country", "FieldName": "CountryID"}]) is None
+
+
 def test_endpoint_top_level_entities_parses_path_tree():
     from grp_mcp.server import _endpoint_top_level_entities
     tree = [

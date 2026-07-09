@@ -558,6 +558,21 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.0 — **AR master-detail import PROVEN end-to-end + recipe hardened.** A committed AR301000
+invoice (BaseQty populated, zero errors) landed via the import pipeline on csmdev/AI MPM. The
+two failure modes that made every prior AR import silently fail `'BaseQty' cannot be empty` are
+now caught by a **preflight** in `build_import_scenario` (`warnings`): (1) a numeric field
+(Qty/Amount/Price) mapped to a **bare literal** — the import reads it as a source COLUMN name,
+so `Qty="1"` binds to a phantom column and imports EMPTY → empty BaseQty; (2) a detail mapping
+**missing a priming field** the vendor scenario sets before Qty (AR301000 `Transactions.InventoryID`,
+even blank — it primes the line so Qty's FieldUpdated defaults BaseQty). Also flags `=` formula
+sources that classic `screen_submit` **silently drops to null** (use plain column refs). New
+tool **`stock_scenario_info(screen_id)`** surfaces the vendor `ACU Import …` predefined scenario
+(mapping + expected template columns) so you **clone the authoritative recipe** instead of
+reverse-engineering it — the durable way to avoid these traps on AP/GL/FA/etc. Pure logic
+(`_looks_like_constant_source`, `_mapping_column_refs`, `_detail_priming_gaps`, `_detail_object_of`)
+unit-tested; 168 tests pass.
+
 v0.51.3 — **`build_import_scenario` gains master-detail (grid line-item) support.** A mapping
 row may now be a **line-break marker** — `{"line_break": "Transactions"}` emits the `##`
 grid-new-row marker that starts each detail line — so you can map header fields then detail
