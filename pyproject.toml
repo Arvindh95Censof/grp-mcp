@@ -1,6 +1,6 @@
 [project]
 name = "grp-mcp"
-version = "0.52.1"
+version = "0.52.2"
 description = "MCP server exposing Acumatica ERP (contract-based REST API) as tools for AI agents. Multi-instance, OAuth2."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,3 +27,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/grp_mcp"]
+
+# Ship the operational knowledge base inside the package so the `knowledge` tool can
+# serve it from an installed wheel (repo-root KNOWLEDGE.md -> grp_mcp/KNOWLEDGE.md).
+[tool.hatch.build.targets.wheel.force-include]
+"KNOWLEDGE.md" = "grp_mcp/KNOWLEDGE.md"

@@ -8,10 +8,12 @@ default instance is used.
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import os
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -5822,6 +5824,12 @@ _GUIDE = {
             "UI protocol facts and SOAP write caveats.",
         "screen_capabilities": "probes one screen's /structure and recommends the plane/tool "
             "per operation shape.",
+        "knowledge": "the operational KNOWLEDGE base (KNOWLEDGE.md) — distilled, sanitized "
+            "Acumatica-driving lessons: the four planes, classic screen-SOAP command "
+            "mechanics + the no-bind signal, the modern UI-screen protocol, the "
+            "data-migration recipe + silent-failure traps, GL setup order, segment values, "
+            "and connection/seat gotchas. Call knowledge() for the table of contents, "
+            "knowledge('migration') or knowledge(5) for one section.",
     },
 }
 
@@ -5867,6 +5875,96 @@ def guide(topic: str | None = None) -> Any:
                 "topics": sorted(set(aliases) | {"planes"}),
                 "tip": "omit topic for the full overview."}
     return _GUIDE
+
+
+def _knowledge_text() -> str | None:
+    """Read the bundled KNOWLEDGE.md (pure, no API). Works both from an installed wheel
+    (packaged as grp_mcp/KNOWLEDGE.md via force-include) and from an editable/src checkout
+    (repo-root KNOWLEDGE.md, two dirs up from this file)."""
+    try:
+        p = importlib.resources.files("grp_mcp").joinpath("KNOWLEDGE.md")
+        if p.is_file():
+            return p.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    here = Path(__file__).resolve()
+    for base in (here.parents[2], here.parents[1], here.parent):
+        cand = base / "KNOWLEDGE.md"
+        if cand.is_file():
+            return cand.read_text(encoding="utf-8")
+    return None
+
+
+def _split_knowledge_sections(text: str) -> list[dict]:
+    """Split KNOWLEDGE.md into its top-level `## N. Title` sections (pure, unit-testable).
+    Returns [{num, title, heading, body}] in document order; content before the first
+    numbered heading is dropped (it's the intro)."""
+    out: list[dict] = []
+    cur: dict | None = None
+    lines: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(\d+)\.\s+(.*)$", line)
+        if m:
+            if cur is not None:
+                cur["body"] = "\n".join(lines).strip()
+                out.append(cur)
+            cur = {"num": m.group(1), "title": m.group(2).strip(),
+                   "heading": f"{m.group(1)}. {m.group(2).strip()}"}
+            lines = [line]
+        elif cur is not None:
+            lines.append(line)
+    if cur is not None:
+        cur["body"] = "\n".join(lines).strip()
+        out.append(cur)
+    return out
+
+
+@mcp.tool()
+def knowledge(section: str | None = None) -> Any:
+    """grp-mcp's OPERATIONAL KNOWLEDGE base — distilled, sanitized Acumatica-driving lessons
+    served straight from the package (read-only, no API call, instant).
+
+    This is the hard-won "how Acumatica actually behaves" knowledge that turns "the screen
+    won't write" into "here's the exact command shape": the four planes and which to reach
+    for, the classic screen-SOAP command mechanics (descriptor `set` vs flat `key`, the
+    ~335-byte no-bind signal, mass-update safety), the modern UI-screen JSON protocol, the
+    DATA-MIGRATION recipe + every silent-failure trap, the GL/foundation setup order,
+    segment values, company tree, and connection/seat gotchas. Complements `guide` (which
+    routes you to a TOOL); this explains the MECHANICS. Instance-specific state is excluded.
+
+    section:
+      • omitted -> the table of contents (section numbers + titles).
+      • a number ("5") or keyword ("migration", "planes", "segment", "setup") -> that one
+        section's full text.
+      • "all" -> the entire document.
+    """
+    text = _knowledge_text()
+    if text is None:
+        return {"error": "KNOWLEDGE.md not found in the package or repo.",
+                "tip": "reinstall grp-mcp, or read KNOWLEDGE.md from the repo root."}
+    secs = _split_knowledge_sections(text)
+    if section is None:
+        return {"knowledge_base": "grp-mcp operational knowledge (KNOWLEDGE.md)",
+                "table_of_contents": [s["heading"] for s in secs],
+                "next": "call knowledge('<number or keyword>') for one section, or "
+                        "knowledge('all') for everything."}
+    q = str(section).strip().lower()
+    if q == "all":
+        return {"content": text}
+    # exact section number, else a keyword match on the title, else on the body
+    for s in secs:
+        if q == s["num"]:
+            return {"section": s["heading"], "content": s["body"]}
+    title_hits = [s for s in secs if q in s["title"].lower()]
+    if title_hits:
+        return ({"section": title_hits[0]["heading"], "content": title_hits[0]["body"]}
+                if len(title_hits) == 1 else
+                {"matched_sections": [s["heading"] for s in title_hits],
+                 "tip": "narrow it — call knowledge('<number>')."})
+    body_hits = [s["heading"] for s in secs if q in s["body"].lower()]
+    return {"error": f"no section titled/numbered {section!r}",
+            "table_of_contents": [s["heading"] for s in secs],
+            **({"sections_mentioning_it": body_hits} if body_hits else {})}
 
 
 @mcp.tool()

@@ -568,6 +568,34 @@ def test_detail_object_of_finds_last_line_marker_object():
     assert _detail_object_of([{"ObjectName": "Country", "FieldName": "CountryID"}]) is None
 
 
+def test_split_knowledge_sections_parses_numbered_headings():
+    from grp_mcp.server import _split_knowledge_sections
+    text = "intro line\n\n## 1. Planes\nbody one\n\n## 2. KB-first\nbody two\nmore\n"
+    secs = _split_knowledge_sections(text)
+    assert [s["num"] for s in secs] == ["1", "2"]
+    assert secs[0]["title"] == "Planes"
+    assert secs[0]["heading"] == "1. Planes"
+    assert "body one" in secs[0]["body"]
+    assert "body two" in secs[1]["body"] and "more" in secs[1]["body"]
+    # intro before the first numbered heading is dropped
+    assert "intro line" not in secs[0]["body"]
+
+
+def test_knowledge_tool_serves_toc_and_sections():
+    from grp_mcp import server
+    toc = server.knowledge()
+    assert toc["table_of_contents"], "expected a non-empty table of contents"
+    # keyword lookup returns one section's content
+    mig = server.knowledge("migration")
+    assert "content" in mig and "Provider" in mig["content"]
+    # exact section number works
+    assert "content" in server.knowledge("1")
+    # whole doc
+    assert "content" in server.knowledge("all")
+    # bogus section reports the TOC back
+    assert "table_of_contents" in server.knowledge("no-such-section-xyz")
+
+
 def test_endpoint_top_level_entities_parses_path_tree():
     from grp_mcp.server import _endpoint_top_level_entities
     tree = [

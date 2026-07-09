@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.2 — **Operational knowledge base shipped inside the server.** New read-only **`knowledge`**
+tool serves the distilled, sanitized `KNOWLEDGE.md` (the "how Acumatica actually behaves" lessons —
+the four planes, classic screen-SOAP command mechanics + the no-bind signal, the modern UI-screen
+protocol, the full data-migration recipe + silent-failure traps, GL setup order, segment values,
+connection/seat gotchas). `knowledge()` returns the table of contents; `knowledge('migration')` or
+`knowledge(5)` returns one section; `knowledge('all')` the whole doc. It's the mechanics companion to
+`guide` (which routes to a tool). The file is bundled into the wheel (hatch force-include) so it
+travels with every install, and resolves from an editable/src checkout too. 170 tests pass.
+
 v0.52.1 — **GL import PROVEN + verbatim-clone ruled out.** Landed a committed, balanced GL301000
 journal batch (`DebitTotal 100 = CreditTotal 100`) via plain-column `build_import_scenario` — no
 special tooling. The lesson: a GL line is debit XOR credit, so its debit/credit columns alternate
