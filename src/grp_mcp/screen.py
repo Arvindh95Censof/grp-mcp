@@ -1261,7 +1261,10 @@ class ScreenClient:
             view = None
             for r in body.get("redirects", []):
                 settings = r.get("settings", {})
-                if settings.get("type") == "openDialog":
+                # openDialog is a panel; openMessageBox is a yes/no confirm (e.g.
+                # SM206025 insertFrom's "provider differs — continue?"). Both are
+                # answered the same way (dialogCallback), so catch both.
+                if settings.get("type") in ("openDialog", "openMessageBox"):
                     view = settings.get("viewName")
                     break
             if ans == "none":

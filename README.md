@@ -558,6 +558,18 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.1 — **GL import PROVEN + verbatim-clone ruled out.** Landed a committed, balanced GL301000
+journal batch (`DebitTotal 100 = CreditTotal 100`) via plain-column `build_import_scenario` — no
+special tooling. The lesson: a GL line is debit XOR credit, so its debit/credit columns alternate
+blanks; put an explicit **0** in the empty side (a blank imports as EMPTY → `'CreditAmt' cannot be
+empty`) and attach a **fresh** file (a same-filename re-upload can read a stale cached copy). The
+vendor's `=IsNull(...)` guards are convenience, **not** required. Separately, investigated cloning a
+vendor scenario VERBATIM to keep those guards and proved it's **not API-drivable**: `insertFrom` sets
+graphIsDirty but copies no rows, Copy/Paste pastes an empty record, and neither write plane persists
+an `=` formula value — the modern `/ui/screen` protocol shims those codebehind-only toolbar actions.
+So no clone tool ships; the one real fix kept from that work is `ScreenClient.ui_command` now
+answering `openMessageBox` (yes/no) confirmations, not just `openDialog` panels. 168 tests pass.
+
 v0.52.0 — **AR master-detail import PROVEN end-to-end + recipe hardened.** A committed AR301000
 invoice (BaseQty populated, zero errors) landed via the import pipeline on csmdev/AI MPM. The
 two failure modes that made every prior AR import silently fail `'BaseQty' cannot be empty` are

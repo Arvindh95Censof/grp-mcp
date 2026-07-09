@@ -5104,7 +5104,16 @@ async def build_import_scenario(
       • Map the line's PRIMING field before Qty (AR301000: Transactions.InventoryID, even
         blank) so Qty's FieldUpdated can default the computed base field (BaseQty).
       • Use PLAIN column refs: classic screen_submit silently DROPS `=` formula values
-        (they persist as null). The preflight warns on all three of these.
+        (they persist as null). The preflight warns on all three of these. (The vendor's
+        `=IsNull([col],[obj.field])` guards can't be reproduced field-by-field — no write
+        plane persists a formula, and insertFrom/Copy-Paste are API no-ops — so supply
+        real values instead of relying on blank-cell fallback.)
+      • For paired debit/credit columns that ALTERNATE blanks per line (GL301000
+        CuryDebitAmt/CuryCreditAmt), put an explicit 0 in the empty side — a truly blank
+        cell imports as EMPTY ('CreditAmt cannot be empty'); a 0 imports as zero. Attach a
+        FRESH file (a same-filename re-upload can read a stale cached copy). Proven: a
+        plain both-column GL mapping with 0-filled cells committed a balanced batch
+        (GL301000, 2026-07-09) — the IsNull guards are NOT required.
 
     After writing, the mapping is READ BACK from the DB and verified: `persisted` lists
     every row, `action_rows` are the STRUCTURAL rows (`@@` key restrictions, `<Cancel>`/
