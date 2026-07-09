@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.51.1 — **`import_excel` honesty fix** (found live testing v0.51.0 through the MCP). The
+Import step read per-row results by the friendly alias (`Error`) but the SOAP export keys
+rows by the resolved name (`ErrorMessage`) — so error detection was silently dead — and it
+never checked `IsProcessed` at all. Result: a scenario that FINISHED without committing a
+single row (a bad mapping stages rows then persists nothing, with no error) returned
+`ok:true`. Now the verdict reads both key spellings and **gates `ok` on rows actually
+Processed** (`rows_processed == rows_total`); a finished-but-0-processed run returns
+`ok:false` with a mapping-diagnosis warning. Extracted to a unit-tested pure helper.
+
 v0.51.0 — **import-scenario suite rebuilt on live-re-vetted mechanics.** A user session
 hit a chain of silent 0-row dead-ends running Excel imports; every finding was
 reproduced (or refuted) live, and the corrected mechanisms are now code:

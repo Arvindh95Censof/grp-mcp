@@ -4519,6 +4519,31 @@ def _import_error_hints(messages: list[str]) -> list[str]:
     return hints
 
 
+def _prepared_data_summary(rows: list[dict]) -> dict:
+    """Honest commit verdict from SM206036's PreparedData grid (pure, unit-testable).
+
+    The SOAP export keys each row by the RESOLVED field name (IsProcessed /
+    ErrorMessage), NOT the friendly alias — read both. `IsProcessed` is the only
+    honest commit signal: a BAD MAPPING finishes (Status F) with 0 errors AND 0
+    processed — nothing persisted (proven live). Returns {processed, errors:[{line,
+    error}], error_texts}."""
+    def cell(r, *names):
+        for n in names:
+            if n in r and r[n] not in (None, ""):
+                return r[n]
+        return None
+
+    processed = sum(1 for r in rows
+                    if str(cell(r, "IsProcessed", "Processed") or "").strip().lower()
+                    in ("true", "1", "yes"))
+    err_rows = [r for r in rows if str(cell(r, "ErrorMessage", "Error") or "").strip()]
+    errors = [{"line": cell(r, "LineNbr", "Number"),
+               "error": cell(r, "ErrorMessage", "Error")} for r in err_rows]
+    return {"processed": processed,
+            "errors": errors,
+            "error_texts": [str(cell(r, "ErrorMessage", "Error") or "") for r in err_rows]}
+
+
 def _phantom_mapping_rows(rows: list[dict]) -> list[dict]:
     """SM206025 mapping rows that are wizard artifacts, not real field mappings
     (pure, unit-testable). Observed live: '<Cancel>' action rows and mangled
@@ -4838,13 +4863,29 @@ async def import_excel(
                                "PreparedData.Error"],
                               filters=[{"field": "Selection.Name", "value": scenario_name}],
                               top=int(state.get("NbrRecords") or 100))
-    errs = [r for r in (rows.get("rows") or []) if (r.get("Error") or "").strip()]
+    # IsProcessed is the honest commit signal: a BAD MAPPING finishes (Status F)
+    # with 0 errors AND 0 processed — nothing persisted (proven live). ok must
+    # require rows actually Processed, not just "status moved, no error string".
+    summ = _prepared_data_summary(rows.get("rows") or [])
+    total = int(state.get("NbrRecords") or 0)
+    processed_n, errs = summ["processed"], summ["errors"]
     out["import"] = {"status": state2.get("Status"), "status_changed": changed,
-                     "row_errors": len(errs), "rows_total": state.get("NbrRecords")}
-    out["ok"] = bool(changed) and not errs and state2.get("Status") != "E"
+                     "rows_total": total, "rows_processed": processed_n,
+                     "row_errors": len(errs)}
+    out["ok"] = (bool(changed) and not errs and state2.get("Status") != "E"
+                 and processed_n == total and total > 0)
     if errs:
         out["errors"] = errs[:25]
-        out["hints"] = _import_error_hints([e.get("Error") for e in errs])
+        out["hints"] = _import_error_hints(summ["error_texts"])
+    elif processed_n < total:
+        out["warning"] = (
+            f"Import FINISHED with no per-row error, but only {processed_n}/{total} "
+            "rows were marked Processed — the rest committed NOTHING. The usual cause is a "
+            "BAD SCENARIO MAPPING (source columns not wired to target fields): the engine "
+            "stages rows and 'finishes' without persisting. Check the scenario's mapping "
+            "(build_import_scenario reads it back) and that the target records now exist.")
+        out["hints"] = ["MAPPING: 0/partial rows Processed with no error almost always means "
+                        "the scenario's field mapping doesn't wire source→target correctly."]
     return out
 
 

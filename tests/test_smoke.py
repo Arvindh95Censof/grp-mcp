@@ -447,6 +447,32 @@ def test_import_error_hints_recognize_live_gates():
     assert _import_error_hints(["all good"]) == []
 
 
+def test_prepared_data_summary_reads_resolved_keys_and_gates_on_processed():
+    from grp_mcp.server import _prepared_data_summary
+    # exact shape the SOAP export returns (keyed by resolved field names) — the
+    # live "finished but committed nothing" case: 0 processed, 0 errors.
+    none_committed = [
+        {"Name": "SC", "LineNbr": "1", "IsProcessed": "False", "ErrorMessage": ""},
+        {"Name": "SC", "LineNbr": "2", "IsProcessed": "False", "ErrorMessage": ""},
+        {"Name": "SC", "LineNbr": "3", "IsProcessed": "False", "ErrorMessage": ""},
+    ]
+    s = _prepared_data_summary(none_committed)
+    assert s["processed"] == 0 and s["errors"] == []
+    # all committed
+    ok = [{"LineNbr": "1", "IsProcessed": "True", "ErrorMessage": ""},
+          {"LineNbr": "2", "IsProcessed": "true", "ErrorMessage": ""}]
+    assert _prepared_data_summary(ok)["processed"] == 2
+    # one real error, surfaced with line + text (resolved key ErrorMessage)
+    mixed = [{"LineNbr": "1", "IsProcessed": "True", "ErrorMessage": ""},
+             {"LineNbr": "2", "IsProcessed": "False",
+              "ErrorMessage": "Cannot generate the next number for the ARINVOICE sequence."}]
+    s = _prepared_data_summary(mixed)
+    assert s["processed"] == 1
+    assert s["errors"] == [{"line": "2",
+                            "error": "Cannot generate the next number for the ARINVOICE sequence."}]
+    assert "ARINVOICE" in s["error_texts"][0]
+
+
 def test_phantom_mapping_rows_flags_wizard_artifacts():
     from grp_mcp.server import _phantom_mapping_rows
     rows = [
