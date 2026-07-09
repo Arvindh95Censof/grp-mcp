@@ -581,6 +581,19 @@ def test_split_knowledge_sections_parses_numbered_headings():
     assert "intro line" not in secs[0]["body"]
 
 
+def test_advertised_tool_count_stays_current():
+    # the "~NN tools" strings in the server instructions + guide() must track reality so a
+    # fresh AI is told the right scale (they silently drifted 77 -> 95 once). Small slack.
+    import inspect
+    import re as _re
+    actual = len(asyncio.run(server.mcp.list_tools()))
+    advertised = [int(n) for n in _re.findall(r"~(\d+)\s+tools", inspect.getsource(server))]
+    assert advertised, "expected at least one '~NN tools' advertised count in server.py"
+    for n in advertised:
+        assert abs(n - actual) <= 8, (
+            f"advertised ~{n} tools but there are {actual} — update the count string(s)")
+
+
 def test_knowledge_tool_serves_toc_and_sections():
     from grp_mcp import server
     toc = server.knowledge()

@@ -25,7 +25,7 @@ from .loaders import map_row, read_rows
 from .screen import ScreenClient, ScreenError, _leaf, clear_session_cache, logout_session_cache
 
 _KB_FIRST_POLICY = (
-    "TOOL SELECTION: this server has ~77 tools across FOUR Acumatica planes (contract "
+    "TOOL SELECTION: this server has ~95 tools across FOUR Acumatica planes (contract "
     "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON). If you're unsure which "
     "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
     "screen call screen_capabilities(screen_id); for financial-foundation setup call "
@@ -538,6 +538,9 @@ def add_instance(
     name: the profile key you'll pass as `instance` (e.g. "financenew").
     base_url + OAuth (client_id/client_secret/username/password): the target
         instance and a Connected Application registered there.
+    endpoint_name/endpoint_version: the web-service endpoint (default
+        "Default"/"24.200.001"). tenant: the company login name (needed for OData and
+        the customization/cookie login). branch: optional login branch.
     Gates default to read-only (allow_write/allow_delete/allow_publish off) and the
     filesystem sandbox (read_roots/write_roots) is unset (unrestricted) unless given.
     set_active=true makes it the default profile. persist=true writes connections.json
@@ -2966,6 +2969,11 @@ async def whoami(instance: str | None = None) -> Any:
     read succeed, and the count of cached sessions holding API seats. Acumatica
     exposes no clean per-seat usage over REST, so to free seats use
     release_sessions (trial = 2 seats). Read-only.
+
+    NOTE: `reachable` reflects ONLY the contract-REST plane (a swagger read). The
+    screen-SOAP and modern-UI planes are independent and can work even when it is
+    false — do NOT treat reachable:false as "instance is down" (see reachable_scope
+    in the result).
     """
     cfg = _cfg()
     name = instance or cfg.default
@@ -3278,6 +3286,8 @@ async def create_ledger(
 ) -> Any:
     """Create a GL ledger (GL201500): LedgerID, Description, Type, Currency, Save.
 
+    ledger_id/description/currency: the ledger's ID, display name, and base currency
+        (e.g. "ACTUAL" / "Actual Ledger" / "USD").
     ledger_type: "Actual" | "Reporting" | "Statistical" | "Budget". Requires a
     financial calendar to exist first (create_financial_calendar). Requires
     allow_write. Verify with screen_get('GL201500', ['LedgerRecords.LedgerID']).
@@ -3401,6 +3411,10 @@ async def chart_of_accounts(
         active                   optional bool, defaults True
     Each becomes a NewRow + field SETs on the AccountRecords grid; one Save
     commits them all. A confirmation dialog (if any) is auto-answered "Yes".
+
+    save/dry_run/auto_answer: save=false stages the rows without the final Save;
+        dry_run=true previews (drops the committing commands, writes nothing);
+        auto_answer answers any confirmation dialog (default "Yes").
 
     type_map: optional {code: AcumaticaType} to override the built-in letter map
         (e.g. {"B": "Asset"} if your source codes B as a Bank/Asset account).
@@ -4314,12 +4328,17 @@ async def load_from_excel(
     background: bool | None = None,
     instance: str | None = None,
 ) -> Any:
-    """Bulk create/update records of an entity from an .xlsx/.csv file.
+    """Bulk create/update ENDPOINT-ENTITY records from an .xlsx/.csv file (contract
+    REST upsert). NOT the import-scenario runner — for a document WITH detail/LINE
+    rows (invoice, journal, batch) or any screen not on the endpoint, use
+    `import_excel` instead. This path is scalar-only and requires the entity on the
+    web-service endpoint.
 
     Each data row -> one upsert (PUT, keyed by the entity's key fields). The first
     row is the header. column_map maps a header to an entity field name; omit it to
     use headers verbatim, or map a header to "" to ignore that column. Only scalar
-    fields are supported (no nested detail rows).
+    fields are supported (no nested detail rows). sheet: which worksheet to read
+    (default: the first sheet).
 
     dry_run=True (DEFAULT): parses + maps + validates field names against the
     schema and returns a preview WITHOUT writing anything. Inspect unknown_fields
@@ -4894,7 +4913,13 @@ async def import_excel(
     force: bool = False,
     instance: str | None = None,
 ) -> Any:
-    """Run an Import Scenario against a NEW data file, end to end, with every silent
+    """THE import-scenario runner (SM206015 -> SM206025 -> SM206036) — the reliable
+    way to bulk-load ANY screen, including master-DETAIL documents (invoices, journals).
+    NOT `load_from_excel` (a scalar-only endpoint-entity upsert, no line rows) and NOT
+    `run_import_scenario` (the UNRELIABLE contract path). If a task says "import
+    scenario" / "bulk load a document", this is the tool.
+
+    Runs an Import Scenario against a NEW data file, end to end, with every silent
     dead-end from the proven ordeal turned into a loud, actionable error. Screen-
     agnostic: the scenario carries the target screen + mapping; this handles the rest
     (file, provider pointing, Prepare, Import). The reliable CLASSIC-plane runner —
@@ -5317,6 +5342,9 @@ async def snapshot_entity(
     Returns the file path + record count. Use before destructive ops (calendar
     regen, segment restructure, bulk overwrite) so you can roll back.
 
+    filter/expand: optional OData `$filter` / `$expand` to scope the dump to a subset
+        or pull in related detail collections.
+
     Auto-pages with $skip so the snapshot captures the FULL table, not just page 1.
     The final path — whether you supplied one or it's the auto-generated default —
     must be inside the instance's write_roots (if configured).
@@ -5404,9 +5432,10 @@ async def run_import_scenario(
     scenario_name: the scenario's Name (must exist in SM206025). do_import: False =
     prepare only. entity/key_field/prepare_action/import_action: override if your
     endpoint names them differently (defaults match GRPSetup: ImportByScenario +
-    prepareIBS/importIBS). The provider must already have its file attached AND its
-    FileName parameter pointing at it — '<EmptyFileName>' Prepares 0 rows silently.
-    Requires "allow_write": true.
+    prepareIBS/importIBS). poll_interval/timeout: seconds between long-operation polls
+    / max seconds to wait for Prepare+Import to finish. The provider must already have
+    its file attached AND its FileName parameter pointing at it — '<EmptyFileName>'
+    Prepares 0 rows silently. Requires "allow_write": true.
     """
     import asyncio
 
@@ -5836,7 +5865,7 @@ _GUIDE = {
 
 @mcp.tool()
 def guide(topic: str | None = None) -> Any:
-    """START HERE — pick the right grp-mcp tool for your task (this server has ~77 tools
+    """START HERE — pick the right grp-mcp tool for your task (this server has ~95 tools
     across four Acumatica planes, so guessing wastes calls).
 
     Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,
@@ -6240,6 +6269,9 @@ async def run_report(
         {"LedgerID": "ACTUAL", "FromPeriod": "012026", "ToPeriod": "122026"}.
     out_path: where to write the report bytes.
 
+    poll_interval/timeout: seconds between status polls / max seconds to wait for the
+        report to render before giving up.
+
     Contract flow: PUT report + params -> 202 + Location -> poll until 200 -> bytes.
     out_path must be within the instance's write_roots (if configured).
     """
@@ -6351,6 +6383,10 @@ async def import_customization(
 
     Creates/replaces the project; does NOT publish it. Requires the instance's
     profile to have "allow_publish": true.
+
+    is_replace_if_exists: overwrite a same-named project (default true; false errors if
+        it exists). project_level: optional int precedence level. project_description:
+        optional description stamped on the created project.
 
     backup=true: before a REPLACE, export the EXISTING project to disk first (cheap
     insurance — lets you restore it if the import is wrong). Defaults the backup to

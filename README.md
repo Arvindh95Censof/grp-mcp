@@ -558,6 +558,18 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.3 — **AI-usability audit + fixes.** A three-arm audit (static inventory of all 95 tools, a live
+discovery-surface check, and a cold subagent using the server read-only) confirmed a fresh AI can
+drive grp-mcp correctly (~4.5/5) thanks to `guide`/`knowledge`/`screen_capabilities`. It also found
+that **tool NAMES could mislead a name-pattern-matcher**: `run_import_scenario` (the UNRELIABLE path)
+reads more "right" than `import_excel` (the correct runner), which collides with `load_from_excel`.
+Fixes: the stale advertised count (`~77` → `~95 tools`, now guarded by a test so it can't silently
+drift again); sharpened first-lines on `import_excel` / `load_from_excel` / `run_import_scenario` so a
+name-picker self-corrects; documented the previously-unnamed params on ~10 tools (`create_ledger`,
+`chart_of_accounts`, `run_report`/`run_import_scenario` poll/timeout, `add_instance`,
+`import_customization`, `snapshot_entity`, …); and clarified that `whoami`'s `reachable` is
+contract-REST-scoped. 171 tests pass.
+
 v0.52.2 — **Operational knowledge base shipped inside the server.** New read-only **`knowledge`**
 tool serves the distilled, sanitized `KNOWLEDGE.md` (the "how Acumatica actually behaves" lessons —
 the four planes, classic screen-SOAP command mechanics + the no-bind signal, the modern UI-screen
