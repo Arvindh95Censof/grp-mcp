@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.51.2 — **`build_import_scenario` now produces a COMMITTING mapping** (proven end to end).
+Diffing a scenario it built against the stock working `ARTEST` mapping revealed the gap: a
+real mapping ENDS with a `<Save>` **action row** — without it the import stages every field
+into the graph and "finishes" without committing a thing (the 0-processed case v0.51.1 now
+catches). The tool auto-appends `<Save>` (toggle `add_save`), and the `@@`/`<Cancel>`/`##`
+rows it used to flag as "phantom corruption" are correctly reframed as **structural** rows
+(present in every working mapping). Proven live: built a Countries scenario → `import_excel`
+→ **3/3 rows Processed, records verified in the Country table** with the right field mapping.
+
 v0.51.1 — **`import_excel` honesty fix** (found live testing v0.51.0 through the MCP). The
 Import step read per-row results by the friendly alias (`Error`) but the SOAP export keys
 rows by the resolved name (`ErrorMessage`) — so error detection was silently dead — and it

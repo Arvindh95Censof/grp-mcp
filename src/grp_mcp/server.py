@@ -4544,14 +4544,16 @@ def _prepared_data_summary(rows: list[dict]) -> dict:
             "error_texts": [str(cell(r, "ErrorMessage", "Error") or "") for r in err_rows]}
 
 
-def _phantom_mapping_rows(rows: list[dict]) -> list[dict]:
-    """SM206025 mapping rows that are wizard artifacts, not real field mappings
-    (pure, unit-testable). Observed live: '<Cancel>' action rows and mangled
-    '@@'-prefixed names appear when the grid is driven wrong (batched new_rows)."""
+def _mapping_action_rows(rows: list[dict]) -> list[dict]:
+    """SM206025 mapping rows that are STRUCTURAL, not field mappings (pure,
+    unit-testable): `@@`-prefixed key restrictions, `<Cancel>`/`<Save>`/`<...>`
+    actions, and `##` grid line-markers. These are NORMAL — present in every
+    working mapping (confirmed from the stock ARTEST scenario), NOT corruption.
+    Separated from real field rows for reporting/verification."""
     out = []
     for r in rows:
         fn = str(r.get("FieldName") or "")
-        if fn.startswith("<") or fn.startswith("@@"):
+        if fn.startswith("<") or fn.startswith("@@") or fn.startswith("##"):
             out.append(r)
     return out
 
@@ -4896,6 +4898,7 @@ async def build_import_scenario(
     provider: str,
     provider_object: str,
     mapping: list[dict],
+    add_save: bool = True,
     instance: str | None = None,
 ) -> Any:
     """Build an SM206025 Import Scenario + its field mapping — using ONLY the write
@@ -4916,13 +4919,21 @@ async def build_import_scenario(
     provider:        Data Provider name (SM206015; see setup_data_provider).
     provider_object: the provider's schema object (= the worksheet name for Excel).
     mapping:         [{"target_object": <screen object, e.g. "Country" / "Document">,
-                       "field": <target Field Name as shown in the mapping combo>,
+                       "field": <target field LABEL as shown in the mapping combo, e.g.
+                                 "Country ID" — from ui_get_structure(screen)'s labels>,
                        "source": <provider column, or a literal like "<NEW>" / "=...">,
-                       "commit": <optional bool — the row's Commit flag>}]
+                       "commit": <optional bool — the row's Commit flag; set true on the
+                                  key + required fields>}]
+    add_save:        append the trailing `<Save>` ACTION row (default True). This is
+                     ESSENTIAL: without it the import stages every field into the graph
+                     but NEVER commits (0 rows Processed, no error — proven live). Every
+                     working scenario ends with `<Save>` (confirmed from stock ARTEST).
 
-    After writing, the mapping is READ BACK from the DB and verified: `persisted`
-    lists what's really there, `phantom_rows` flags wizard artifacts, and ok=false if
-    the row count doesn't match. Requires allow_write; KB-first policy applies.
+    After writing, the mapping is READ BACK from the DB and verified: `persisted` lists
+    every row, `action_rows` are the STRUCTURAL rows (`@@` key restrictions, `<Cancel>`/
+    `<Save>` actions, `##` line markers — normal, present in every real mapping, NOT
+    corruption), `has_save_action` confirms the commit row is there, and ok=false if a
+    field row failed or `<Save>` is missing. Requires allow_write; KB-first policy applies.
     """
     _require_write(instance)
     client = _client(instance)
@@ -4958,6 +4969,22 @@ async def build_import_scenario(
             r = await s.submit(cmds)
             results.append({"index": i, "field": m["field"], "ok": bool(r.get("ok")),
                             **({"error": str(r.get("error"))[:200]} if not r.get("ok") else {})})
+        # Append the <Save> ACTION row — WITHOUT it the import stages every field into
+        # the graph but NEVER commits (0 rows Processed, no error; proven live). Every
+        # working scenario ends with it (confirmed from the stock ARTEST mapping). The
+        # object is the primary target (same as the field rows' object).
+        if add_save and mapping:
+            save_obj = mapping[-1]["target_object"]
+            rs = await s.submit([
+                {"set": "ScenarioSummary.Name", "to": name},
+                {"new_row": "Mapping"},
+                {"set": "Mapping.TargetObject", "to": save_obj},
+                {"set": "Mapping.FieldActionName", "to": "<Save>"},
+                {"action": "Save"},
+            ])
+            results.append({"index": len(mapping), "field": "<Save>",
+                            "ok": bool(rs.get("ok")),
+                            **({"error": str(rs.get("error"))[:200]} if not rs.get("ok") else {})})
     # verify from the DB — the wizard's own reply is optimistic
     rows = []
     m2 = await client.run_dac("PX_Api_SYMapping", {
@@ -4969,15 +4996,23 @@ async def build_import_scenario(
                       key=lambda r: r.get("LineNbr", 0))
     persisted = [{k: r.get(k) for k in ("LineNbr", "ObjectName", "FieldName", "Value",
                                         "NeedCommit", "IsActive")} for r in rows]
-    phantoms = _phantom_mapping_rows(persisted)
-    real = [r for r in persisted if r not in phantoms]
-    ok = all(x["ok"] for x in results) and len(real) >= len(mapping)
-    return {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
-            "requested_rows": len(mapping), "persisted_rows": len(real),
-            "row_results": results, "persisted": persisted,
-            "phantom_rows": phantoms or None,
-            "next": f"run it with import_excel({name!r}, <file>, do_import=false) — "
-                    "Prepare first, check nbr_records, then do_import=true."}
+    # `@@`/`<Cancel>`/`<Save>`/`##` are STRUCTURAL rows (restrictions, actions, line
+    # markers) — present in every working mapping, NOT corruption. Report them as such.
+    action_rows = _mapping_action_rows(persisted)
+    field_rows = [r for r in persisted if r not in action_rows]
+    has_save = any((r.get("FieldName") or "") == "<Save>" for r in persisted)
+    ok = (all(x["ok"] for x in results) and len(field_rows) >= len(mapping)
+          and (has_save or not add_save))
+    out = {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
+           "requested_rows": len(mapping), "persisted_field_rows": len(field_rows),
+           "has_save_action": has_save, "row_results": results, "persisted": persisted,
+           "action_rows": action_rows or None,
+           "next": f"run it with import_excel({name!r}, <file>, do_import=false) — "
+                   "Prepare first, check nbr_records, then do_import=true."}
+    if add_save and not has_save:
+        out["warning"] = ("No <Save> action row persisted — the scenario will stage rows "
+                          "but commit NOTHING on import. Check the mapping build.")
+    return out
 
 
 @mcp.tool()

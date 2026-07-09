@@ -473,16 +473,19 @@ def test_prepared_data_summary_reads_resolved_keys_and_gates_on_processed():
     assert "ARINVOICE" in s["error_texts"][0]
 
 
-def test_phantom_mapping_rows_flags_wizard_artifacts():
-    from grp_mcp.server import _phantom_mapping_rows
+def test_mapping_action_rows_separates_structural_from_fields():
+    from grp_mcp.server import _mapping_action_rows
+    # structural rows from the real working ARTEST mapping shape
     rows = [
-        {"FieldName": "CountryID", "Value": "CountryID"},
-        {"FieldName": "<Cancel>", "Value": None},      # observed live
-        {"FieldName": "@@CountryID", "Value": "X"},    # observed live
-        {"FieldName": "Description", "Value": "CountryName"},
+        {"FieldName": "DocType", "Value": "Type"},        # field
+        {"FieldName": "@@DocType", "Value": "=[...]"},    # key restriction (structural)
+        {"FieldName": "<Cancel>", "Value": None},         # action (structural)
+        {"FieldName": "##", "Value": None},               # line marker (structural)
+        {"FieldName": "CustomerID", "Value": "CustomerID"},  # field
+        {"FieldName": "<Save>", "Value": None},           # commit action (structural)
     ]
-    ph = _phantom_mapping_rows(rows)
-    assert {r["FieldName"] for r in ph} == {"<Cancel>", "@@CountryID"}
+    act = _mapping_action_rows(rows)
+    assert {r["FieldName"] for r in act} == {"@@DocType", "<Cancel>", "##", "<Save>"}
 
 
 def test_endpoint_top_level_entities_parses_path_tree():
