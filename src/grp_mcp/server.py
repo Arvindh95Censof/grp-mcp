@@ -1272,9 +1272,20 @@ async def attach_file_to_provider(
     directly — no GET on the broken entity.
 
     record_id: the provider's GUID, as returned by setup_data_provider's `id`
-               (also visible in the URL of its read-back error).
+               (== the SYProvider row's NoteID, readable via run_dac_odata).
     file_path: the .xlsx/.csv to upload (must be within the instance read_roots).
     filename:  stored name (defaults to the file's basename).
+
+    IMPORTANT — attaching does NOT point the provider at the file. The provider
+    reads whatever its FileName PARAMETER names; if that still says another file
+    (or '<EmptyFileName>') a subsequent Prepare reads the OLD/no content with no
+    error. After attaching, set the parameter:
+        ui_update_grid_row("SM206015", "Parameters", key={"LineNbr": 1},
+            values={"Value": "Data Providers (<ProviderName>)\\\\<filename>"},
+            parent={"view": "Providers", "key": {"Name": "<ProviderName>"}})
+    — or skip both steps and use import_excel, which attaches under a fresh unique
+    name and repoints the parameter in one call. Also note: an openpyxl-authored
+    .xlsx reads as 0 rows (author with real Excel).
 
     Requires "allow_write": true. Returns the upload URL + byte count.
     """
@@ -2525,6 +2536,14 @@ async def screen_submit(
     Add a detail row (master-detail/context screen): set the parent key(s),
     new_row the detail container, set the row's fields, Save.
 
+    CAUTION — MULTIPLE new_row IN ONE SUBMIT CAN CORRUPT SILENTLY. Proven live on
+    SM206025's mapping grid (2026-07-08): batching 2 new_row blocks returned ok:true
+    but persisted values CROSSED between rows plus phantom "<Cancel>"/"@@" artifact
+    rows. Grids whose combo values depend on the current row's state are the danger;
+    simple grids (e.g. GL202500 accounts) batch fine. When in doubt: ONE row per
+    screen_submit call (nav-key + new_row + sets + Save each time), and READ BACK
+    what persisted (run_dac_odata / screen_get) — ok:true alone proves nothing.
+
     Field-level errors are returned in `messages` (the API reports them inside a
     200, not as a fault). Requires "allow_write": true; a sequence containing a
     `delete_row` (unless dry_run) additionally requires "allow_delete": true, so
@@ -2584,6 +2603,12 @@ async def screen_insert_rows(
           {"Account":"10100","Type":"Asset","AccountClass":"CASH","Description":"Cash"},
           {"Account":"40100","Type":"Income","Description":"Sales"}])
     Requires allow_write. Opens/closes its own SOAP session (frees the API seat).
+
+    CAUTION: all rows go in ONE batched Submit. On grids whose combo/lookup values
+    depend on the current row's state (e.g. SM206025 scenario mapping) batching
+    corrupts silently — values cross rows behind an ok:true (proven live). For such
+    grids write one row per call (screen_submit / screen_bulk_load) and read back.
+    Simple flat grids (GL202500 etc.) batch fine.
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -4409,6 +4434,103 @@ async def load_status(job: str | None = None) -> Any:
     return _load_job_view(state)
 
 
+def _xlsx_read_risk(path) -> str | None:
+    """Reason this .xlsx is likely UNREADABLE by Acumatica's Excel data provider,
+    or None if it looks fine (pure, unit-testable).
+
+    Proven live (csmdev 2026-07-08): an openpyxl-authored .xlsx Prepares to 0 rows
+    SILENTLY — Fill Schema reads the header fine, so nothing points at the file.
+    Two independent markers of a not-really-Excel writer:
+      • docProps/app.xml <Application> mentions the library (openpyxl stamps
+        "Microsoft Excel Compatible / Openpyxl x.y.z"), or
+      • xl/sharedStrings.xml is MISSING (inline-strings writer — real Excel always
+        emits the shared-strings part for text cells).
+    """
+    import zipfile
+    from pathlib import Path
+
+    p = Path(path)
+    if p.suffix.lower() != ".xlsx":
+        return None
+    try:
+        with zipfile.ZipFile(p) as z:
+            names = set(z.namelist())
+            app = b""
+            if "docProps/app.xml" in names:
+                app = z.read("docProps/app.xml")
+            if b"openpyxl" in app.lower():
+                return ("authored by openpyxl (docProps/app.xml Application) — Acumatica's "
+                        "Excel provider reads such files as 0 data rows.")
+            if "xl/sharedStrings.xml" not in names:
+                return ("no xl/sharedStrings.xml (inline-strings writer, not real Excel) — "
+                        "Acumatica's Excel provider typically reads such files as 0 data rows.")
+    except zipfile.BadZipFile:
+        return "not a valid .xlsx (zip) file."
+    return None
+
+
+def _xlsx_sheet_names(path) -> list[str]:
+    """Worksheet names of an .xlsx (empty list for non-xlsx or unreadable)."""
+    from pathlib import Path
+
+    if Path(path).suffix.lower() != ".xlsx":
+        return []
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, read_only=True)
+        try:
+            return list(wb.sheetnames)
+        finally:
+            wb.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _provider_filename_value(provider_name: str, filename: str) -> str:
+    """The FileName parameter Value a WORKING provider carries (pure, unit-testable).
+
+    Format proven from the stock 'ACU Import AR Invoices' provider on csmdev:
+    'Data Providers (<ProviderName>)\\<attached filename>'. A provider whose
+    FileName is '<EmptyFileName>' reads NOTHING (Prepare = 0 rows, silently)."""
+    return f"Data Providers ({provider_name})\\{filename}"
+
+
+_IMPORT_HINT_PATS = [
+    (re.compile(r"cannot generate the next number", re.I),
+     "NUMBERING: the target numbering sequence has no range covering the document date "
+     "(e.g. ARINVOICE starts 1/1/2021) — use doc dates inside a defined range."),
+    (re.compile(r"period.{0,40}(closed|not.{0,10}open|does not exist)|posting period", re.I),
+     "PERIOD: the document date falls in a closed/undefined financial period — open the "
+     "period (GL/master calendar) or move the date."),
+    (re.compile(r"unconvert|invalid date|not a valid|format", re.I),
+     "FORMAT: a cell value didn't convert — write dates as real Excel date cells "
+     "(serials), not text, to avoid D/M/Y vs M/D/Y ambiguity."),
+]
+
+
+def _import_error_hints(messages: list[str]) -> list[str]:
+    """Map raw per-row import errors to actionable hints (pure, unit-testable)."""
+    hints = []
+    blob = "\n".join(m for m in messages if m)
+    for pat, hint in _IMPORT_HINT_PATS:
+        if pat.search(blob):
+            hints.append(hint)
+    return hints
+
+
+def _phantom_mapping_rows(rows: list[dict]) -> list[dict]:
+    """SM206025 mapping rows that are wizard artifacts, not real field mappings
+    (pure, unit-testable). Observed live: '<Cancel>' action rows and mangled
+    '@@'-prefixed names appear when the grid is driven wrong (batched new_rows)."""
+    out = []
+    for r in rows:
+        fn = str(r.get("FieldName") or "")
+        if fn.startswith("<") or fn.startswith("@@"):
+            out.append(r)
+    return out
+
+
 @mcp.tool()
 async def setup_data_provider(
     name: str,
@@ -4422,20 +4544,25 @@ async def setup_data_provider(
 ) -> dict:
     """Create AND fully configure a Data Provider (SM206015) from a data file — via API.
 
-    Reads the file's header columns and writes the provider's schema object + field
-    rows DIRECTLY, sidestepping the stateful `fillSchemaFields` screen action (which
-    can't run over stateless REST because it needs a UI-selected object row). Then,
-    by default, uploads the file so an import run can read it.
+    Writes the provider header + schema object/field rows, uploads the file, AND — the
+    step whose absence used to make every provider built here read 0 rows — points the
+    provider's FileName parameter at the uploaded file ('Data Providers (<name>)\\<file>';
+    a provider left at '<EmptyFileName>' reads NOTHING, silently). Root cause proven
+    live 2026-07-08; no fillSchemaFields rebind is needed — the schema rows written
+    here are sufficient (verified: such a provider Prepared 3/3 rows once pointed).
 
-    name:          provider name (its key).
-    file_path:     the .xlsx/.csv source (must be within the instance's read_roots).
-    provider_type: the plugin class (default = Excel provider).
-    object_name:   schema object/sheet name (default "Template" — the Excel provider's).
-    key_columns:   header columns that are keys (default: the first column).
-    upload_file:   also attach the file via files:put so prepare/import can read it.
-    sheet:         worksheet name for .xlsx (default: first sheet).
+    FILE FORMAT WARNING (returned as `file_warning`): an .xlsx authored by openpyxl or
+    another inline-strings writer is UNREADABLE by the Excel provider (Prepare = 0 rows,
+    no error). Author the file with real Excel (e.g. excel-mcp / COM). Detected via
+    docProps/app.xml + missing sharedStrings.
 
-    Requires "allow_write": true. Returns the provider id + the columns written.
+    Idempotent-ish: if the provider already EXISTS, the schema write is SKIPPED (a
+    re-run used to append duplicate schema objects) — only the upload + FileName
+    repoint run. object_name should match the .xlsx WORKSHEET name (default "Template");
+    a mismatch is another silent 0-row cause — `sheet_names` is returned so you can see.
+
+    name/file_path/provider_type/key_columns/upload_file/sheet: as before.
+    Requires "allow_write": true. Returns provider id, columns, file_pointed, warnings.
     """
     import mimetypes
 
@@ -4450,37 +4577,66 @@ async def setup_data_provider(
     if unknown_keys:
         raise ValueError(f"key_columns not in the file header: {sorted(unknown_keys)}")
 
-    client = _client(instance)
-    # 1) create the provider header
-    rec = await client.put_entity(
-        "DataProvider",
-        _wrap_fields({"Name": name, "ProviderType": provider_type, "Active": True}),
-    )
-    rid = rec.get("id") if isinstance(rec, dict) else None
-    # 2) write the schema object + field rows directly (no stateful action needed)
-    field_rows = [
-        {"ObjectName": object_name, "Field": h, "DataType": "String",
-         "Key": h in keys, "Active": True}
-        for h in headers
-    ]
-    await client.put_entity("DataProvider", _wrap_fields({
-        "Name": name,
-        "SchemaSourceObjects": [{"Object": object_name, "Active": True, "LineNbr": 1}],
-        "SchemaSourceFields": field_rows,
-    }))
     out: dict[str, Any] = {
         "provider": name,
-        "id": rid,
         "object": object_name,
         "columns": headers,
         "key_columns": sorted(keys),
         "file_uploaded": False,
+        "file_pointed": False,
     }
-    # 3) optionally upload the source file so an import run can read it.
-    #    Use the GET-free template URL: the DataProvider entity 500s on
-    #    read-back (Link field BQL delegate), so record_files_put_url would
-    #    fail to resolve _links. Don't let an upload hiccup mask a created
-    #    provider — surface it instead of raising.
+    risk = _xlsx_read_risk(p)
+    if risk:
+        out["file_warning"] = (f"UNREADABLE-FILE RISK: {risk} Re-author with real Excel "
+                               "(excel-mcp/COM) or the provider will Prepare 0 rows.")
+    sheets = _xlsx_sheet_names(p)
+    if sheets:
+        out["sheet_names"] = sheets
+        if object_name not in sheets:
+            out["object_warning"] = (
+                f"object_name {object_name!r} does not match any worksheet {sheets} — "
+                "the Excel provider reads the sheet NAMED LIKE THE OBJECT; a mismatch "
+                "reads 0 rows silently.")
+
+    client = _client(instance)
+    # 0) existence check — a re-run used to append duplicate schema objects.
+    existing = await client.run_dac("SYProvider", {"$filter": f"Name eq '{_oq(name)}'",
+                                                   "$select": "ProviderID,Name"})
+    exists = bool(isinstance(existing, dict) and existing.get("value"))
+    rid = None
+    if not exists:
+        # 1) create the provider header
+        rec = await client.put_entity(
+            "DataProvider",
+            _wrap_fields({"Name": name, "ProviderType": provider_type, "Active": True}),
+        )
+        rid = rec.get("id") if isinstance(rec, dict) else None
+        # 2) write the schema object + field rows directly (no stateful action needed)
+        field_rows = [
+            {"ObjectName": object_name, "Field": h, "DataType": "String",
+             "Key": h in keys, "Active": True}
+            for h in headers
+        ]
+        await client.put_entity("DataProvider", _wrap_fields({
+            "Name": name,
+            "SchemaSourceObjects": [{"Object": object_name, "Active": True, "LineNbr": 1}],
+            "SchemaSourceFields": field_rows,
+        }))
+    else:
+        out["already_existed"] = True
+        out["note_existing"] = ("provider exists — schema write SKIPPED (re-running it "
+                                "appends duplicate objects); only upload + FileName repoint run.")
+    out["id"] = rid
+    if rid is None:
+        # contract record id == NoteID (needed for the file-attach URL template)
+        nid = await client.run_dac("SYProvider", {"$filter": f"Name eq '{_oq(name)}'",
+                                                  "$select": "NoteID"})
+        vals = (nid.get("value") or [{}]) if isinstance(nid, dict) else [{}]
+        rid = vals[0].get("NoteID")
+        out["id"] = rid
+
+    # 3) upload the source file so an import run can read it (GET-free template URL:
+    #    the DataProvider entity 500s on read-back). Surface a hiccup, don't raise.
     if upload_file and rid:
         try:
             url = client.provider_files_put_url(rid, p.name)
@@ -4494,7 +4650,293 @@ async def setup_data_provider(
                 "Provider + schema created, but file upload failed. Retry with "
                 f"attach_file_to_provider(record_id='{rid}', file_path=...)."
             )
+    # 4) point the provider at the uploaded file — THE step whose absence caused
+    #    every previous provider to silently read 0 rows (FileName stayed
+    #    '<EmptyFileName>'). Classic submit inserts a blank param row instead of
+    #    updating (proven), so drive the modern grid channel.
+    if out["file_uploaded"]:
+        try:
+            await ui_update_grid_row(
+                "SM206015", "Parameters", key={"LineNbr": 1},
+                values={"Value": _provider_filename_value(name, p.name)},
+                parent={"view": "Providers", "key": {"Name": name}},
+                instance=instance)
+            out["file_pointed"] = True
+            out["filename_param"] = _provider_filename_value(name, p.name)
+        except Exception as e:
+            out["file_point_error"] = str(e)[:300]
+            out["note_pointing"] = (
+                "File uploaded but the FileName parameter could not be set — the provider "
+                "will read 0 rows until it is. Set it with ui_update_grid_row(SM206015, "
+                "'Parameters', key={'LineNbr':1}, values={'Value': "
+                f"'{_provider_filename_value(name, p.name)}'}}, parent={{'view':'Providers',"
+                f"'key':{{'Name':'{name}'}}}}).")
     return out
+
+
+async def _scenario_state(client, scenario_name: str) -> dict:
+    """Live SYMapping state (Status/NbrRecords/PreparedOn) — the honest Prepare result."""
+    r = await client.run_dac("PX_Api_SYMapping", {
+        "$filter": f"Name eq '{_oq(scenario_name)}'",
+        "$select": "Name,Status,NbrRecords,PreparedOn,ScreenID,ProviderID"})
+    vals = (r.get("value") or []) if isinstance(r, dict) else []
+    return vals[0] if vals else {}
+
+
+async def _await_scenario_change(client, scenario_name: str, field: str, old,
+                                 timeout: float = 120.0, interval: float = 2.0):
+    """Poll SYMapping until `field` differs from `old` — Prepare/Import run as
+    server-side LONG OPERATIONS, so the Submit returns before the work happens;
+    reading the state immediately races it (proven live: a stale PreparedOn).
+    Returns (state, changed)."""
+    import asyncio as _a
+
+    waited = 0.0
+    while waited < timeout:
+        st = await _scenario_state(client, scenario_name)
+        if st.get(field) != old:
+            return st, True
+        await _a.sleep(interval)
+        waited += interval
+    return await _scenario_state(client, scenario_name), False
+
+
+@mcp.tool()
+async def import_excel(
+    scenario_name: str,
+    file_path: str,
+    do_import: bool = False,
+    force: bool = False,
+    instance: str | None = None,
+) -> Any:
+    """Run an Import Scenario against a NEW data file, end to end, with every silent
+    dead-end from the proven ordeal turned into a loud, actionable error. Screen-
+    agnostic: the scenario carries the target screen + mapping; this handles the rest
+    (file, provider pointing, Prepare, Import). The reliable CLASSIC-plane runner —
+    the contract path (run_import_scenario) crashes in SYImportSimple on many screens.
+
+    Steps (each failure mode was hit live and is now guarded):
+      1. FILE GUARD — reject an .xlsx authored by openpyxl / an inline-strings writer
+         (reads as 0 rows, silently; author with real Excel / excel-mcp). force=true
+         overrides. Also compares the scenario's provider OBJECT to the file's actual
+         worksheet names (a mismatch is another silent 0).
+      2. ATTACH FRESH — upload under a UNIQUE timestamped filename (defends against any
+         same-name caching) and REPOINT the provider's FileName parameter to it (a
+         provider at '<EmptyFileName>' reads nothing — THE historical 0-row root cause).
+      3. PREPARE — classic SM206036 (proven; Status/PreparedOn verified from the DB, not
+         the optimistic screen reply). NbrRecords == 0 → ok:false with a checklist.
+      4. IMPORT (do_import=true) — classic action; per-row errors read back from the
+         PreparedData grid, plus structured hints (numbering range / closed period /
+         date-format — the recurring gates).
+
+    scenario_name: an existing SM206025 scenario (build one with build_import_scenario).
+    file_path:     .xlsx/.csv within read_roots. do_import: False = Prepare only (safe).
+    Requires allow_write. Returns {ok, prepared:{...}, import?:{...}, errors?, hints?}.
+    """
+    import time as _time
+
+    _require_write(instance)
+    p = _check_read_path(file_path, instance)
+    client = _client(instance)
+
+    # 1) file guard + scenario/provider resolution
+    risk = _xlsx_read_risk(p)
+    if risk and not force:
+        return {"ok": False, "stage": "file_guard", "error": f"UNREADABLE-FILE RISK: {risk}",
+                "fix": "Author the file with real Excel (excel-mcp/COM). Or pass force=true "
+                       "if you are sure this instance reads it."}
+    scen = await _scenario_state(client, scenario_name)
+    if not scen:
+        return {"ok": False, "stage": "scenario_lookup",
+                "error": f"scenario {scenario_name!r} not found in SM206025 (SYMapping)",
+                "fix": "create it with build_import_scenario, or check the name."}
+    prov = await client.run_dac("SYProvider", {
+        "$filter": f"ProviderID eq {scen['ProviderID']}", "$select": "Name,NoteID"})
+    pv = ((prov.get("value") or [{}]) if isinstance(prov, dict) else [{}])[0]
+    provider_name, note_id = pv.get("Name"), pv.get("NoteID")
+    if not provider_name or not note_id:
+        return {"ok": False, "stage": "provider_lookup",
+                "error": f"could not resolve the scenario's provider (ProviderID "
+                         f"{scen.get('ProviderID')}) to a Name + NoteID."}
+    pobj = await client.run_dac("PX_Api_SYProviderObject", {
+        "$filter": f"ProviderID eq {scen['ProviderID']}", "$select": "Name"})
+    objects = [r.get("Name") for r in ((pobj.get("value") or []) if isinstance(pobj, dict) else [])]
+    sheets = _xlsx_sheet_names(p)
+    sheet_mismatch = bool(sheets and objects and not set(objects) & set(sheets))
+    if sheet_mismatch and not force:
+        return {"ok": False, "stage": "sheet_check",
+                "error": f"provider object(s) {objects} match no worksheet in the file "
+                         f"{sheets} — the Excel provider reads the sheet NAMED LIKE THE "
+                         f"OBJECT, so Prepare would read 0 rows silently.",
+                "fix": "rename the worksheet (or rebuild the provider object) so they match; "
+                       "force=true to try anyway."}
+
+    # 2) attach under a fresh unique name + repoint the FileName parameter
+    import mimetypes
+    fresh = f"{p.stem}-{_time.strftime('%Y%m%d%H%M%S')}{p.suffix}"
+    url = client.provider_files_put_url(note_id, fresh)
+    await client.put_file(url, p.read_bytes(),
+                          mimetypes.guess_type(fresh)[0] or "application/octet-stream")
+    await ui_update_grid_row(
+        "SM206015", "Parameters", key={"LineNbr": 1},
+        values={"Value": _provider_filename_value(provider_name, fresh)},
+        parent={"view": "Providers", "key": {"Name": provider_name}},
+        instance=instance)
+
+    # 3) Prepare on the classic screen; it runs as a server-side LONG OPERATION, so
+    #    poll until PreparedOn moves — reading immediately races it (proven live).
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, "SM206036") as s:
+        sub = await s.submit([{"set": "Selection.Name", "to": scenario_name},
+                              {"action": "Prepare"}], auto_answer="Yes")
+    if not sub.get("ok"):
+        return {"ok": False, "stage": "prepare_submit", "scenario": scenario_name,
+                "error": str(sub.get("error"))[:400],
+                "detail": sub.get("field_errors") or sub.get("messages")}
+    state, changed = await _await_scenario_change(
+        client, scenario_name, "PreparedOn", scen.get("PreparedOn"))
+    if not changed:
+        return {"ok": False, "stage": "prepare_wait", "scenario": scenario_name,
+                "error": "Prepare was submitted but the scenario's PreparedOn never "
+                         "advanced within the poll window — the long operation did not "
+                         "run or is still running.",
+                "state": state, "hint": "re-check in the UI (SM206036) / retry."}
+    prepared = {"status": state.get("Status"), "nbr_records": state.get("NbrRecords"),
+                "prepared_on": state.get("PreparedOn"), "attached_as": fresh,
+                "provider": provider_name}
+    out: dict[str, Any] = {"scenario": scenario_name, "prepared": prepared}
+    if not state.get("NbrRecords"):
+        out["ok"] = False
+        out["error"] = "Prepare staged 0 rows — the provider read nothing."
+        out["checklist"] = [
+            f"file readable? ({'RISK: ' + risk if risk else 'no known format risk'})",
+            f"worksheet vs provider object: sheets={sheets or 'n/a'} objects={objects}",
+            f"FileName parameter now points at {_provider_filename_value(provider_name, fresh)!r} (was repointed by this call)",
+            "data rows start on row 2 under a header row?",
+        ]
+        return out
+    if not do_import:
+        out["ok"] = True
+        out["note"] = "Prepare only (do_import=false) — nothing committed."
+        return out
+
+    # 4) Import (also a long operation — poll Status away from "P"), then per-row
+    #    errors from the PreparedData grid.
+    async with ScreenClient(inst, "SM206036") as s:
+        sub = await s.submit([{"set": "Selection.Name", "to": scenario_name},
+                              {"action": "Import"}], auto_answer="Yes")
+    if not sub.get("ok"):
+        out["ok"] = False
+        out["stage"] = "import_submit"
+        out["error"] = str(sub.get("error"))[:400]
+        return out
+    state2, changed = await _await_scenario_change(
+        client, scenario_name, "Status", state.get("Status"), timeout=300.0)
+    inst2 = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst2, "SM206036") as s:
+        rows = await s.export(["PreparedData.Number", "PreparedData.Processed",
+                               "PreparedData.Error"],
+                              filters=[{"field": "Selection.Name", "value": scenario_name}],
+                              top=int(state.get("NbrRecords") or 100))
+    errs = [r for r in (rows.get("rows") or []) if (r.get("Error") or "").strip()]
+    out["import"] = {"status": state2.get("Status"), "status_changed": changed,
+                     "row_errors": len(errs), "rows_total": state.get("NbrRecords")}
+    out["ok"] = bool(changed) and not errs and state2.get("Status") != "E"
+    if errs:
+        out["errors"] = errs[:25]
+        out["hints"] = _import_error_hints([e.get("Error") for e in errs])
+    return out
+
+
+@mcp.tool()
+async def build_import_scenario(
+    name: str,
+    screen_id: str,
+    provider: str,
+    provider_object: str,
+    mapping: list[dict],
+    instance: str | None = None,
+) -> Any:
+    """Build an SM206025 Import Scenario + its field mapping — using ONLY the write
+    patterns proven to persist correctly. Screen-agnostic: pass any target screen's
+    field list once and the scenario carries it thereafter (run with import_excel).
+
+    Two proven landmines are baked in:
+      • the Screen combo is set by RAW ScreenID (e.g. "CS204000") — setting it by title
+        breaks on titles containing "/" (truncates server-side, proven);
+      • mapping rows are written ONE ROW PER SUBMIT — batching many new_row commands in
+        one Submit returns ok:true but persists CORRUPTED rows (values crossed between
+        rows, phantom "<Cancel>"/"@@" artifacts; reproduced live on this very grid).
+
+    name:            scenario name (must NOT exist — this tool refuses to touch an
+                     existing scenario; record-level deletes are blocked by a confirm
+                     dialog over SOAP, so delete via the UI if you need to redo).
+    screen_id:       target screen (raw ID, e.g. "AR301000").
+    provider:        Data Provider name (SM206015; see setup_data_provider).
+    provider_object: the provider's schema object (= the worksheet name for Excel).
+    mapping:         [{"target_object": <screen object, e.g. "Country" / "Document">,
+                       "field": <target Field Name as shown in the mapping combo>,
+                       "source": <provider column, or a literal like "<NEW>" / "=...">,
+                       "commit": <optional bool — the row's Commit flag>}]
+
+    After writing, the mapping is READ BACK from the DB and verified: `persisted`
+    lists what's really there, `phantom_rows` flags wizard artifacts, and ok=false if
+    the row count doesn't match. Requires allow_write; KB-first policy applies.
+    """
+    _require_write(instance)
+    client = _client(instance)
+    if await _scenario_state(client, name):
+        return {"ok": False, "error": f"scenario {name!r} already exists",
+                "fix": "pick a new name, or delete the existing one in the UI first "
+                       "(SOAP delete is blocked by its confirmation dialog)."}
+    inst = _cfg().get(instance or _cfg().default)
+    results = []
+    async with ScreenClient(inst, "SM206025") as s:
+        r = await s.submit([
+            {"action": "Insert"},
+            {"set": "ScenarioSummary.Name", "to": name},
+            {"set": "ScreenName", "to": screen_id.upper()},
+            {"set": "Provider", "to": provider},
+            {"set": "ProviderObject", "to": provider_object},
+            {"action": "Save"},
+        ])
+        if not r.get("ok"):
+            return {"ok": False, "stage": "header", "error": r.get("error"),
+                    "detail": r.get("field_errors") or r.get("messages")}
+        for i, m in enumerate(mapping):
+            cmds = [
+                {"set": "ScenarioSummary.Name", "to": name},
+                {"new_row": "Mapping"},
+                {"set": "Mapping.TargetObject", "to": m["target_object"]},
+                {"set": "Mapping.FieldActionName", "to": m["field"]},
+                {"set": "Mapping.SourceFieldValue", "to": m["source"]},
+            ]
+            if m.get("commit") is not None:
+                cmds.append({"set": "Mapping.Commit", "to": bool(m["commit"])})
+            cmds.append({"action": "Save"})
+            r = await s.submit(cmds)
+            results.append({"index": i, "field": m["field"], "ok": bool(r.get("ok")),
+                            **({"error": str(r.get("error"))[:200]} if not r.get("ok") else {})})
+    # verify from the DB — the wizard's own reply is optimistic
+    rows = []
+    m2 = await client.run_dac("PX_Api_SYMapping", {
+        "$filter": f"Name eq '{_oq(name)}'", "$select": "MappingID"})
+    mid = ((m2.get("value") or [{}]) if isinstance(m2, dict) else [{}])[0].get("MappingID")
+    if mid:
+        f = await client.run_dac("PX_Api_SYMappingField", {"$filter": f"MappingID eq {mid}"})
+        rows = sorted(((f.get("value") or []) if isinstance(f, dict) else []),
+                      key=lambda r: r.get("LineNbr", 0))
+    persisted = [{k: r.get(k) for k in ("LineNbr", "ObjectName", "FieldName", "Value",
+                                        "NeedCommit", "IsActive")} for r in rows]
+    phantoms = _phantom_mapping_rows(persisted)
+    real = [r for r in persisted if r not in phantoms]
+    ok = all(x["ok"] for x in results) and len(real) >= len(mapping)
+    return {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
+            "requested_rows": len(mapping), "persisted_rows": len(real),
+            "row_results": results, "persisted": persisted,
+            "phantom_rows": phantoms or None,
+            "next": f"run it with import_excel({name!r}, <file>, do_import=false) — "
+                    "Prepare first, check nbr_records, then do_import=true."}
 
 
 @mcp.tool()
@@ -4638,21 +5080,25 @@ async def run_import_scenario(
     timeout: float = 300.0,
     instance: str | None = None,
 ) -> Any:
-    """Drive Import-by-Scenario (SM206036) end to end via API.
+    """Drive Import-by-Scenario (SM206036) via the CONTRACT-REST entity. UNRELIABLE —
+    prefer import_excel (the classic-plane runner) for real work.
 
-    Selects the scenario record, runs Prepare (stages rows from the provider),
-    and optionally Import (commits to the target). Returns the record status.
+    PROVEN LIMITATION (live, 2026-07-08): this contract path routes EVERY scenario
+    through SYImportSimple, whose copy-paste script machinery makes assumptions about
+    the TARGET SCREEN's shape — it crashed with "SetBranchFieldCommandToTheTop /
+    Sequence contains no matching element" even on a trivial 2-field Countries
+    mapping (and on full AR301000 mappings). Whether it works depends on the target
+    screen, not on mapping size. The classic SM206036 screen (screen_submit: set
+    Selection.Name → action Prepare → action Import) has no such crash — that is what
+    import_excel wraps, with file/provider/0-row guards built in.
 
-    scenario_name: the scenario's Name (must already exist in SM206025).
-    do_import:     False (default) = prepare only (safe, no commit); True = also import.
-    entity/key_field/prepare_action/import_action: override if your endpoint names
-        them differently (defaults match the GRPSetup setup: ImportByScenario +
-        prepareIBS/importIBS). Find action names with list_actions(entity).
-
-    NOTE: the provider that the scenario uses must already have its file attached
-    (see attach_file). Prepare/Import run on the screen's selected scenario record.
-
-    Requires the instance's "allow_write": true (it stages/commits records).
+    Kept for compatibility with endpoints where the entity path does work.
+    scenario_name: the scenario's Name (must exist in SM206025). do_import: False =
+    prepare only. entity/key_field/prepare_action/import_action: override if your
+    endpoint names them differently (defaults match GRPSetup: ImportByScenario +
+    prepareIBS/importIBS). The provider must already have its file attached AND its
+    FileName parameter pointing at it — '<EmptyFileName>' Prepares 0 rows silently.
+    Requires "allow_write": true.
     """
     import asyncio
 
@@ -5038,10 +5484,15 @@ _GUIDE = {
             "import_customization + publish_customization (poll publish_status)",
             "list_published, unpublish_customization, export_customization",
             "ui_tree_dialog_insert + ui_populate_endpoint_entity_fields (add entity via SM207060)"],
-        "import / export data": ["run_import_scenario (SM206036)",
+        "import / export data": [
+            "import_excel (RUN an import scenario against a new file — classic plane, "
+            "all silent 0-row/format/cache traps guarded; PREFER over run_import_scenario)",
+            "build_import_scenario (create SM206025 scenario + mapping, corruption-safe)",
+            "setup_data_provider (create + point a Data Provider — sets the FileName param)",
+            "run_import_scenario (contract path — UNRELIABLE, crashes on many target screens)",
             "load_from_excel (endpoint entity — then poll load_status)",
             "screen_bulk_load (N master records to any classic screen via SOAP — no endpoint)",
-            "setup_data_provider, setup_readiness"],
+            "setup_readiness"],
         "files / notes / attachments": ["attach_file", "attach_file_to_provider "
             "(GET-free, for Data Providers)", "download_file", "list_attachments", "set_note"],
         "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],

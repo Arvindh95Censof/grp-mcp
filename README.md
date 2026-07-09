@@ -558,6 +558,31 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.51.0 — **import-scenario suite rebuilt on live-re-vetted mechanics.** A user session
+hit a chain of silent 0-row dead-ends running Excel imports; every finding was
+reproduced (or refuted) live, and the corrected mechanisms are now code:
+- **Root cause found**: a provider built by `setup_data_provider` left its FileName
+  parameter at `<EmptyFileName>` — it read NOTHING, silently. (Not unbound fields:
+  the schema rows it writes are sufficient — proven by pointing the same provider at
+  a file and staging 3/3.) `setup_data_provider` now uploads AND points the provider,
+  skips the schema write on re-run (duplicate-append), warns on openpyxl-authored
+  files and object/worksheet mismatches.
+- **`import_excel`** (new) — the reliable classic-plane runner: file-format guard,
+  sheet-vs-object check, fresh-filename attach + FileName repoint, Prepare with
+  long-operation polling (the Submit returns before the work runs — reading
+  immediately races it), hard-fail on 0 rows with a checklist, optional Import with
+  per-row errors + structured numbering/period/format hints.
+- **`build_import_scenario`** (new) — corruption-safe SM206025 builder: screen set by
+  RAW ScreenID (titles containing "/" break the SOAP set — proven), mapping written
+  ONE ROW PER SUBMIT (batched new_rows persist crossed values behind ok:true —
+  reproduced), then read back from the DB and verified (wizard auto-rows flagged).
+- Honest docstrings: `run_import_scenario` (contract path crashes in SYImportSimple
+  on many target screens — even a 2-field mapping), `screen_submit` /
+  `screen_insert_rows` (batched new_row corruption caution),
+  `attach_file_to_provider` (attaching does NOT repoint the provider).
+- Re-vet also REFUTED one claim: same-filename re-attach was read fresh (4/4) — the
+  historical "stale cache" was the FileName-param confound.
+
 v0.50.0 — **setup-execution tools** (2 new) + an endpoint bug fix. The write half of the
 setup story that pairs with v0.49.0's discovery half:
 - `screen_bulk_load` — bulk-load N independent **master** records to any classic screen via

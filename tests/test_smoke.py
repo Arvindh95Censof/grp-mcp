@@ -403,6 +403,62 @@ def test_discover_prereqs_parses_real_payroll_errors():
     assert _DETAIL_RULE_PAT.search(tax)
 
 
+def test_xlsx_read_risk_flags_openpyxl_and_inline_strings(tmp_path):
+    from grp_mcp.server import _xlsx_read_risk
+    import openpyxl, zipfile, shutil
+    # an actual openpyxl-authored file -> flagged (matches the live 0-row repro)
+    p = tmp_path / "bad.xlsx"
+    wb = openpyxl.Workbook(); wb.active.append(["A", "B"]); wb.save(p)
+    risk = _xlsx_read_risk(p)
+    assert risk and "openpyxl" in risk
+    # simulate a real-Excel file: rewrite app.xml + add sharedStrings -> no risk
+    good = tmp_path / "good.xlsx"
+    with zipfile.ZipFile(p) as zin, zipfile.ZipFile(good, "w") as zout:
+        for item in zin.namelist():
+            if item == "docProps/app.xml":
+                zout.writestr(item, '<Properties><Application>Microsoft Excel</Application></Properties>')
+            else:
+                zout.writestr(item, zin.read(item))
+        zout.writestr("xl/sharedStrings.xml", "<sst/>")
+    assert _xlsx_read_risk(good) is None
+    # non-xlsx passes through
+    csv = tmp_path / "x.csv"; csv.write_text("a,b")
+    assert _xlsx_read_risk(csv) is None
+    # garbage zip -> flagged
+    bad = tmp_path / "junk.xlsx"; bad.write_bytes(b"not a zip")
+    assert "not a valid" in (_xlsx_read_risk(bad) or "")
+
+
+def test_provider_filename_value_matches_stock_format():
+    from grp_mcp.server import _provider_filename_value
+    # exact format read from the working stock provider on csmdev
+    assert (_provider_filename_value("ACU Import AR Invoices", "ARV3.xlsx")
+            == "Data Providers (ACU Import AR Invoices)\\ARV3.xlsx")
+
+
+def test_import_error_hints_recognize_live_gates():
+    from grp_mcp.server import _import_error_hints
+    hints = _import_error_hints([
+        "Error: Cannot generate the next number for the ARINVOICE sequence.",
+        "Error: The posting period 01-2020 is closed.",
+    ])
+    assert any("NUMBERING" in h for h in hints)
+    assert any("PERIOD" in h for h in hints)
+    assert _import_error_hints(["all good"]) == []
+
+
+def test_phantom_mapping_rows_flags_wizard_artifacts():
+    from grp_mcp.server import _phantom_mapping_rows
+    rows = [
+        {"FieldName": "CountryID", "Value": "CountryID"},
+        {"FieldName": "<Cancel>", "Value": None},      # observed live
+        {"FieldName": "@@CountryID", "Value": "X"},    # observed live
+        {"FieldName": "Description", "Value": "CountryName"},
+    ]
+    ph = _phantom_mapping_rows(rows)
+    assert {r["FieldName"] for r in ph} == {"<Cancel>", "@@CountryID"}
+
+
 def test_endpoint_top_level_entities_parses_path_tree():
     from grp_mcp.server import _endpoint_top_level_entities
     tree = [
