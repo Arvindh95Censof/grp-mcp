@@ -1566,16 +1566,39 @@ class ScreenClient:
         'KK'), never to alter what we send."""
         return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9]", " ", str(s))).strip()
 
+    @classmethod
+    def _is_altered_key(cls, sent: Any, stored: Any) -> bool:
+        """True if `stored` looks like a silently-altered form of `sent` — the two
+        SILENT key transforms proven on this platform's key fields:
+          • punctuation replaced with spaces (classic plane: 'A. SELERA'->'A  SELERA')
+          • right-truncation at the field length (modern plane: 11-char 'ZZ.TEST/GRD'
+            ->'ZZ.TEST/GR')
+        Identical values (post-strip) are NOT 'altered'. Order matters: exact is
+        checked by the caller first."""
+        s, t = str(sent).strip(), str(stored).strip()
+        if not t or s == t:
+            return False
+        ns, nt = cls._key_mangle_norm(s), cls._key_mangle_norm(t)
+        if ns == nt:
+            return True                     # punctuation -> space
+        if s.startswith(t):
+            return True                     # right-truncated
+        if nt and ns.startswith(nt):
+            return True                     # punctuation + truncation
+        return False
+
     async def _verify_stored_key(self, grid_view: str, g: dict, sent_values: dict,
                                  save_resp: Any, parent: dict | None) -> dict | None:
         """After an insert, confirm the row persisted under the EXACT key sent.
 
-        Acumatica can silently normalize a key field on save (proven live on
-        CS205010: BuildingCD converts '.' '/' '*' to spaces, so 'A. SELERA' stores as
-        'A  SELERA'). A later lookup/import by the ORIGINAL key then misses. Returns a
-        warning dict {warning, sent_key, stored_key} if the stored key differs, else
-        None. Best-effort: prefers the Save response's echoed grid rows (free); falls
-        back to one fresh read only if the response carried none; never raises."""
+        Acumatica can silently ALTER a key field on save — two transforms proven live:
+        punctuation replaced with spaces (classic plane: CS205010 BuildingCD
+        'A. SELERA'->'A  SELERA') and right-truncation at the field length (modern
+        plane: 'ZZ.TEST/GRD'->'ZZ.TEST/GR'). Either way a later lookup/import by the
+        ORIGINAL key misses. Returns {warning, sent_key, stored_key} if the stored key
+        differs, else None. Best-effort: prefers the Save response's echoed grid rows
+        (free); falls back to one fresh read only if the response carried none; never
+        raises."""
         key_names = g.get("key_names") or []
         sent_key = {k: sent_values[k] for k in key_names if k in sent_values}
         if not sent_key:
@@ -1589,23 +1612,24 @@ class ScreenClient:
                 return None
         if not rows:
             return None
-        # exact (post-strip) key present -> stored as sent, no mangle
+        # exact (post-strip) key present -> stored as sent, no alteration
         idx, _ = self._locate_row(rows, sent_key)
         if idx is not None:
             return None
-        # a row whose key matches ONLY after punctuation-normalization = mangled
+        # else find the row whose key is a silently-altered form of what we sent
         for row in rows:
             stored = {k: (self._cell_key(row, k) or "") for k in sent_key}
-            norm_eq = all(self._key_mangle_norm(stored[k]) == self._key_mangle_norm(v)
+            matched = all(str(stored[k]).strip() == str(v).strip()
+                          or self._is_altered_key(v, stored[k])
                           for k, v in sent_key.items())
-            raw_diff = any(str(stored[k]).strip() != str(v).strip()
-                           for k, v in sent_key.items())
-            if norm_eq and raw_diff:
+            altered = any(self._is_altered_key(v, stored[k]) for k, v in sent_key.items())
+            if matched and altered:
                 return {
                     "warning": "the row persisted under a DIFFERENT key than you sent — "
-                    "the screen normalized a key field on save (punctuation replaced "
-                    "with/collapsed to spaces). Reference the STORED key in later "
-                    "lookups, updates, deletes, and imports.",
+                    "the screen silently altered a key field on save (punctuation "
+                    "replaced with spaces, or the value truncated at the field length). "
+                    "Reference the STORED key in later lookups, updates, deletes, and "
+                    "imports.",
                     "sent_key": sent_key,
                     "stored_key": {k: stored[k] for k in sent_key},
                 }

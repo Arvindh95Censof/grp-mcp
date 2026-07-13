@@ -2449,12 +2449,15 @@ async def ui_insert_grid_row(
     (so Type "Expense" and "E" both work). skip_validation=true bypasses.
 
     KEY-MANGLE GUARD: after the insert, the row is checked to have persisted under the
-    EXACT key you sent. Some key fields silently normalize punctuation on save (proven
-    live on CS205010: BuildingCD converts '.' '/' '*' to spaces, so 'A. SELERA' stores
-    as 'A  SELERA') — a later lookup/import by the original key then misses. When the
-    stored key differs, the result carries `key_mangled: true` + a `warnings` entry
-    with {sent_key, stored_key} so you learn the real key immediately. Reference the
-    STORED key in later updates/deletes/imports.
+    EXACT key you sent. This MODERN plane PRESERVES punctuation (unlike the classic
+    screen_insert_rows, which replaces '.' '/' '*' in a key with spaces) but it does
+    silently RIGHT-TRUNCATE a key at the field length (proven CS205010: an 11-char
+    'ZZ.TEST/GRD' persists as 'ZZ.TEST/GR'). Either alteration makes a later
+    lookup/import by the original key miss. When the stored key differs from what was
+    sent, the result carries `key_mangled: true` + a `warnings` entry with {sent_key,
+    stored_key} so you learn the real key immediately. Reference the STORED key in
+    later updates/deletes/imports. (For keys with punctuation, this modern tool is the
+    SAFE choice — it keeps them; the classic path does not.)
 
     Examples:
         ui_insert_grid_row("GL202500", "AccountRecords",
@@ -2617,6 +2620,15 @@ async def screen_insert_rows(
     auto_answer: answer a confirmation dialog raised by Save (e.g. "Yes").
     dry_run:   preview — runs the SETs per row, drops each Save, surfaces field
                errors, without leaving dirty state for a later call to inherit.
+
+    KEY-FIELD PUNCTUATION WARNING (classic plane): this SOAP path routes writes
+    through the field's input mask, which SILENTLY REPLACES punctuation in a KEY
+    field with spaces on save — proven live on CS205010: BuildingCD 'A. SELERA'
+    persists as 'A  SELERA', 'BP/KPK/HT' as 'BP KPK HT'. The insert still returns
+    ok:true, so a later lookup/import by the ORIGINAL key misses. If your KEY values
+    contain '.', '/', '*' etc., prefer the MODERN ui_insert_grid_row — it PRESERVES
+    punctuation (it only truncates at the field length, and warns via key_mangled
+    when it does). This classic path does NOT read keys back, so it can't warn.
 
     Example — add two GL accounts (GL202500):
         screen_insert_rows("GL202500", "AccountRecords", [

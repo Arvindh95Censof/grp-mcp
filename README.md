@@ -558,6 +558,17 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.6 — **Key-mangle guard corrected to the right plane + broadened to truncation.**
+Live testing on CS205010 revealed the two plumbing planes alter keys DIFFERENTLY:
+the **classic** `screen_insert_rows` replaces punctuation in a key with spaces
+(`A. SELERA`->`A  SELERA`), while the **modern** `ui_insert_grid_row` PRESERVES
+punctuation but silently right-truncates at the field length (`ZZ.TEST/GRD`->
+`ZZ.TEST/GR`). So v0.52.5's guard (on the modern tool, punctuation-only) couldn't fire
+for the real case. Now: the modern guard detects BOTH transforms (punctuation-norm AND
+truncation) and still returns `key_mangled: true` + `{sent_key, stored_key}`; and
+`screen_insert_rows` documents its punctuation-mangling loudly, recommending the modern
+tool for keys containing `.` `/` `*` (it keeps them). 2 new tests; 180 pass.
+
 v0.52.5 — **`ui_insert_grid_row` now catches silent key mangling.** Some key fields
 normalize punctuation on save (proven live on CS205010: `BuildingCD` converts `.` `/`
 `*` to spaces, so `A. SELERA` persists as `A  SELERA`), so a later lookup/import by the

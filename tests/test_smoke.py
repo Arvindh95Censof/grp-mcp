@@ -2360,6 +2360,27 @@ def test_verify_stored_key_flags_mangled_key():
     assert warn["stored_key"] == {"BuildingCD": "A  SELERA"}
 
 
+def test_verify_stored_key_flags_truncated_key():
+    s = _grid_client()
+    g = {"key_names": ["BuildingCD"]}
+    # sent 11-char 'ZZ.TEST/GRD' but the field truncated it to 10 -> 'ZZ.TEST/GR'
+    resp = {"controlsData": {"building": {"rows": [_row(BuildingCD="ZZ.TEST/GR",
+                                                        Description="X")]}}}
+    warn = asyncio.run(s._verify_stored_key(
+        "building", g, {"BuildingCD": "ZZ.TEST/GRD", "Description": "X"}, resp, None))
+    assert warn is not None
+    assert warn["stored_key"] == {"BuildingCD": "ZZ.TEST/GR"}
+
+
+def test_is_altered_key_matrix():
+    f = ScreenClient._is_altered_key
+    assert f("A. SELERA", "A  SELERA") is True     # punctuation -> space
+    assert f("ZZ.TEST/GRD", "ZZ.TEST/GR") is True  # right-truncation
+    assert f("KEDAI", "KEDAI") is False            # identical
+    assert f("KOLOMBONG", "KEPAYAN") is False      # unrelated row
+    assert f("ABC", "") is False                   # empty stored -> not a match
+
+
 def test_verify_stored_key_none_on_exact_match():
     s = _grid_client()
     g = {"key_names": ["BuildingCD"]}
