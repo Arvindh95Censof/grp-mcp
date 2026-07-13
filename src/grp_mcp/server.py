@@ -2586,22 +2586,23 @@ async def screen_insert_rows(
     dry_run: bool = False,
     instance: str | None = None,
 ) -> Any:
-    """Insert many grid/detail rows into one container in a single transaction.
+    """Insert many grid/detail rows into one container — ONE Submit per row.
 
     The master-detail / bulk-grid writer on top of the screen-based SOAP engine —
     use it for Chart of Accounts rows, subaccount segments, GL batch lines, any
-    screen where one Save commits N rows.
+    screen where you need to append N detail/grid rows under one header.
 
     container: the grid container friendly name (from screen_get_schema), e.g.
                "AccountRecords" on GL202500.
-    rows:      list of {field: value}; each row becomes NewRow + the field SETs.
-               Field names are friendly (qualify "Container.Field" if a name
-               repeats across containers).
-    header:    optional field sets applied once before the rows (a parent key /
-               document context).
-    save:      add a final Save (set False to chain more work first).
+    rows:      list of {field: value}; each row gets its own isolated NewRow +
+               field SETs + Save. Field names are friendly (qualify
+               "Container.Field" if a name repeats across containers).
+    header:    optional field sets applied once before the row loop (a parent key /
+               document context), in its own Submit.
+    save:      add a Save after each row (set False to chain more work first).
     auto_answer: answer a confirmation dialog raised by Save (e.g. "Yes").
-    dry_run:   preview — runs the SETs, drops Save, surfaces field errors.
+    dry_run:   preview — runs the SETs per row, drops each Save, surfaces field
+               errors, without leaving dirty state for a later call to inherit.
 
     Example — add two GL accounts (GL202500):
         screen_insert_rows("GL202500", "AccountRecords", [
@@ -2609,11 +2610,19 @@ async def screen_insert_rows(
           {"Account":"40100","Type":"Income","Description":"Sales"}])
     Requires allow_write. Opens/closes its own SOAP session (frees the API seat).
 
-    CAUTION: all rows go in ONE batched Submit. On grids whose combo/lookup values
-    depend on the current row's state (e.g. SM206025 scenario mapping) batching
-    corrupts silently — values cross rows behind an ok:true (proven live). For such
-    grids write one row per call (screen_submit / screen_bulk_load) and read back.
-    Simple flat grids (GL202500 etc.) batch fine.
+    FIXED 2026-07-13 (was the single biggest data-corruption footgun in this
+    server): this used to bundle every row's NewRow+Set into ONE Submit envelope.
+    The screen-SOAP command stream carries no explicit row-index on a Value
+    command — it relies entirely on the server's "current row after the last
+    NewRow" state, which does not reliably hold across multiple NewRows in one
+    Submit, AND dry_run only dropped the Save (not the NewRow/Set), so a "preview"
+    could leave the graph dirty for the NEXT call to inherit. Proven live on
+    CS205010 (Buildings grid): values crossed onto the wrong row, and a dry_run's
+    leftover dirty rows corrupted a later real Save. Now every row is its own
+    isolated Submit — same proven-safe shape as screen_bulk_load / the
+    modern-plane ui_insert_grid_row. Returns {ok, row_count, succeeded, failed,
+    results:[{index, ok, ...}], messages, field_errors} — messages/field_errors
+    are merged across all rows for back-compat with old single-Submit callers.
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)

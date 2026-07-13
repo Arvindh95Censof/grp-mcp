@@ -558,6 +558,17 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.4 — **Fixed a live data-corruption bug in `screen_insert_rows`.** It used to bundle every
+row's NewRow+Set into ONE Submit envelope. The screen-SOAP command stream carries no explicit
+row-index on a Value command — it relies entirely on the server's "current row after the last
+NewRow" state, which does not reliably hold across multiple NewRows in one Submit, AND `dry_run`
+only dropped the Save (not the NewRow/Set), so a "preview" could leave the graph dirty for the
+NEXT call to inherit. Proven live on CS205010 (Buildings grid): field values crossed onto the
+wrong row, and a dry_run's leftover dirty rows corrupted a later real Save. Fixed by submitting
+ONE row per Submit — the same proven-safe shape `screen_bulk_load` and the modern-plane
+`ui_insert_grid_row` already used. 3 new regression tests lock in the one-Submit-per-row
+behavior, partial-failure isolation, and header-failure short-circuiting. 174 tests pass.
+
 v0.52.3 — **AI-usability audit + fixes.** A three-arm audit (static inventory of all 95 tools, a live
 discovery-surface check, and a cold subagent using the server read-only) confirmed a fresh AI can
 drive grp-mcp correctly (~4.5/5) thanks to `guide`/`knowledge`/`screen_capabilities`. It also found

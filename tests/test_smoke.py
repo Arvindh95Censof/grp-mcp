@@ -2241,3 +2241,90 @@ def test_every_public_function_is_a_registered_tool():
     assert not missing, (
         f"public function(s) in server.py not registered as MCP tools (lost/stolen "
         f"@mcp.tool() decorator?): {missing} — if intentional, add to NOT_TOOLS")
+
+
+# ---- v0.52.4: insert_rows one-Submit-per-row (fixes the CS205010 cross-row
+# corruption bug — see screen.py insert_rows docstring) ---------------------
+
+def test_insert_rows_one_submit_per_row_and_header():
+    """insert_rows must issue a SEPARATE submit() call per row (plus one for the
+    header, if given) — never bundle multiple NewRow+Set blocks into one Submit."""
+    s = ScreenClient(_inst(), "CS205010")
+    calls = []
+
+    async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        calls.append(cmds)
+        return {"ok": True, "messages": [], "field_errors": []}
+
+    s.submit = fake_submit
+    rows = [
+        {"Building": "A", "Description": "Bldg A"},
+        {"Building": "B", "Description": "Bldg B"},
+        {"Building": "C", "Description": "Bldg C"},
+    ]
+    result = asyncio.run(s.insert_rows("Buildings", rows, header={"Branch": "000"}))
+
+    # header + 3 rows = 4 separate submit() calls, never bundled together
+    assert len(calls) == 4
+    assert calls[0] == [{"set": "Branch", "to": "000"}]
+    for i, row in enumerate(rows):
+        row_cmds = calls[i + 1]
+        assert row_cmds[0] == {"new_row": "Buildings"}
+        assert {"set": "Building", "to": row["Building"]} in row_cmds
+        assert {"set": "Description", "to": row["Description"]} in row_cmds
+        assert row_cmds[-1] == {"action": "Save"}
+
+    assert result["ok"] is True
+    assert result["row_count"] == 3
+    assert result["succeeded"] == 3
+    assert result["failed"] == 0
+    assert len(result["results"]) == 3
+
+
+def test_insert_rows_partial_failure_does_not_abort_remaining_rows():
+    """One bad row should not block the rest — each row is isolated."""
+    s = ScreenClient(_inst(), "CS205010")
+    seen_rows = []
+
+    async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        # identify which row this is from its Building value
+        building = next((c["to"] for c in cmds if c.get("set") == "Building"), None)
+        seen_rows.append(building)
+        if building == "B":
+            return {"ok": False, "messages": ["Building 'B' already exists"], "field_errors": []}
+        return {"ok": True, "messages": [], "field_errors": []}
+
+    s.submit = fake_submit
+    rows = [
+        {"Building": "A", "Description": "Bldg A"},
+        {"Building": "B", "Description": "Bldg B"},
+        {"Building": "C", "Description": "Bldg C"},
+    ]
+    result = asyncio.run(s.insert_rows("Buildings", rows))
+
+    assert seen_rows == ["A", "B", "C"]   # all 3 attempted despite B failing
+    assert result["ok"] is False
+    assert result["succeeded"] == 2
+    assert result["failed"] == 1
+    assert result["results"][1]["ok"] is False
+    assert "already exists" in result["messages"][0]
+
+
+def test_insert_rows_header_failure_skips_all_rows():
+    """If the header field-set itself fails, no row NewRow/Set should be attempted."""
+    s = ScreenClient(_inst(), "CS205010")
+    calls = []
+
+    async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        calls.append(cmds)
+        return {"ok": False, "messages": ["Branch '999' does not exist"], "field_errors": []}
+
+    s.submit = fake_submit
+    result = asyncio.run(s.insert_rows(
+        "Buildings", [{"Building": "A", "Description": "Bldg A"}],
+        header={"Branch": "999"},
+    ))
+
+    assert len(calls) == 1   # only the header submit — no row was attempted
+    assert result["ok"] is False
+    assert "note" in result

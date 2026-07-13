@@ -2248,27 +2248,64 @@ class ScreenClient:
         auto_answer: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Insert N grid/detail rows into `container` in one transaction.
+        """Insert N grid/detail rows into `container`, ONE Submit per row.
 
         header: field sets applied first (the parent/context, e.g. a document key)
-                — keys may be friendly or "Container.Field".
-        rows:   list of {field: value}; each becomes NewRow + the field SETs. Field
-                names are the schema's friendly names (qualify "Container.Field" if a
-                name repeats). One Save commits them all.
+                — keys may be friendly or "Container.Field". Applied once, before
+                the row loop, in its own Submit.
+        rows:   list of {field: value}; each row gets its own NewRow + field SETs +
+                Save, submitted independently. Field names are the schema's friendly
+                names (qualify "Container.Field" if a name repeats).
 
         This is the master-detail / bulk-grid writer (e.g. Chart of Accounts rows,
-        subaccount segments). Returns the submit() result.
+        subaccount segments).
+
+        FIXED 2026-07-13: previously bundled every row's NewRow+Set into ONE Submit
+        envelope. The screen-SOAP command stream carries no explicit row-index on a
+        Value command — it relies entirely on the server's "current row after the
+        last NewRow" state, which does not reliably hold across multiple NewRows in
+        one Submit. Proven live on CS205010 (Buildings grid): a 2-row batched insert
+        left field values shifted onto the wrong BuildingCD, and a dry_run's
+        NewRow/Set commands (dry_run only drops the Save, not the row-add/field-set)
+        left the graph dirty for the NEXT call to inherit, corrupting an unrelated
+        later Save too. One Submit per row eliminates both: each row is now fully
+        isolated (matches the already-safe pattern in screen_bulk_load and the
+        modern-plane ui_insert_grid_row).
+
+        Returns {ok, row_count, succeeded, failed, results:[{index, ok, ...}], and
+        (for back-compat with single-Submit callers) messages/field_errors merged
+        across all rows}.
         """
-        cmds: list[dict] = []
-        for k, v in (header or {}).items():
-            cmds.append({"set": k, "to": v})
-        for row in rows:
-            cmds.append({"new_row": container})
+        header_cmds = [{"set": k, "to": v} for k, v in (header or {}).items()]
+        if header_cmds:
+            hres = await self.submit(header_cmds, dry_run=dry_run, auto_answer=auto_answer)
+            if not hres.get("ok"):
+                hres["note"] = "header field-set failed — no rows were attempted"
+                return hres
+        results: list[dict] = []
+        for i, row in enumerate(rows):
+            cmds = [{"new_row": container}]
             for k, v in row.items():
                 cmds.append({"set": k, "to": v})
-        if save:
-            cmds.append({"action": "Save"})
-        return await self.submit(cmds, dry_run=dry_run, auto_answer=auto_answer)
+            if save:
+                cmds.append({"action": "Save"})
+            r = await self.submit(cmds, dry_run=dry_run, auto_answer=auto_answer)
+            r["index"] = i
+            results.append(r)
+        all_ok = all(r.get("ok") for r in results)
+        merged_messages = [m for r in results for m in (r.get("messages") or [])]
+        merged_field_errors = [fe for r in results for fe in (r.get("field_errors") or [])]
+        return {
+            "screen_id": self.screen_id,
+            "ok": all_ok,
+            "dry_run": dry_run,
+            "row_count": len(rows),
+            "succeeded": sum(1 for r in results if r.get("ok")),
+            "failed": sum(1 for r in results if not r.get("ok")),
+            "results": results,
+            "messages": merged_messages,
+            "field_errors": merged_field_errors,
+        }
 
     async def set_record(
         self,
