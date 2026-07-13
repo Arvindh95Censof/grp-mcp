@@ -2328,3 +2328,52 @@ def test_insert_rows_header_failure_skips_all_rows():
     assert len(calls) == 1   # only the header submit — no row was attempted
     assert result["ok"] is False
     assert "note" in result
+
+
+# ---- v0.52.5: ui_insert_grid_row key-mangle read-back guard -----------------
+
+def _row(**cells):
+    """A modern-plane grid row in {cells:{Field:{value}}} shape."""
+    return {"id": "r", "cells": {k: {"value": v} for k, v in cells.items()}}
+
+
+def test_key_mangle_norm():
+    n = ScreenClient._key_mangle_norm
+    assert n("A. SELERA") == "A SELERA"
+    assert n("A  SELERA") == "A SELERA"      # collapses to same as the punctuated form
+    assert n("BP/KPK/HT") == "BP KPK HT"
+    assert n("KK.") == "KK"
+    assert n("KEDAI") == "KEDAI"
+
+
+def test_verify_stored_key_flags_mangled_key():
+    s = _grid_client()
+    g = {"key_names": ["BuildingCD"]}
+    # sent 'A. SELERA' but the row persisted as 'A  SELERA' (punctuation -> space)
+    resp = {"controlsData": {"building": {"rows": [_row(BuildingCD="A  SELERA",
+                                                        Description="ANJUNG SELERA")]}}}
+    warn = asyncio.run(s._verify_stored_key(
+        "building", g, {"BuildingCD": "A. SELERA", "Description": "ANJUNG SELERA"},
+        resp, None))
+    assert warn is not None
+    assert warn["sent_key"] == {"BuildingCD": "A. SELERA"}
+    assert warn["stored_key"] == {"BuildingCD": "A  SELERA"}
+
+
+def test_verify_stored_key_none_on_exact_match():
+    s = _grid_client()
+    g = {"key_names": ["BuildingCD"]}
+    resp = {"controlsData": {"building": {"rows": [_row(BuildingCD="KEDAI",
+                                                        Description="X")]}}}
+    warn = asyncio.run(s._verify_stored_key(
+        "building", g, {"BuildingCD": "KEDAI", "Description": "X"}, resp, None))
+    assert warn is None   # stored exactly as sent -> no warning
+
+
+def test_verify_stored_key_none_without_key_fields():
+    s = _grid_client()
+    g = {"key_names": ["BuildingCD"]}
+    # caller supplied no key field -> nothing to verify, never warns/reads
+    warn = asyncio.run(s._verify_stored_key(
+        "building", g, {"Description": "X"}, {"controlsData": {}}, None))
+    assert warn is None

@@ -558,6 +558,15 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.52.5 — **`ui_insert_grid_row` now catches silent key mangling.** Some key fields
+normalize punctuation on save (proven live on CS205010: `BuildingCD` converts `.` `/`
+`*` to spaces, so `A. SELERA` persists as `A  SELERA`), so a later lookup/import by the
+original key misses — and Acumatica gives no hint. After each insert the tool now reads
+the row back (from the Save response, or one fresh read if it echoed none) and, when the
+stored key differs from what was sent, returns `key_mangled: true` + a `warnings` entry
+with `{sent_key, stored_key}`. You learn the real key the first time, not N rows later.
+4 new tests; 178 pass.
+
 v0.52.4 — **Fixed a live data-corruption bug in `screen_insert_rows`.** It used to bundle every
 row's NewRow+Set into ONE Submit envelope. The screen-SOAP command stream carries no explicit
 row-index on a Value command — it relies entirely on the server's "current row after the last

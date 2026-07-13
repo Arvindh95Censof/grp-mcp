@@ -1558,6 +1558,59 @@ class ScreenClient:
         empty if the grid exposes no dataKeyNames."""
         return {kn: self._cell_key(row, kn) for kn in (key_names or [])}
 
+    @staticmethod
+    def _key_mangle_norm(s: Any) -> str:
+        """Normalize a key the way a field's key input-mask does when it rejects
+        punctuation: every non-alphanumeric char -> space, runs of space collapsed,
+        trimmed. Used ONLY to RECOGNIZE a server-mangled key (sent 'KK.' persisted as
+        'KK'), never to alter what we send."""
+        return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9]", " ", str(s))).strip()
+
+    async def _verify_stored_key(self, grid_view: str, g: dict, sent_values: dict,
+                                 save_resp: Any, parent: dict | None) -> dict | None:
+        """After an insert, confirm the row persisted under the EXACT key sent.
+
+        Acumatica can silently normalize a key field on save (proven live on
+        CS205010: BuildingCD converts '.' '/' '*' to spaces, so 'A. SELERA' stores as
+        'A  SELERA'). A later lookup/import by the ORIGINAL key then misses. Returns a
+        warning dict {warning, sent_key, stored_key} if the stored key differs, else
+        None. Best-effort: prefers the Save response's echoed grid rows (free); falls
+        back to one fresh read only if the response carried none; never raises."""
+        key_names = g.get("key_names") or []
+        sent_key = {k: sent_values[k] for k in key_names if k in sent_values}
+        if not sent_key:
+            return None
+        rows = (((save_resp or {}).get("controlsData") or {}).get(grid_view) or {}).get("rows") \
+            if isinstance(save_resp, dict) else None
+        if not rows:
+            try:
+                rows = (await self.ui_grid_read(grid_view, parent)).get("rows")
+            except Exception:  # noqa: BLE001 — verification is best-effort, never block
+                return None
+        if not rows:
+            return None
+        # exact (post-strip) key present -> stored as sent, no mangle
+        idx, _ = self._locate_row(rows, sent_key)
+        if idx is not None:
+            return None
+        # a row whose key matches ONLY after punctuation-normalization = mangled
+        for row in rows:
+            stored = {k: (self._cell_key(row, k) or "") for k in sent_key}
+            norm_eq = all(self._key_mangle_norm(stored[k]) == self._key_mangle_norm(v)
+                          for k, v in sent_key.items())
+            raw_diff = any(str(stored[k]).strip() != str(v).strip()
+                           for k, v in sent_key.items())
+            if norm_eq and raw_diff:
+                return {
+                    "warning": "the row persisted under a DIFFERENT key than you sent — "
+                    "the screen normalized a key field on save (punctuation replaced "
+                    "with/collapsed to spaces). Reference the STORED key in later "
+                    "lookups, updates, deletes, and imports.",
+                    "sent_key": sent_key,
+                    "stored_key": {k: stored[k] for k in sent_key},
+                }
+        return None
+
     def _grid_ctrl(self, grid_view: str, g: dict, changes: dict, key: dict | None) -> dict:
         """controlsParams.<grid> block for a Save. The columns + pager fields MUST be
         echoed or the Save persists nothing (a minimal payload returns a clean 200
@@ -1741,8 +1794,17 @@ class ScreenClient:
         if refusal:
             return refusal
         change = {"id": str(uuid.uuid4()), "index": len(g["rows"]), "values": self._kv(values)}
-        return await self._grid_save(grid_view, g, {"inserted": [change]}, None,
-                                     "ui_insert_grid_row", parent)
+        res = await self._grid_save(grid_view, g, {"inserted": [change]}, None,
+                                    "ui_insert_grid_row", parent)
+        # Key-mangle guard: a key field can be silently normalized on save (e.g.
+        # CS205010 BuildingCD turns '.' '/' '*' into spaces), so the row persists
+        # under a DIFFERENT key than sent and a later lookup/import by the original
+        # key misses. Flag it here — the first time — instead of N rows later.
+        warn = await self._verify_stored_key(grid_view, g, values, res, parent)
+        if warn and isinstance(res, dict):
+            res.setdefault("warnings", []).append(warn)
+            res["key_mangled"] = True
+        return res
 
     async def ui_delete_grid_row(self, grid_view: str, key: dict,
                                  parent: dict | None = None) -> dict:

@@ -2448,6 +2448,14 @@ async def ui_insert_grid_row(
     of silently dropped, and an enum's display label is coerced to its stored value
     (so Type "Expense" and "E" both work). skip_validation=true bypasses.
 
+    KEY-MANGLE GUARD: after the insert, the row is checked to have persisted under the
+    EXACT key you sent. Some key fields silently normalize punctuation on save (proven
+    live on CS205010: BuildingCD converts '.' '/' '*' to spaces, so 'A. SELERA' stores
+    as 'A  SELERA') — a later lookup/import by the original key then misses. When the
+    stored key differs, the result carries `key_mangled: true` + a `warnings` entry
+    with {sent_key, stored_key} so you learn the real key immediately. Reference the
+    STORED key in later updates/deletes/imports.
+
     Examples:
         ui_insert_grid_row("GL202500", "AccountRecords",
             values={"AccountCD": "40100", "Type": "I", "Description": "Service Revenue"})
@@ -2460,8 +2468,14 @@ async def ui_insert_grid_row(
         res = await s.ui_insert_grid_row(grid_view, values, parent, skip_validation)
     if isinstance(res, dict) and res.get("ok") is False:
         return res  # validation refusal — surface it instead of a bogus success
-    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
-            "values": values, "parent": parent, "ok": True}
+    out = {"screen_id": screen_id.upper(), "grid_view": grid_view,
+           "values": values, "parent": parent, "ok": True}
+    # Surface the key-mangle warning (the screen normalized a key field on save, so
+    # the stored key differs from what was sent) — see ScreenClient._verify_stored_key.
+    if isinstance(res, dict) and res.get("key_mangled"):
+        out["key_mangled"] = True
+        out["warnings"] = res.get("warnings")
+    return out
 
 
 @mcp.tool()
