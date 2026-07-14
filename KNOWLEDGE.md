@@ -126,8 +126,20 @@ invoice (master-detail w/ computed field), journal batch (balanced debit/credit)
    for the migration screens (`PX_Api_SYMapping` where `CreatedByScreenID='SM209900'`). Call
    **`stock_scenario_info(screen_id)`** to read the authoritative field order, the exact
    source-column names, and priming fields; build your file with those headers.
-2. **Provider** (`setup_data_provider`) — it uploads the file **and points the FileName parameter**
-   at it. A provider left at `<EmptyFileName>` reads **0 rows, silently**.
+2. **Provider** — a Data Provider (`SM206015`) that points at the file. A provider left at
+   `<EmptyFileName>` reads **0 rows, silently** — the FileName parameter must point at the upload.
+   **`setup_data_provider` creates one via the `DataProvider` CONTRACT entity — which 404s on an
+   instance whose endpoint doesn't expose that entity (e.g. DBKK).** The provider mechanics do NOT
+   require the contract entity, though — two endpoint-free paths:
+   - **Reuse an existing provider.** Migration-configured instances ship providers already; DBKK has
+     `ACU Import Fixed Assets`, `Import Fixed Assets`, `Import Fixed Asset - Parent / Child ID`,
+     `Import Fixed Asset Classes`, `Asset Type`, `Import Asset Floor`, `Import Asset Room`, … — point
+     your scenario's `ProviderID` at one and just re-point its FileName parameter to your upload.
+   - **Drive `SM206015` on the screen plane.** Create the provider header + upload + point the FileName
+     param entirely via `ui_screen_action` / `ui_update_grid_row` (classic/modern) — no endpoint entity.
+     (Activate the schema Object + fill Fields headless per the provider-schema-gotchas below.)
+   `import_excel` already re-points the FileName param via `ui_update_grid_row` (screen plane), so the
+   RUN path needs no contract entity — only `setup_data_provider`'s create path does.
 3. **Scenario** (`build_import_scenario`) — writes the mapping one row per submit, auto-appends the
    `<Save>` action, reads it back, and runs a **preflight** that warns on the traps.
 4. **Run** (`import_excel` / `SM206036` prepareImport) — Prepare stages, Import commits. Poll; trust
