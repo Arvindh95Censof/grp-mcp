@@ -6391,6 +6391,10 @@ _GUIDE = {
             "list_published, unpublish_customization, export_customization",
             "ui_tree_dialog_insert + ui_populate_endpoint_entity_fields (add entity via SM207060)"],
         "import / export data": [
+            "validate_import_setup (RUN BEFORE importing — checks the file's lookup values "
+            "against the instance's live masters, screen-agnostic/no FK map; catches "
+            "missing class/branch/dept/method, key collisions, mandatory blanks that Prepare "
+            "won't; import_excel(validate=True) runs it automatically)",
             "import_excel (RUN an import scenario against a new file — classic plane, "
             "all silent 0-row/format/cache traps guarded; PREFER over run_import_scenario)",
             "build_import_scenario (create SM206025 scenario + mapping, corruption-safe; "
