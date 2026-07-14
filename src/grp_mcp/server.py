@@ -5030,6 +5030,7 @@ async def import_excel(
     file_path: str,
     do_import: bool = False,
     force: bool = False,
+    validate: bool = True,
     instance: str | None = None,
 ) -> Any:
     """THE import-scenario runner (SM206015 -> SM206025 -> SM206036) — the reliable
@@ -5060,7 +5061,10 @@ async def import_excel(
 
     scenario_name: an existing SM206025 scenario (build one with build_import_scenario).
     file_path:     .xlsx/.csv within read_roots. do_import: False = Prepare only (safe).
-    Requires allow_write. Returns {ok, prepared:{...}, import?:{...}, errors?, hints?}.
+    validate: run validate_import_setup first and attach it as `validation` (non-blocking
+    auto-warn — surfaces lookup values missing from the instance's masters BEFORE they
+    fail on commit; set False to skip). Requires allow_write. Returns
+    {ok, validation?, prepared:{...}, import?:{...}, errors?, hints?}.
     """
     import time as _time
 
@@ -5100,6 +5104,15 @@ async def import_excel(
                 "fix": "rename the worksheet (or rebuild the provider object) so they match; "
                        "force=true to try anyway."}
 
+    # 1b) pre-import DATA validation (non-blocking auto-warn) — probe the target
+    #     screen's masters for the file's lookup values BEFORE staging/committing.
+    validation = None
+    if validate:
+        try:
+            validation = await validate_import_setup(scenario_name, file_path, instance=instance)
+        except Exception as e:  # noqa: BLE001 — validation must never break the import
+            validation = {"ok": None, "error": f"validation skipped: {e!r}"}
+
     # 2) attach under a fresh unique name + repoint the FileName parameter
     import mimetypes
     fresh = f"{p.stem}-{_time.strftime('%Y%m%d%H%M%S')}{p.suffix}"
@@ -5134,6 +5147,8 @@ async def import_excel(
                 "prepared_on": state.get("PreparedOn"), "attached_as": fresh,
                 "provider": provider_name}
     out: dict[str, Any] = {"scenario": scenario_name, "prepared": prepared}
+    if validation is not None:
+        out["validation"] = validation
     if not state.get("NbrRecords"):
         out["ok"] = False
         out["error"] = "Prepare staged 0 rows — the provider read nothing."
@@ -5191,6 +5206,398 @@ async def import_excel(
         out["hints"] = ["MAPPING: 0/partial rows Processed with no error almost always means "
                         "the scenario's field mapping doesn't wire source→target correctly."]
     return out
+
+
+# Mapping FieldName markers that are STRUCTURAL, not real target fields:
+#   @@X = key restriction, <Save>/<Cancel> = actions, ## = grid line markers.
+def _is_real_target_field(field_name: str) -> bool:
+    fn = (field_name or "").strip()
+    return bool(fn) and not fn.startswith(("@@", "<", "#"))
+
+
+def _read_file_distincts(path, columns: list[str]) -> dict:
+    """Distinct non-blank values (+ blank/total counts) per named header column of an
+    .xlsx/.csv — for diffing a file's actual values against live masters. Reads the
+    ACTIVE sheet; matches columns by header text (row 1). Fully-empty rows are skipped."""
+    import openpyxl
+    from pathlib import Path
+
+    out = {c: {"present": False, "values": set(), "blank": 0, "total": 0} for c in columns}
+    if Path(path).suffix.lower() == ".csv":
+        import csv
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            rd = csv.reader(fh)
+            header = [h.strip() for h in next(rd, [])]
+            idx = {h: i for i, h in enumerate(header)}
+            want = {c: idx[c] for c in columns if c in idx}
+            for c in want:
+                out[c]["present"] = True
+            for row in rd:
+                if not any((x or "").strip() for x in row[:8]):
+                    continue
+                for c, i in want.items():
+                    s = (row[i].strip() if i < len(row) and row[i] is not None else "")
+                    out[c]["total"] += 1
+                    (out[c]["values"].add(s) if s else out[c].__setitem__("blank", out[c]["blank"] + 1))
+        return out
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        it = ws.iter_rows(values_only=True)
+        header = [(str(h).strip() if h is not None else "") for h in next(it, [])]
+        idx = {h: i for i, h in enumerate(header)}
+        want = {c: idx[c] for c in columns if c in idx}
+        for c in want:
+            out[c]["present"] = True
+        for r in it:
+            if all(x is None or str(x).strip() == "" for x in r[:8]):
+                continue
+            for c, i in want.items():
+                v = r[i] if i < len(r) else None
+                s = "" if v is None else str(v).strip()
+                out[c]["total"] += 1
+                if s:
+                    out[c]["values"].add(s)
+                else:
+                    out[c]["blank"] += 1
+    finally:
+        wb.close()
+    return out
+
+
+def _csdl_fk_target(csdl: str, owner_short: str, field: str) -> dict | None:
+    """From the OData CSDL, find the FK a DAC field points at — via the owner DAC's
+    NavigationProperty whose ReferentialConstraint binds `field`. Returns
+    {dac, ref} (target DAC short name + referenced key) or None. This resolves
+    GRID-column masters that the modern /structure doesn't materialize (schema-level,
+    so it works for any field on any DAC)."""
+    import re
+    i = csdl.find(f'EntityType Name="{owner_short}"')
+    if i < 0:
+        return None
+    j = csdl.find("</EntityType>", i)
+    block = csdl[i: j if j > 0 else i + 200000]
+    for m in re.finditer(r'<NavigationProperty\b[^>]*Type="([^"]+)"[^>]*>(.*?)</NavigationProperty>', block, re.S):
+        typ, inner = m.group(1), m.group(2)
+        for c in re.finditer(r'<ReferentialConstraint\b[^>]*Property="([^"]+)"[^>]*ReferencedProperty="([^"]+)"', inner):
+            if c.group(1) == field:
+                return {"dac": typ.rsplit(".", 1)[-1], "ref": c.group(2)}
+    return None
+
+
+def _match_master_column(rows: list, distinct: set):
+    """Given a master DAC's rows (all columns) + the file's distinct values, find the
+    column that best matches — i.e. auto-detect the human CODE column (MethodCD, etc.)
+    without knowing its name. Returns (best_col, valid_set, coverage, hint_samples).
+    coverage 0 = the file's values match NO column (all invalid, or undetectable)."""
+    dset = {v.strip() for v in distinct if v}
+    best_col, best_valid, best_cover = None, set(), -1
+    code_col, code_n, code_hint = None, -1, []
+    for col in (rows[0].keys() if rows else []):
+        vals, ok = set(), True
+        for r in rows:
+            x = r.get(col)
+            if isinstance(x, (dict, list)):
+                ok = False; break
+            if x is not None and str(x).strip() != "":
+                vals.add(str(x).strip())
+        if not ok or not vals:
+            continue
+        cover = len(dset & vals)
+        if cover > best_cover:
+            best_cover, best_col, best_valid = cover, col, vals
+        # hint = the most code-like column: many short values, at least some non-numeric
+        # (so a human CODE like "SL-MQ-5 YEARS" wins over an int ID / period column)
+        sample = list(vals)[:40]
+        if (all(len(v) <= 24 for v in sample) and any(not v.isdigit() for v in sample)
+                and len(vals) > code_n):
+            code_n, code_col, code_hint = len(vals), col, sorted(vals)[:8]
+    return best_col, best_valid, best_cover, code_hint
+
+
+@mcp.tool()
+async def validate_import_setup(
+    scenario_name: str,
+    file_path: str,
+    max_probe_per_field: int = 500,
+    instance: str | None = None,
+) -> Any:
+    """PRE-IMPORT DATA CHECK — does every lookup value in the file already EXIST in the
+    instance's master data? The reason a Prepare "succeeds" but the Import then fails
+    row-by-row: Prepare only STAGES rows; foreign-key values (asset class, book,
+    depreciation method, department, branch, …) aren't validated until commit. This
+    tool front-runs that failure with zero curation — it PROBES the target screen live.
+
+    How it works (screen-agnostic, no hard-coded FK map):
+      1. Reads the scenario's field mapping (SM206025) → the mapped (target field ←
+         source column) pairs that actually commit.
+      2. Reads the file's DISTINCT value per mapped source column (deduped, so 6,978
+         rows collapse to ~100 class codes to check).
+      3. Resolves each field's MASTER two ways (no curated map):
+         - FORM/tab fields: the modern /structure — each carries ENUM options or a
+           SELECTOR viewName (`_Cache#…_<TargetDAC>+key_`) + value column; bulk-query that
+           master DAC and diff.
+         - GRID-column fields (not in /structure, e.g. a depreciation grid): the OData
+           CSDL NavigationProperty on the grid's DAC gives the target master; the human
+           code column is auto-detected by value coverage.
+      4. Flags: missing lookup value (BLOCKER — those rows fail on commit); record key
+         already exists (COLLISION); mandatory field blank (BLOCKER); grid value matching
+         no master column (WARNING + valid-code sample); non-FK / non-queryable fields
+         reported `unverified` (never assumed OK).
+
+    Read-only (no writes, no staging). scenario_name: an SM206025 scenario. file_path:
+    the .xlsx/.csv you intend to import. max_probe_per_field caps distinct-value probes
+    per field (reports if capped). Returns {ok, verdict, columns:[...], blockers:[...],
+    warnings:[...], unverified:[...]} — ok=false when any BLOCKER is found.
+    """
+    client = _client(instance)
+    scen = await _scenario_state(client, scenario_name)
+    if not scen:
+        return {"ok": False, "error": f"scenario {scenario_name!r} not found (SM206025)."}
+    screen_id = scen.get("ScreenID")
+    # MappingID (not in _scenario_state's select) — fetch it to read the field rows.
+    mrow = await client.run_dac("PX_Api_SYMapping", {
+        "$filter": f"Name eq '{_oq(scenario_name)}'", "$select": "MappingID"})
+    mid = (((mrow.get("value") or [{}]) if isinstance(mrow, dict) else [{}])[0] or {}).get("MappingID")
+    if not mid:
+        return {"ok": False, "error": "could not resolve the scenario's MappingID."}
+
+    mf = await client.run_dac("PX_Api_SYMappingField", {
+        "$filter": f"MappingID eq {mid} and IsActive eq true",
+        "$select": "LineNbr,ObjectName,FieldName,Value,NeedCommit", "$orderby": "LineNbr", "$top": "500"})
+    mrows = (mf.get("value") or []) if isinstance(mf, dict) else []
+    # keep real target fields wired to a plain FILE COLUMN (Value not a '=' formula / null)
+    mapped = []
+    for f in mrows:
+        fn, val = f.get("FieldName"), f.get("Value")
+        if not _is_real_target_field(fn):
+            continue
+        if not val or str(val).startswith("="):
+            continue
+        mapped.append({"view": f.get("ObjectName"), "field": fn, "column": str(val),
+                       "commit": bool(f.get("NeedCommit"))})
+    if not mapped:
+        return {"ok": False, "error": "no plain-column field mappings found to validate."}
+
+    p = _check_read_path(file_path, instance)
+    distinct = _read_file_distincts(p, sorted({m["column"] for m in mapped}))
+
+    inst = _cfg().get(instance or _cfg().default)
+    columns: list[dict] = []
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+    unverified: list[dict] = []
+    master_cache: dict[str, set | None] = {}  # DAC -> valid value set (None = unqueryable)
+    master_rows_cache: dict[str, list | None] = {}  # DAC -> full rows (for grid code-col detect)
+    csdl_holder: dict[str, str | None] = {}  # lazily-loaded OData CSDL (only if a grid field appears)
+
+    async def _csdl():
+        if "x" not in csdl_holder:
+            try:
+                csdl_holder["x"] = await get_dac_metadata(raw=True, instance=instance)
+            except Exception:  # noqa: BLE001
+                csdl_holder["x"] = None
+        return csdl_holder["x"]
+    async with ScreenClient(inst, screen_id) as s:
+        struct = await s.get_ui_structure()
+        views = struct.get("views") or {}
+        # field name -> [(modern_view, descriptor)] across all views
+        by_field: dict[str, list[tuple[str, dict]]] = {}
+        for vname, flds in views.items():
+            for fd in flds:
+                by_field.setdefault(fd["field"], []).append((vname, fd))
+
+        # Primary DAC + its key fields — so the record's OWN key (e.g. AssetCD, which
+        # the import CREATES) is a COLLISION check (present=bad), not must-exist.
+        primary_dac = (struct.get("primary_dac") or "").rsplit(".", 1)[-1]
+        primary_keys: set[str] = set()
+        if primary_dac:
+            try:
+                meta = await get_dac_metadata(primary_dac, instance=instance)
+                for flist in (meta.values() if isinstance(meta, dict) else []):
+                    for f in (flist or []):
+                        if isinstance(f, dict) and f.get("key"):
+                            primary_keys.add(f.get("name"))
+            except Exception:  # noqa: BLE001
+                pass
+
+        for m in mapped:
+            col, fld = m["column"], m["field"]
+            d = distinct.get(col, {})
+            colrec = {"source_column": col, "target": f"{m['view']}.{fld}",
+                      "present_in_file": d.get("present", False),
+                      "distinct": len(d.get("values", set())), "blank_rows": d.get("blank", 0)}
+            if not d.get("present"):
+                colrec["status"] = "MISSING COLUMN"
+                unverified.append({**colrec, "why": "source column not found in the file header"})
+                columns.append(colrec); continue
+
+            cands = by_field.get(fld) or []
+            # prefer the view whose name matches the mapping ObjectName; else first w/ selector|options
+            cand = next((c for c in cands if c[0] == m["view"]), None) \
+                or next((c for c in cands if c[1].get("selector") or c[1].get("options")), None) \
+                or (cands[0] if cands else None)
+            vals = d.get("values", set())
+
+            if cand is None:
+                # GRID-column field (not materialized in the modern form /structure):
+                # resolve its master via the owning grid DAC's CSDL FK nav, then
+                # auto-detect the code column by value coverage.
+                gridinfo = (struct.get("grids") or {}).get(m["view"]) or {}
+                owner_short = (gridinfo.get("dac") or "").rsplit(".", 1)[-1]
+                fk = None
+                if owner_short:
+                    csdl = await _csdl()
+                    if csdl:
+                        fk = _csdl_fk_target(csdl, owner_short, fld)
+                if not fk:
+                    colrec["status"] = "UNVERIFIED"
+                    unverified.append({**colrec, "why": "not a form field; no FK found for this grid column"})
+                    columns.append(colrec); continue
+                tdac = fk["dac"]
+                if tdac not in master_rows_cache:
+                    try:
+                        mr = await client.run_dac(tdac, {"$top": "2000"})
+                        master_rows_cache[tdac] = (mr.get("value") or []) if isinstance(mr, dict) else []
+                    except Exception:  # noqa: BLE001
+                        master_rows_cache[tdac] = None
+                rowsm = master_rows_cache[tdac]
+                if not rowsm:
+                    colrec["status"] = "UNVERIFIED"
+                    colrec["master"] = tdac
+                    unverified.append({**colrec, "why": f"master {tdac} not queryable via OData"})
+                    columns.append(colrec); continue
+                mcol, valid, cover, hint = _match_master_column(rowsm, vals)
+                if cover <= 0:
+                    # target master resolved, but the file's values appear in NO column
+                    # → they don't reference any existing record (likely invalid). Warn
+                    # (not a hard blocker: code-column detection has some ambiguity).
+                    colrec["status"] = "LIKELY INVALID (grid)"
+                    colrec["master"] = f"{tdac} (grid, via CSDL nav)"
+                    warnings.append({"source_column": col, "target": colrec["target"],
+                                     "issue": "VALUE NOT FOUND IN MASTER (grid field)",
+                                     "master": f"{tdac} (via CSDL nav)",
+                                     "file_values": sorted(vals)[:10], "valid_sample": hint,
+                                     "detail": "values appear in no column of the target master — "
+                                               "likely invalid or a code-format mismatch; confirm."})
+                    columns.append(colrec); continue
+                missing = sorted(v for v in vals if v.strip() not in valid)
+                colrec["master"] = f"{tdac}.{mcol} (grid, via CSDL nav)"
+                colrec["status"] = "OK (grid lookup)" if not missing else "MISSING IN MASTER (grid)"
+                if missing:
+                    blockers.append({"source_column": col, "target": colrec["target"],
+                                     "issue": "VALUE NOT IN MASTER (grid field)", "master": colrec["master"],
+                                     "missing": missing[:50], "missing_count": len(missing),
+                                     "valid_sample": hint})
+                columns.append(colrec); continue
+            mview, desc = cand
+            required = bool(desc.get("required"))
+            colrec["required"] = required
+
+            # mandatory-but-blank
+            if required and d.get("blank", 0):
+                blockers.append({"source_column": col, "target": colrec["target"],
+                                 "issue": "MANDATORY FIELD BLANK",
+                                 "blank_rows": d["blank"],
+                                 "detail": f"{d['blank']} row(s) leave a required field empty → those rows fail."})
+
+            if desc.get("options"):
+                valid = {str(o.get("value")) for o in desc["options"]} | \
+                        {str(o.get("text")) for o in desc["options"]}
+                missing = sorted(v for v in vals if v not in valid)
+                colrec["status"] = "OK (enum)" if not missing else "INVALID ENUM"
+                if missing:
+                    blockers.append({"source_column": col, "target": colrec["target"],
+                                     "issue": "VALUE NOT IN ENUM", "missing": missing[:50],
+                                     "missing_count": len(missing),
+                                     "allowed": sorted(valid)[:50]})
+                columns.append(colrec); continue
+
+            # LOOKUP (PXSelector): the field's viewName encodes its master DAC + key
+            # column — BULK-query that master once (cached) and diff the file's distinct
+            # values locally. Fast + exact, no per-value grid probing.
+            lk = desc.get("lookup")
+            if lk:
+                dac, vfield = lk["dac"], lk["value_field"]
+                colrec["master"] = f"{dac}.{vfield}"
+                if dac not in master_cache:
+                    try:
+                        mr = await client.run_dac(dac, {"$select": vfield, "$top": "5000"})
+                        rowsm = (mr.get("value") or []) if isinstance(mr, dict) else []
+                        master_cache[dac] = {str(rw.get(vfield) or "").strip() for rw in rowsm}
+                    except Exception:  # noqa: BLE001 — DAC not exposed as an OData collection
+                        master_cache[dac] = None
+                valid = master_cache[dac]
+                if valid is None:
+                    colrec["status"] = "UNVERIFIED"
+                    unverified.append({**colrec, "why": f"master {dac} not queryable via OData"})
+                    columns.append(colrec); continue
+
+                # The record's OWN key (AssetCD) → import CREATES it, so present=collision.
+                if dac == primary_dac and fld in primary_keys:
+                    collisions = sorted(v for v in vals if v.strip() in valid)
+                    colrec["master"] = f"{dac}.{vfield} (record key)"
+                    colrec["status"] = "KEY: creates new" if not collisions else "KEY COLLISION"
+                    if collisions:
+                        blockers.append({"source_column": col, "target": colrec["target"],
+                                         "issue": "RECORD KEY ALREADY EXISTS (duplicate import)",
+                                         "master": colrec["master"], "existing": collisions[:50],
+                                         "existing_count": len(collisions)})
+                    columns.append(colrec); continue
+
+                missing = sorted(v for v in vals if v.strip() not in valid)
+                # A self-reference to the primary DAC that ISN'T the key (e.g.
+                # ParentAssetID) must exist BY IMPORT TIME — if the referents come from
+                # a companion file (parent-child), they won't exist yet: warn, don't block.
+                if dac == primary_dac:
+                    colrec["status"] = "OK (self-ref)" if not missing else "SELF-REF NOT YET PRESENT"
+                    if missing:
+                        warnings.append({"source_column": col, "target": colrec["target"],
+                                         "issue": "SELF-REFERENCE NOT PRESENT YET", "master": colrec["master"],
+                                         "missing_count": len(missing), "missing": missing[:20],
+                                         "detail": "must exist at import time — if this is a parent link, "
+                                                   "import the parent file FIRST."})
+                    columns.append(colrec); continue
+
+                colrec["status"] = "OK (lookup)" if not missing else "MISSING IN MASTER"
+                if missing:
+                    blockers.append({"source_column": col, "target": colrec["target"],
+                                     "issue": "VALUE NOT IN MASTER", "master": colrec["master"],
+                                     "missing": missing[:50], "missing_count": len(missing)})
+                columns.append(colrec); continue
+
+            # selectorMode style (SM207060-like) — fall back to per-value grid probe.
+            if desc.get("selector"):
+                probe_vals = sorted(vals)[:max_probe_per_field]
+                missing = []
+                for v in probe_vals:
+                    res = await s.selector_probe(struct, mview, fld, v)
+                    if res is None:
+                        break
+                    if not any(str(rw.get(res["value_field"])).strip() == v for rw in res["rows"]):
+                        missing.append(v)
+                colrec["status"] = "OK (lookup)" if not missing else "MISSING IN MASTER"
+                if len(vals) > max_probe_per_field:
+                    colrec["note"] = f"probed first {max_probe_per_field} of {len(vals)} distinct"
+                if missing:
+                    blockers.append({"source_column": col, "target": colrec["target"],
+                                     "issue": "VALUE NOT IN MASTER",
+                                     "missing": missing[:50], "missing_count": len(missing)})
+                columns.append(colrec); continue
+
+            # not a lookup/enum → data field (format only; no master to check)
+            colrec["status"] = "DATA (no master)"
+            columns.append(colrec)
+
+    verdict = "PASS" if not blockers else "BLOCKERS FOUND"
+    return {"ok": not blockers, "verdict": verdict, "scenario": scenario_name,
+            "screen": screen_id, "file": p.name,
+            "summary": {"columns_checked": len(columns), "blockers": len(blockers),
+                        "unverified": len(unverified)},
+            "blockers": blockers, "warnings": warnings, "unverified": unverified,
+            "columns": columns,
+            "note": "Read-only. Lookup values probed against the live screen; a BLOCKER "
+                    "means those rows will fail on Import (commit), not Prepare."}
 
 
 @mcp.tool()

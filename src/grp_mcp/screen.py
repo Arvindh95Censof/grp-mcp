@@ -276,6 +276,34 @@ def _selector_meta(field_state: dict) -> dict | None:
     }
 
 
+# A PXSelector field's `viewName` encodes its lookup target as
+#   _Cache#<OwnerDAC>_<FieldName>_<TargetDAC>+<TargetKeyField>_
+# e.g. "_Cache#PX.Objects.FA.FixedAsset_ClassID_PX.Objects.FA.FAClass+assetID_"
+# -> target DAC PX.Objects.FA.FAClass. The `valueField` (e.g. "assetCD") is the
+# actual value column (camelCase -> the DAC's PascalCase field). This is how the
+# common Acumatica selector exposes its master, distinct from the `selectorMode`
+# grid-selector style (SM207060) that _selector_meta handles.
+_CACHE_LOOKUP_RE = re.compile(r"^_Cache#(?P<owner>[\w.]+)_(?P<field>\w+)_(?P<target>[\w.]+)\+(?P<key>\w+)_$")
+
+
+def _lookup_meta(field_state: dict) -> dict | None:
+    """Extract a PXSelector field's LOOKUP MASTER (target DAC + value column) from its
+    `viewName`/`valueField`, or None if the field isn't such a selector (pure,
+    unit-testable). Lets a caller BULK-query the master via OData and diff locally —
+    no per-value grid probing. Complements _selector_meta (the selectorMode style)."""
+    m = _CACHE_LOOKUP_RE.match(field_state.get("viewName") or "")
+    vf = field_state.get("valueField")
+    if not m or not vf:
+        return None
+    target = m.group("target")
+    return {
+        "dac": target.rsplit(".", 1)[-1],          # OData entity name (FAClass, Branch, ...)
+        "target_full": target,
+        "value_field": vf[:1].upper() + vf[1:],     # camelCase -> DAC PascalCase (assetCD->AssetCD)
+        "value_field_raw": vf,
+    }
+
+
 def _selector_grid_payload(sel: dict, field: str, data_view: str, search: str,
                             active_row_contexts: list | None = None) -> dict:
     """The POST body for a selector field's grid sub-endpoint (pure, unit-testable).
@@ -1057,6 +1085,7 @@ class ScreenClient:
                     "options": ([{"value": o.get("value"), "text": o.get("text")} for o in opts]
                                 if opts else None),
                     "selector": _selector_meta(st),
+                    "lookup": _lookup_meta(st),
                 })
             views[vname] = out
         actions = [
@@ -1068,6 +1097,7 @@ class ScreenClient:
         ]
         grids = {
             cname: {"key_fields": cd.get("dataKeyNames"),
+                    "dac": cd.get("dataDacName"),
                     "columns": [c.get("field") for c in (cd.get("columns") or []) if isinstance(c, dict)]}
             for cname, cd in (d.get("controlsData") or {}).items()
             if isinstance(cd, dict) and cd.get("dataKeyNames")
@@ -1278,6 +1308,35 @@ class ScreenClient:
             vf, df = sel["value_field"], sel["search_field"]
             result["value"] = {"id": rows[0].get(vf), "text": rows[0].get(df)}
         return result
+
+    async def selector_probe(self, struct: dict, view: str, field: str,
+                             search: str) -> dict | None:
+        """Query a selector's lookup grid using a PREFETCHED /structure — the fast,
+        loopable core of ui_resolve_selector (which re-fetches /structure every call,
+        fatal when probing hundreds of values). Returns {value_field, rows:[{col:val}]}
+        or None if the field isn't a selector on this screen. `search` is the
+        server-side fastFilter (the value you're validating).
+
+        Used by validate_import_setup to check each distinct source value against its
+        field's live master without a browser or a curated FK map.
+        """
+        fmeta = next((f for f in struct["views"].get(view, []) if f["field"] == field), None)
+        sel = fmeta.get("selector") if fmeta else None
+        if not sel:
+            return None
+        if not sel.get("graph"):
+            sel = {**sel, "graph": struct.get("screen_graph")}
+        grid_url = self.instance.base_url.rstrip("/") + f"/ui/screen/{self.screen_id}/grid"
+        active_rows = [self._active_tree_row] if self._active_tree_row is not None else None
+        payload = _selector_grid_payload(sel, field, view, search, active_rows)
+        resp = await self._http.post(grid_url, json=payload, headers=_UI_HEADERS)
+        err = self._ui_error(resp)
+        if err:
+            raise ScreenError(f"selector_probe {view}.{field} on {self.screen_id}: {err}")
+        cols = sel["columns"]
+        rows = [{c: (r.get("cells") or {}).get(c, {}).get("value") for c in cols}
+                for r in (resp.json().get("rows") or [])]
+        return {"value_field": sel["value_field"], "rows": rows}
 
     # WebDialogResult values accepted as a dialog answer (public PX.Data enum).
     _DIALOG_ANSWERS = {"ok": 1, "cancel": 2, "yes": 6, "no": 7}

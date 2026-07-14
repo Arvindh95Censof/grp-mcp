@@ -198,6 +198,43 @@ plus a well-formed file, or formulas where you need them, reproduces the recipe'
 file pointed + object activated + 35 fields filled via `grid_select`), both scenarios built with
 `formula_rows_fixed`, Parent Prepared **6978 rows clean, zero manual clicks**.
 
+### Pre-import DATA validation — `validate_import_setup` (v0.55)
+
+**Prepare only STAGES rows; foreign-key values aren't validated until COMMIT** — so a Prepare can
+report "6978 rows clean" and the Import then fails row-by-row on missing masters. `validate_import_setup`
+front-runs that, screen-agnostic and with ZERO curated FK map:
+- reads the scenario mapping → the committed (target field ← source column) pairs;
+- reads the file's DISTINCT value per source column (6978 rows collapse to ~117 class codes);
+- reads the target screen's live modern `/structure` — **each PXSelector field self-describes its
+  master in its `viewName`**: `_Cache#<OwnerDAC>_<Field>_<TargetDAC>+<key>_` (e.g. ClassID →
+  `PX.Objects.FA.FAClass`, Department → `EPDepartment`, LocationID → `GL.Branch`), and `valueField`
+  is the master's value column. So the tool BULK-queries each master DAC via OData and diffs locally —
+  no per-value probing, no hard-coded field→DAC table. (`_lookup_meta` parses this; `get_ui_structure`
+  now exposes it as each field's `lookup`.)
+- classifies: enum options; lookup missing-in-master (BLOCKER); the record's OWN key (AssetCD) as a
+  COLLISION check (present = duplicate import, not must-exist); a non-key self-reference (ParentAssetID)
+  as a WARNING ("import the parent file first"); required-but-blank (BLOCKER).
+- `import_excel(validate=True)` (default) runs it and attaches `validation` — a non-blocking auto-warn
+  BEFORE Prepare/Import.
+
+**Grid-column fields too.** Multi-row grid columns (e.g. `AssetBalance.DepreciationMethodID`)
+aren't materialized in the modern `/structure`, so their master comes from a second source: the
+**OData CSDL NavigationProperty** — `<NavigationProperty Type="…FADepreciationMethod"><Referential
+Constraint Property="DepreciationMethodID" ReferencedProperty="MethodID"/></NavigationProperty>` on
+the grid's DAC gives the target master for ANY field (schema-level, works for grids). `_csdl_fk_target`
+parses it; the grid's owning DAC comes from `get_ui_structure` grids' `dac`. Since the FK references
+the master's INTERNAL key (MethodID) but the file uses the human CODE (MethodCD), the code column is
+**auto-detected by value coverage** (`_match_master_column`: query the master, pick the column whose
+values best cover the file's — no per-DAC config). A resolved master whose column matches NONE of the
+file's values → `warning` "value not found in master" with a sample of valid codes.
+
+**What stays `unverified`:** non-FK data fields (dates, amounts, serial no. — nothing to check) and
+masters not exposed as an OData collection (custom/segmented, e.g. the Building lookup). Never a false
+"OK". Proven live on DBKK FA303000: caught 48 mandatory-blank ClassID rows, LocationID `MHQ` absent,
+Department `2/5/308/500` absent, **19 asset IDs that already existed** (real duplicate-import collision
+a prefix-only manual check missed), AND `DepreciationMethodID='S'` invalid (valid codes are `SL-…`) —
+the last one via the grid/CSDL path.
+
 ---
 
 ## 6. Foundation / GL setup — order and gotchas
