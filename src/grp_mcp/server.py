@@ -216,6 +216,53 @@ ScreenClient.default_seat_reliever = staticmethod(_relieve_api_seats)
 CustomizationClient.default_seat_reliever = staticmethod(_relieve_api_seats)
 
 
+# Fire-and-forget logout tasks scheduled from sync contexts; hold a ref so the loop
+# doesn't GC them mid-flight (see _drop_client).
+_PENDING_LOGOUTS: set = set()
+
+
+def _drop_client(name: str) -> None:
+    """Evict a profile's cached contract client(s) AND log their OAuth sessions out
+    server-side — from a SYNC context (add_instance / remove_instance).
+
+    Fixes the 'ghost session' seat leak: these callers used to do just
+    `_clients.pop(name, None)`, which (1) matched only the bare `name` key and MISSED
+    endpoint-scoped variants (`name@<Endpoint>/<Ver>` — see _client), and (2) dropped the
+    client WITHOUT logging out, orphaning its 'Max Web Services API Users' seat until
+    idle-timeout. Once the handle is gone from `_clients`, release_sessions can no longer
+    see it to end it — so it blocks logins until the server times it out (observed live:
+    add_instance replacing an active profile stranded its prior REST session).
+
+    Loop-safe: FastMCP may run a sync tool on a worker thread (no running loop -> fresh
+    `asyncio.run`, like _shutdown_clients) or, defensively, on the loop thread (schedule a
+    task). Best-effort throughout — never raises into the caller."""
+    victims = [k for k in list(_clients) if k == name or k.startswith(f"{name}@")]
+    clients = [c for c in (_clients.pop(k, None) for k in victims) if c is not None]
+    if not clients:
+        return
+
+    async def _close_all() -> None:
+        for c in clients:
+            try:
+                await c.logout()
+            except Exception:  # noqa: BLE001 — best-effort seat release
+                pass
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    try:
+        if loop is not None:
+            task = loop.create_task(_close_all())
+            _PENDING_LOGOUTS.add(task)
+            task.add_done_callback(_PENDING_LOGOUTS.discard)
+        else:
+            asyncio.run(_close_all())
+    except Exception:  # noqa: BLE001 — best-effort; idle-timeout is the backstop
+        pass
+
+
 @asynccontextmanager
 async def _customization(instance: str | None):
     """Short-lived cookie session for one Customization API operation.
@@ -582,7 +629,7 @@ def add_instance(
         cfg.session_only.discard(name)
     else:
         cfg.session_only.add(name)
-    _clients.pop(name, None)  # drop any stale cached client for this name
+    _drop_client(name)  # drop + log out any stale cached client(s) — frees the OAuth seat now, not at idle-timeout
     if set_active or len(cfg.instances) == 1:
         cfg.default = name
     saved = save_config(cfg) if persist else None
@@ -646,7 +693,7 @@ def remove_instance(name: str, persist: bool = True) -> dict:
         raise ValueError("refusing to remove the only configured profile.")
     del cfg.instances[name]
     cfg.session_only.discard(name)
-    _clients.pop(name, None)
+    _drop_client(name)  # drop + log out any cached client(s) so the removed profile's seat frees now
     if cfg.default == name:
         cfg.default = next(iter(cfg.instances))
     saved = save_config(cfg) if persist else None

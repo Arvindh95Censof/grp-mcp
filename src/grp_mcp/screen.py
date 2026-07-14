@@ -473,6 +473,17 @@ class ScreenClient:
                 self._cookie_session = cached["kind"] == "cookie"
                 self._shared = True
                 return
+            # A STALE cached entry (past the local TTL) is STILL a live server-side session
+            # — the TTL is far shorter than Acumatica's session idle-timeout. Minting a new
+            # login below and overwriting the dict entry would ORPHAN it: it keeps holding a
+            # 'Max Web Services API Users' seat until idle-timeout, and with its handle gone
+            # from the cache, release_sessions can never end it (the 'ghost session' seat
+            # leak). So log the stale session out server-side FIRST, then re-login.
+            if cached is not None:
+                try:
+                    await logout_session_cache(key)
+                except Exception:  # noqa: BLE001 — best-effort; re-login regardless
+                    pass
             try:
                 await self.login()
                 kind = "soap"
