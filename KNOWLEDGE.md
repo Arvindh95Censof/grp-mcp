@@ -147,9 +147,13 @@ invoice (master-detail w/ computed field), journal batch (balanced debit/credit)
 - **Alternating-blank columns need an explicit 0.** For debit/credit pairs (a GL line is debit XOR
   credit), put `0` in the empty side — a truly blank cell imports as EMPTY (`'CreditAmt' cannot be
   empty`).
-- **Plain column refs only.** The classic writer silently **drops `=` formula values** to null
-  (the vendor's `=IsNull(...)` guards can't be reproduced field-by-field). Supply real values instead
-  of relying on blank-cell fallback.
+- **`=` formula sources: the classic writer mangles them, the modern plane persists them.** The
+  classic SOAP writer silently corrupts `=` values (`='H'`→phantom literal `"H"`, `=[X]`→null).
+  As of v0.53 **`build_import_scenario` auto-repairs** every `source.startswith("=")` row after the
+  classic write by rewriting it through the modern grid plane (`ui_update_grid_row` on `FieldMappings`)
+  and reports `formula_rows_fixed`. So `='const'`, `=[Self.Key]` key-restrictions, and
+  `=LEFT(Concat(...),256)` computed values all survive now — you no longer have to flatten to plain
+  columns. (If you hand-write the mapping via classic SOAP alone, they still mangle — use the tool.)
 - **End with a `<Save>` action row** or the import stages every field and commits **nothing**
   (0 rows Processed, no error).
 - **Batching many `new_row` in one submit corrupts state-dependent grids** — one row per call.
@@ -165,11 +169,34 @@ vendor, no cash sale without a cash account, no fixed asset without an asset cla
 is: **set up master data first** (companies, accounts, classes, customers, vendors, items…), **then**
 run the transactional imports in dependency order.
 
-### Verbatim scenario clone is NOT API-drivable (and isn't needed)
+### Provider-schema gotchas (all now headless — v0.54)
 
-Reproducing a vendor scenario row-for-row (to keep its `IsNull` guards) fails on every plane:
-`insertFrom` copies no rows, Copy/Paste pastes empty, no writer persists a formula. You don't need
-it — plain-column `build_import_scenario` + a well-formed file reproduces the recipe's intent.
+The `SM206015` provider isn't usable until its schema Object + Fields are populated and active.
+Doing this headless has three traps that each surface as a misleading downstream error:
+
+- **The Objects grid `ProviderID` ≠ the id `setup_data_provider` returns.** The tool returns the
+  entity/NoteID (e.g. `390a05d0-…`); the value the grid rows key on is a *different* GUID
+  (e.g. `84ad0300-…`). Selecting a grid row / filtering `PX_Api_SYProviderField` with the wrong one
+  fails silently ("schema object is not selected", empty reads). **Read the real grid ProviderID via
+  `ui_read_grid` (or `run_dac_odata('PX_Api_SYProviderObject')`) and use that.**
+- **The schema Object ships `IsActive:false`.** An inactive object → "Provider Object … cannot be
+  found" at scenario build. Flip it: `ui_update_grid_row("Objects", {LineNbr:1}, {IsActive:true})`.
+- **"Fill Schema Fields" IS headless-reachable (v0.54).** It's a codebehind action on a *selected
+  detail-grid row*, so it was unreachable until `ui_screen_action` gained `grid_select`. Call it with
+  `grid_select={"view":"Objects","key":{...}}` + `save_after=true` and the Fields schema populates
+  without a manual click. (Verify the written fields via `run_dac_odata('PX_Api_SYProviderField',
+  filter="ProviderID eq <gridProviderID>")` — `screen_get` reads the provider schema as empty.)
+
+### Verbatim vendor-scenario clone still isn't needed
+
+`insertFrom` copies no rows and Copy/Paste pastes empty, so a row-for-row clone of a vendor scenario
+still isn't worth chasing — but you no longer lose its `=IsNull(...)` guards by rebuilding, because
+`build_import_scenario` now persists `=` formulas (see the formula trap above). Plain-column mapping
+plus a well-formed file, or formulas where you need them, reproduces the recipe's intent.
+
+**Proven end-to-end fully headless (2026-07-14, DBKK `FA303000`):** both providers built (header +
+file pointed + object activated + 35 fields filled via `grid_select`), both scenarios built with
+`formula_rows_fixed`, Parent Prepared **6978 rows clean, zero manual clicks**.
 
 ---
 
