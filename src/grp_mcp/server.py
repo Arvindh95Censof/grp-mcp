@@ -1751,9 +1751,11 @@ async def ui_screen_action(
     action: str,
     set_fields: list[dict] | None = None,
     tree_select: dict | None = None,
+    grid_select: dict | None = None,
     record_key: dict | None = None,
     skip_validation: bool = False,
     verify: bool = False,
+    save_after: bool = False,
     dialog_answer: str = "ok",
     instance: str | None = None,
 ) -> Any:
@@ -1787,6 +1789,19 @@ async def ui_screen_action(
         no-ops without this. `key`/`parent_key` come from ui_read_grid(tree_view)
         rows. Selection stays active for set_fields + action in THIS call only
         (each ui_screen_action call is its own fresh session).
+    grid_select: optional {"view": <GridView>, "key": {keyField: value}} — marks an
+        existing DATA-GRID row as the graph's current row before the action, the
+        modern-plane equivalent of clicking a detail-grid row. REQUIRED for codebehind
+        actions that operate on the selected row: e.g. SM206015 `fillSchemaFields`
+        faults "A schema object is not selected" without it. `key` is the grid's FULL
+        key (ui_get_structure grids[view].key_fields; e.g. {"ProviderID": <id>,
+        "LineNbr": 1}) — for a detail grid, navigate the header first via record_key so
+        the right parent's rows load. Pair with save_after=true for fill/generate
+        actions that stage changes needing a commit. Proven live 2026-07-14.
+    save_after: after the action, fire a Save in the SAME session (default False). A
+        "fill"/edit-type action (fillSchemaFields, ...) leaves graphIsDirty=true and is
+        LOST when the session closes; save_after commits it. Skipped when action itself
+        is "Save". The result's `saved` reports the post-Save graphIsDirty (False = ok).
     record_key:  optional {"view": <ViewName>, "key": {keyField: value}} — selects
         a SPECIFIC EXISTING record before tree_select/set_fields/action run. Needed
         whenever the screen's PRIMARY view is itself keyed to one record instead of
@@ -1883,6 +1898,11 @@ async def ui_screen_action(
                 f"ui_screen_action: unknown field {f['view']}.{f['field']} on "
                 f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'}"
             )
+        if grid_select and grid_select["view"] not in struct["grids"]:
+            raise ScreenError(
+                f"ui_screen_action: unknown grid {grid_select['view']!r} on "
+                f"{screen_id.upper()} (grid_select). Grids: {sorted(struct['grids'])}"
+            )
         # Load the views we'll edit (so a Save validates a full record) PLUS the
         # primary view (first in /structure) — it carries the record/company
         # context an action needs (e.g. GL201000 generateYears faults "Select a
@@ -1891,12 +1911,16 @@ async def ui_screen_action(
         load = {f["view"] for f in (set_fields or [])} | ({primary} if primary else set())
         if record_key:
             load.add(record_key["view"])
+        if grid_select:
+            load.add(grid_select["view"])
         await s.ui_bootstrap(sorted(load))
         if record_key:
             await s.ui_navigate_record(record_key["view"], record_key["key"])
         if tree_select:
             await s.ui_select_tree_node(tree_select["view"], tree_select["key"],
                                          tree_select.get("parent_key"))
+        if grid_select:
+            s.ui_select_grid_row(grid_select["view"], grid_select["key"])
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
         try:
@@ -1920,6 +1944,14 @@ async def ui_screen_action(
         # HTTP 200 hides). Best-effort verify=true re-reads /structure to confirm the
         # graph settled. (ui_command already raised on any explicit error message.)
         dirty = result.get("graphIsDirty") if isinstance(result, dict) else None
+        # save_after: a fill/edit action stages changes (graphIsDirty) that are LOST at
+        # session close — commit them with a Save in THIS session (the selected grid row
+        # stays active via _active_grid_row, auto-attached). Skip if the action WAS Save.
+        saved = None
+        if save_after and action != "Save":
+            save_res = await s.ui_command("Save", answer=dialog_answer)
+            saved = save_res.get("graphIsDirty") if isinstance(save_res, dict) else None
+            dirty = saved  # reflect the post-Save state
         verified = None
         if verify:
             try:
@@ -1927,11 +1959,14 @@ async def ui_screen_action(
                 verified = {"reread_ok": True, "actions": len(after.get("actions", []))}
             except Exception as e:  # noqa: BLE001
                 verified = {"reread_ok": False, "error": str(e)[:200]}
-    ok = not (action == "Save" and dirty is True)
+    ok = not ((action == "Save" or save_after) and dirty is True)
     out = {"screen_id": screen_id.upper(), "action": action, "set_fields": set_fields or [],
-           "record_key": record_key, "tree_select": tree_select, "ok": ok, "raw": result}
+           "record_key": record_key, "tree_select": tree_select, "grid_select": grid_select,
+           "ok": ok, "raw": result}
     if coercions:
         out["coercions"] = coercions
+    if saved is not None:
+        out["saved"] = (saved is False)
     if dirty is not None:
         out["graph_is_dirty"] = dirty
     if not ok:

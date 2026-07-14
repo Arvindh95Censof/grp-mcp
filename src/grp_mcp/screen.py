@@ -323,6 +323,7 @@ class ScreenClient:
         self._active_tree_row: dict | None = None  # see ui_select_tree_node
         self._active_tree_controls: dict | None = None
         self._active_tree_context_views: dict | None = None
+        self._active_grid_row: dict | None = None  # see ui_select_grid_row
         self._ui_meta: dict[tuple[str, str], dict] | None = None  # (view,field)->meta cache
 
     @property
@@ -633,6 +634,7 @@ class ScreenClient:
         self._active_tree_row = None  # a fresh graph has no node selected
         self._active_tree_controls: dict | None = None
         self._active_tree_context_views: dict | None = None
+        self._active_grid_row = None  # a fresh graph has no grid row selected
 
     async def ui_navigate_record(self, view: str, key: dict) -> None:
         """Select a SPECIFIC EXISTING record on `view` by its key field(s) — the
@@ -661,6 +663,27 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
+
+    def ui_select_grid_row(self, grid_view: str, key: dict) -> None:
+        """Mark an EXISTING data-grid row as the graph's CURRENT row for `grid_view`,
+        so a codebehind action fired next operates on it. The modern-plane peer of
+        clicking a detail-grid row (ui_select_tree_node is the tree equivalent).
+
+        WHY: actions like SM206015 `fillSchemaFields` read the *selected* child row
+        (the schema object whose fields to fill); ui_command sends an empty
+        activeRowContexts, so they fault "A schema object is not selected". This stores
+        a `GridActiveDataRow` activeRowContext that `_ui_post` then auto-attaches to
+        every subsequent command in THIS session (the action + a trailing Save),
+        exactly as the browser resends it while a row stays selected.
+
+        grid_view: the grid's data view (from ui_get_structure `grids`, e.g. "Objects").
+        key:       the row's FULL grid key (grids[grid_view].key_fields), e.g.
+            {"ProviderID": <id>, "LineNbr": 1}. For a detail grid include the parent-
+            link field(s); navigate the header first with ui_navigate_record so the
+            right parent's rows are loaded. Sync only — no network (the context rides
+            the next command). Proven live on SM206015 (2026-07-14)."""
+        self._active_grid_row = {"dataView": grid_view, "syncPosition": True,
+                                 "resultType": "GridActiveDataRow", "dataKey": dict(key)}
 
     async def _ui_post(self, payload: dict, _auth_retried: bool = False) -> httpx.Response:
         # The modern plane rides the SOAP login cookie (same ASP.NET app). If no
@@ -699,6 +722,20 @@ class ScreenClient:
             vp = dict(payload.get("viewsParams") or {})
             for view, block in self._active_tree_context_views.items():
                 vp.setdefault(view, block)
+            payload = {**payload, "viewsParams": vp}
+        # A selected data-GRID row (ui_select_grid_row) is the "current row" of a detail
+        # view — the context a codebehind action on a selected row needs (e.g. SM206015
+        # `fillSchemaFields` faults "A schema object is not selected" without it). The
+        # browser resends this activeRowContexts entry on every command while the row
+        # stays selected; auto-attach it (+ ensure the grid view is listed in viewsParams
+        # so the row resolves). Caller-supplied contexts win. Proven live 2026-07-14.
+        if self._active_grid_row is not None:
+            existing = payload.get("activeRowContexts") or []
+            if not any(c.get("dataView") == self._active_grid_row["dataView"] for c in existing):
+                payload = {**payload, "activeRowContexts": [*existing, self._active_grid_row]}
+            gv = self._active_grid_row["dataView"]
+            vp = dict(payload.get("viewsParams") or {})
+            vp.setdefault(gv, {})
             payload = {**payload, "viewsParams": vp}
         resp = await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
         # If we REUSED a cached shared cookie and the server has since dropped it, the
