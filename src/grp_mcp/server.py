@@ -4810,10 +4810,12 @@ async def stock_scenario_info(screen_id: str, instance: str | None = None) -> di
                         "active": r.get("IsActive")} for r in rows],
         })
     return {"ok": True, "screen_id": screen_id.upper(),
-            "note": "Clone this recipe: build your file with `source_columns` as headers, "
-                    "map each field to its column (plain refs — classic screen_submit drops "
-                    "`=` formula values), and keep the detail field ORDER (priming fields "
-                    "like InventoryID must precede Qty).",
+            "note": "Clone this recipe VERBATIM: build your file with `source_columns` as "
+                    "headers, map each field to its column OR its `=` formula (build_import_"
+                    "scenario now persists `=` formulas via the modern plane, so the vendor's "
+                    "`='H'` / `=[Obj.Field]` / `=IsNull(...)` / `=LEFT(Concat(...))` values "
+                    "reproduce as-is), and keep the detail field ORDER (priming fields like "
+                    "InventoryID must precede Qty).",
             "scenarios": scenarios}
 
 
@@ -5212,11 +5214,14 @@ async def build_import_scenario(
         Qty="1" -> empty Qty -> empty BaseQty).
       • Map the line's PRIMING field before Qty (AR301000: Transactions.InventoryID, even
         blank) so Qty's FieldUpdated can default the computed base field (BaseQty).
-      • Use PLAIN column refs: classic screen_submit silently DROPS `=` formula values
-        (they persist as null). The preflight warns on all three of these. (The vendor's
-        `=IsNull([col],[obj.field])` guards can't be reproduced field-by-field — no write
-        plane persists a formula, and insertFrom/Copy-Paste are API no-ops — so supply
-        real values instead of relying on blank-cell fallback.)
+      • `=` FORMULA sources ARE now supported (`='H'`, `=[Asset.RecordType]`,
+        `=IsNull([col],[obj.field])`, `=LEFT(Concat([A],' - ',[B]),256)`, ...). Classic
+        screen_submit mangles them (drops `=[field]` to null, strips `='X'` to a phantom
+        literal), so after the classic build this tool AUTOMATICALLY re-writes every `=`
+        row's Value through the MODERN grid plane (ui_update_grid_row on FieldMappings),
+        which persists formulas intact (proven live 2026-07-14). `formula_rows_fixed` in
+        the result reports how many were rewritten; a still-null `=` row is warned. So you
+        CAN clone the vendor's `=IsNull(...)` guards / computed values verbatim now.
       • For paired debit/credit columns that ALTERNATE blanks per line (GL301000
         CuryDebitAmt/CuryCreditAmt), put an explicit 0 in the empty side — a truly blank
         cell imports as EMPTY ('CreditAmt cannot be empty'); a 0 imports as zero. Attach a
@@ -5295,6 +5300,42 @@ async def build_import_scenario(
                       key=lambda r: r.get("LineNbr", 0))
     persisted = [{k: r.get(k) for k in ("LineNbr", "ObjectName", "FieldName", "Value",
                                         "NeedCommit", "IsActive")} for r in rows]
+    # FORMULA FIX-UP (modern plane). The classic screen_submit above MANGLES any `=`
+    # formula source: it drops `=[Obj.Field]` references to NULL and strips `='X'` to a
+    # bare literal "X" (which the import then reads as a phantom source COLUMN, importing
+    # EMPTY). The MODERN grid plane writes formulas INTACT (proven live 2026-07-14:
+    # SM206025 FieldMappings.Value accepted `='H'`, `=[Asset.RecordType]`,
+    # `=LEFT(Concat(...),256)` verbatim). So re-write every `=` row's Value via
+    # ui_update_grid_row. norm[i] was written in order, and the readback is LineNbr-sorted
+    # = write order, so persisted[i] is norm[i]'s row (guarded by a FieldName match).
+    fixup_errors: list[str] = []
+    n_formula_fixed = 0
+    if mid:
+        targets = []
+        for i, m in enumerate(norm):
+            src = m.get("source")
+            if src is None or not str(src).startswith("=") or i >= len(persisted):
+                continue
+            if persisted[i].get("FieldName") != m.get("field"):
+                continue  # order drift — skip rather than write the wrong row
+            targets.append((persisted[i].get("LineNbr"), src))
+        if targets:
+            try:
+                async with ScreenClient(inst, "SM206025") as s2:
+                    for ln, src in targets:
+                        await s2.ui_update_grid_row(
+                            "FieldMappings", {"MappingID": mid, "LineNbr": ln},
+                            {"Value": src},
+                            {"view": "Mappings", "key": {"Name": name}}, True)
+                        n_formula_fixed += 1
+                # re-read so the returned `persisted`/warnings reflect the fixed values
+                f = await client.run_dac("PX_Api_SYMappingField", {"$filter": f"MappingID eq {mid}"})
+                rows = sorted(((f.get("value") or []) if isinstance(f, dict) else []),
+                              key=lambda r: r.get("LineNbr", 0))
+                persisted = [{k: r.get(k) for k in ("LineNbr", "ObjectName", "FieldName",
+                              "Value", "NeedCommit", "IsActive")} for r in rows]
+            except Exception as e:  # noqa: BLE001 — surface as a warning, don't fail the build
+                fixup_errors.append(f"formula fix-up (modern plane) failed: {e}")
     # `@@`/`<Cancel>`/`<Save>`/`##` are STRUCTURAL rows (restrictions, actions, line
     # markers) — present in every working mapping, NOT corruption. Report them as such.
     action_rows = _mapping_action_rows(persisted)
@@ -5320,14 +5361,17 @@ async def build_import_scenario(
         warnings.append(f"{m['field']}: source {m['source']!r} is a bare literal — the "
                         "import reads it as a source COLUMN name (imports EMPTY). Map it to "
                         "a real provider column, or use an `=` expression.")
+    # After the modern-plane fix-up, `=` sources should be intact; anything STILL null
+    # means the fix-up couldn't reach it (report loudly). fixup_errors surfaces failures.
     dropped = [r for r in field_rows if r.get("Value") is None
                and any(str((_norm_map_row(x)).get("source") or "").startswith("=")
                        and (_norm_map_row(x)).get("field") == r.get("FieldName")
                        for x in mapping)]
     if dropped:
-        warnings.append("`=` formula sources persisted as NULL (classic screen_submit "
-                        f"drops formula values): {[r.get('FieldName') for r in dropped]}. "
-                        "Use plain column refs, or set these via the modern grid plane.")
+        warnings.append("`=` formula sources still NULL after modern-plane fix-up: "
+                        f"{[r.get('FieldName') for r in dropped]}. Set them manually via "
+                        "ui_update_grid_row on SM206025 FieldMappings.")
+    warnings.extend(fixup_errors)
     try:
         stock = await _stock_scenario_for_screen(client, screen_id)
         if stock:
@@ -5342,7 +5386,8 @@ async def build_import_scenario(
         pass
     out = {"ok": ok, "scenario": name, "screen_id": screen_id.upper(),
            "requested_rows": len(mapping), "persisted_field_rows": len(field_rows),
-           "has_save_action": has_save, "row_results": results, "persisted": persisted,
+           "has_save_action": has_save, "formula_rows_fixed": n_formula_fixed,
+           "row_results": results, "persisted": persisted,
            "action_rows": action_rows or None,
            "next": f"run it with import_excel({name!r}, <file>, do_import=false) — "
                    "Prepare first, check nbr_records, then do_import=true."}
