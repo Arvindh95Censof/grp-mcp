@@ -22,7 +22,8 @@ from .acumatica import AcumaticaClient, AcumaticaError
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
-from .screen import ScreenClient, ScreenError, _leaf, clear_session_cache, logout_session_cache
+from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
+                     clear_struct_cache, close_http_pool, logout_session_cache)
 
 _KB_FIRST_POLICY = (
     "TOOL SELECTION: this server has ~95 tools across FOUR Acumatica planes (contract "
@@ -472,15 +473,19 @@ def _shutdown_clients() -> None:
     Runs on a fresh event loop (the server's is gone by atexit); logout() uses its
     own short-lived httpx client so it works there. Guarded so exit never crashes.
     """
-    if not _clients:
-        return
-
     async def _close_all() -> None:
         for c in list(_clients.values()):
             try:
                 await c.aclose()
             except Exception:
                 pass
+        # Pooled UI-plane HTTP clients outlive every ScreenClient by design, so this
+        # is the only place they get closed. Best-effort like the rest: at atexit the
+        # loop they were created on is already gone, and the OS reclaims the sockets.
+        try:
+            await close_http_pool()
+        except Exception:
+            pass
 
     try:
         import asyncio
@@ -6699,6 +6704,10 @@ async def setup_readiness(instance: str | None = None) -> Any:
     and preference VALUES (GLSetup/ARSetup/APSetup serve no readable collection route).
     """
     client = _client(instance)
+    # Hoisted out of the calendar probe below, where it used to be the first statement
+    # inside a try: if it threw, inst_obj stayed unbound and the LATER probes died with
+    # a NameError that their own excepts swallowed as an unrelated "error".
+    inst_obj = _cfg().get(instance or _cfg().default)
     feats_raw = await client.run_dac("FeaturesSet", {"$top": 1})
     rows = feats_raw.get("value") if isinstance(feats_raw, dict) else None
     feats = rows[0] if rows else {}
@@ -6706,90 +6715,120 @@ async def setup_readiness(instance: str | None = None) -> Any:
     modules = {f: bool(feats.get(f)) for f in _MODULE_FLAGS if f in feats}
     enabled_features = sorted(k for k, v in feats.items() if v is True)
 
-    checklist: list[dict[str, Any]] = []
-    for module, flag, steps in _SETUP_CHECKLIST:
-        feature_on = bool(feats.get(flag))
-        step_out = []
-        for label, dac, key in steps:
-            exists = await _probe_exists(client, dac, key) if feature_on else None
-            step_out.append({"step": label, "exists": exists})
-        complete = feature_on and all(s["exists"] is True for s in step_out)
-        checklist.append({
-            "module": module,
-            "feature_flag": flag,
-            "feature_enabled": feature_on,
-            "complete": complete,
-            "steps": step_out,
-        })
+    # Only the FeaturesSet read above gates the rest: the 9 checklist probes, the 3
+    # screen exports and the FinPeriod read share no data, so they ran as ~13 serial
+    # round-trips for no reason. Fan them out; each keeps its own best-effort except,
+    # so one failure still degrades to null rather than failing readiness.
+    async def _checklist() -> list[dict[str, Any]]:
+        async def _step(feature_on: bool, dac: str, key: str) -> bool | None:
+            # _probe_exists never raises — it degrades to None.
+            return await _probe_exists(client, dac, key) if feature_on else None
 
-    gaps = [
-        f"{c['module']}: {s['step']}"
-        for c in checklist if c["feature_enabled"]
-        for s in c["steps"] if s["exists"] is False
-    ]
+        plan = [(module, flag, steps, bool(feats.get(flag)))
+                for module, flag, steps in _SETUP_CHECKLIST]
+        flat = await asyncio.gather(*[_step(on, dac, key)
+                                      for _, _, steps, on in plan
+                                      for _, dac, key in steps])
+        out: list[dict[str, Any]] = []
+        i = 0
+        for module, flag, steps, feature_on in plan:
+            step_out = []
+            for label, _dac, _key in steps:
+                step_out.append({"step": label, "exists": flat[i]})
+                i += 1
+            out.append({
+                "module": module,
+                "feature_flag": flag,
+                "feature_enabled": feature_on,
+                "complete": feature_on and all(s["exists"] is True for s in step_out),
+                "steps": step_out,
+            })
+        return out
 
     # Financial calendar (GL101000) has no DAC/REST collection route — probe it via
     # the screen-based SOAP Export (the wizard plane). Best-effort: degrades to
     # exists:null if SOAP is unreachable. A calendar is the prerequisite for the GL
     # ledger, so surface it as a gap when the financial module is on but it's absent.
-    calendar = {"exists": None, "checked_via": "GL101000 Export (screen SOAP)"}
-    try:
-        inst_obj = _cfg().get(instance or _cfg().default)
-        async with ScreenClient(inst_obj, "GL101000") as sc:
-            periods = await sc.export(["Periods.PeriodNbr"], top=1)
-            calendar["exists"] = bool(periods.get("rows"))
-    except Exception as e:  # noqa: BLE001 - readiness must never hard-fail
-        calendar["error"] = str(e)[:200]
-    if bool(feats.get("FinancialModule")) and calendar["exists"] is False:
-        gaps.insert(0, "General Ledger: Financial calendar (GL101000)")
+    async def _calendar() -> dict[str, Any]:
+        out: dict[str, Any] = {"exists": None,
+                               "checked_via": "GL101000 Export (screen SOAP)"}
+        try:
+            async with ScreenClient(inst_obj, "GL101000") as sc:
+                periods = await sc.export(["Periods.PeriodNbr"], top=1)
+                out["exists"] = bool(periods.get("rows"))
+        except Exception as e:  # noqa: BLE001 - readiness must never hard-fail
+            out["error"] = str(e)[:200]
+        return out
 
     # Feature ACTIVATION (are the enabled flags actually INSTALLED, or only staged?).
     # CS100000 ActivationStatus via screen Export — "Validated" = installed; "Pending
     # Activation" = saved but not applied (call activate_features). This is the gap
     # that silently blocks everything downstream.
-    feature_activation = {"status": None, "installed": None,
-                          "checked_via": "CS100000 Export (screen SOAP)"}
-    try:
-        async with ScreenClient(inst_obj, "CS100000") as sc:
-            rows = (await sc.export(["GeneralSettings.ActivationStatus"], top=1)).get("rows")
-        st = rows[0].get("Status") if rows else None
-        feature_activation.update(status=st, installed=(st == "Validated"))
-    except Exception as e:  # noqa: BLE001
-        feature_activation["error"] = str(e)[:160]
-    if feature_activation.get("installed") is False:
-        gaps.insert(0, "Features: staged but NOT installed — ActivationStatus is "
-                    f"'{feature_activation.get('status')}' (call activate_features)")
+    async def _activation() -> dict[str, Any]:
+        out: dict[str, Any] = {"status": None, "installed": None,
+                               "checked_via": "CS100000 Export (screen SOAP)"}
+        try:
+            async with ScreenClient(inst_obj, "CS100000") as sc:
+                rows = (await sc.export(["GeneralSettings.ActivationStatus"],
+                                        top=1)).get("rows")
+            st = rows[0].get("Status") if rows else None
+            out.update(status=st, installed=(st == "Validated"))
+        except Exception as e:  # noqa: BLE001
+            out["error"] = str(e)[:160]
+        return out
 
     # GL Preferences system accounts (GL102000): Retained Earnings + YTD Net Income
     # must be set before the GL master calendar can be generated / posting enabled.
-    gl_preferences = {"retained_earnings": None, "ytd_net_income": None,
-                      "configured": None, "checked_via": "GL102000 Export (screen SOAP)"}
-    try:
-        async with ScreenClient(inst_obj, "GL102000") as sc:
-            rows = (await sc.export(["GLSetupRecord.RetainedEarningsAccount",
-                                     "GLSetupRecord.YTDNetIncomeAccount"], top=1)).get("rows")
-        if rows:
-            vals = list(rows[0].values())
-            re_acct = (vals[0] if len(vals) > 0 else None) or None
-            ytd_acct = (vals[1] if len(vals) > 1 else None) or None
-            gl_preferences.update(
-                retained_earnings=re_acct, ytd_net_income=ytd_acct,
-                configured=bool(re_acct) and bool(ytd_acct))
-    except Exception as e:  # noqa: BLE001
-        gl_preferences["error"] = str(e)[:160]
-    if bool(feats.get("FinancialModule")) and gl_preferences.get("configured") is False:
-        gaps.append("General Ledger: GL Preferences system accounts not set "
-                    "(GL102000 Retained Earnings + YTD Net Income — GL phase)")
+    async def _glprefs() -> dict[str, Any]:
+        out: dict[str, Any] = {"retained_earnings": None, "ytd_net_income": None,
+                               "configured": None,
+                               "checked_via": "GL102000 Export (screen SOAP)"}
+        try:
+            async with ScreenClient(inst_obj, "GL102000") as sc:
+                rows = (await sc.export(["GLSetupRecord.RetainedEarningsAccount",
+                                         "GLSetupRecord.YTDNetIncomeAccount"],
+                                        top=1)).get("rows")
+            if rows:
+                vals = list(rows[0].values())
+                re_acct = (vals[0] if len(vals) > 0 else None) or None
+                ytd_acct = (vals[1] if len(vals) > 1 else None) or None
+                out.update(retained_earnings=re_acct, ytd_net_income=ytd_acct,
+                           configured=bool(re_acct) and bool(ytd_acct))
+        except Exception as e:  # noqa: BLE001
+            out["error"] = str(e)[:160]
+        return out
 
     # Open periods — no open period means no posting. FinPeriod is empty until the
     # master calendar is generated (GL201000) + periods opened (GL201100).
-    periods = {"any_exist": None, "checked_via": "FinPeriod DAC"}
-    try:
-        pr = await client.run_dac("FinPeriod", {"$top": 1})
-        rows = pr.get("value") if isinstance(pr, dict) else None
-        periods["any_exist"] = bool(rows) if rows is not None else None
-    except Exception as e:  # noqa: BLE001
-        periods["error"] = str(e)[:160]
+    async def _periods() -> dict[str, Any]:
+        out: dict[str, Any] = {"any_exist": None, "checked_via": "FinPeriod DAC"}
+        try:
+            pr = await client.run_dac("FinPeriod", {"$top": 1})
+            prows = pr.get("value") if isinstance(pr, dict) else None
+            out["any_exist"] = bool(prows) if prows is not None else None
+        except Exception as e:  # noqa: BLE001
+            out["error"] = str(e)[:160]
+        return out
+
+    checklist, calendar, feature_activation, gl_preferences, periods = await asyncio.gather(
+        _checklist(), _calendar(), _activation(), _glprefs(), _periods())
+
+    # Gap ORDER is part of this tool's contract (most-blocking first), so it is rebuilt
+    # here in the same sequence the old serial code produced: activation, then calendar,
+    # then the checklist gaps, then GL prefs, then periods.
+    gaps = [
+        f"{c['module']}: {s['step']}"
+        for c in checklist if c["feature_enabled"]
+        for s in c["steps"] if s["exists"] is False
+    ]
+    if bool(feats.get("FinancialModule")) and calendar["exists"] is False:
+        gaps.insert(0, "General Ledger: Financial calendar (GL101000)")
+    if feature_activation.get("installed") is False:
+        gaps.insert(0, "Features: staged but NOT installed — ActivationStatus is "
+                    f"'{feature_activation.get('status')}' (call activate_features)")
+    if bool(feats.get("FinancialModule")) and gl_preferences.get("configured") is False:
+        gaps.append("General Ledger: GL Preferences system accounts not set "
+                    "(GL102000 Retained Earnings + YTD Net Income — GL phase)")
     if bool(feats.get("FinancialModule")) and periods.get("any_exist") is False:
         gaps.append("General Ledger: no financial periods generated/open "
                     "(GL201000 generate calendar → GL201100 open periods — GL phase)")
@@ -7182,11 +7221,16 @@ async def publish_customization(
         waited = 0.0
         last: Any = None
         try:
+            # A publish recompiles the site and rewrites screen metadata, which is
+            # exactly what the cached /structure describes. Drop it now (anything read
+            # mid-recompile is suspect) and again on completion.
+            clear_struct_cache()
             await client.publish_begin(publish_set, tenant_mode, tenant_login_names, options)
             state["phase"] = "publishing"
             while waited < 1800:
                 last = await client.publish_end()
                 if isinstance(last, dict) and last.get("isCompleted"):
+                    clear_struct_cache()
                     state.update(completed=True, failed=bool(last.get("isFailed")), result=last)
                     return
                 await asyncio.sleep(3.0)
@@ -7265,7 +7309,9 @@ async def unpublish_customization(
     """
     _require_publish(instance)
     async with _customization(instance) as c:
-        return await c.unpublish_all(tenant_mode, tenant_login_names)
+        result = await c.unpublish_all(tenant_mode, tenant_login_names)
+    clear_struct_cache()  # site recompiled — cached screen metadata is now stale
+    return result
 
 
 def main() -> None:

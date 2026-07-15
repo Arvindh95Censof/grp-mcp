@@ -31,11 +31,13 @@ def _inst(**over) -> Instance:
 
 @pytest.fixture(autouse=True)
 def _clear_ui_session_cache():
-    """The shared UI-plane cookie cache is module-global; isolate tests from each other."""
+    """The shared UI-plane cookie + /structure caches are module-global; isolate tests."""
     from grp_mcp import screen as _screen
     _screen._SESSION_CACHE.clear()
+    _screen._STRUCT_CACHE.clear()
     yield
     _screen._SESSION_CACHE.clear()
+    _screen._STRUCT_CACHE.clear()
 
 
 @pytest.fixture
@@ -137,9 +139,10 @@ def test_wrap_list_of_rows():
 # ---- modern UI-screen error parser -----------------------------------------
 
 class _Resp:
-    def __init__(self, status: int, body):
+    def __init__(self, status: int, body, headers: dict | None = None):
         self.status_code = status
         self._body = body
+        self.headers = headers or {}
         self.text = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
 
     def json(self):
@@ -306,6 +309,174 @@ def test_update_payload_resends_key_in_values():
     fields = {v["field"]: v["value"] for v in mod["values"]}
     assert fields.get("AccountCD") == "40000" and fields.get("Description") == "New"
     assert ctrl["dataKey"] == {"AccountCD": "40000"} and mod["id"] == "g8"
+
+
+# ---- /structure ETag cache --------------------------------------------------
+#
+# The endpoint's ETag is an ENVIRONMENT stamp, identical for every screen on a
+# tenant (verified live on 25.101: AP301000's etag replayed at GL101000's url
+# returns 304). So the server cannot be relied on to notice a screen mix-up — the
+# cache key has to, which is what these lock.
+
+class _StructHTTP:
+    """Serves /structure with an ETag; 304s when the matching If-None-Match arrives."""
+
+    def __init__(self, bodies: dict, etag: str = 'W/"env-v1"'):
+        self.bodies = bodies          # screen_id -> raw structure body
+        self.etag = etag
+        self.full = 0
+        self.conditional = 0
+        self.sent_inm: list = []
+
+    async def get(self, url, headers=None):
+        h = headers or {}
+        inm = h.get("If-None-Match")
+        self.sent_inm.append(inm)
+        if inm == self.etag:
+            self.conditional += 1
+            return _Resp(304, None, headers={"ETag": self.etag})
+        self.full += 1
+        screen = url.split("/ui/screen/")[1].split("/")[0]
+        return _Resp(200, self.bodies[screen], headers={"ETag": self.etag})
+
+    async def aclose(self):
+        pass
+
+
+def _struct_body(dac: str) -> dict:
+    return {"primaryDacName": dac, "fieldStates": {}, "actionStates": {},
+            "controlsData": {}}
+
+
+def _struct_client(screen: str, http) -> ScreenClient:
+    s = ScreenClient(_inst(), screen)
+    s._logged_in = True
+    s._http = http
+    return s
+
+
+def test_structure_memoized_within_one_client():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    s = _struct_client("GL101000", http)
+    for _ in range(3):
+        asyncio.run(s.get_ui_structure())
+    assert http.full == 1 and http.conditional == 0  # memo: no repeat HTTP at all
+
+
+def test_structure_revalidates_with_etag_across_clients():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    first = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    # a NEW client (as every tool call builds) must revalidate, not re-download
+    second = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    assert http.full == 1 and http.conditional == 1
+    assert http.sent_inm == [None, 'W/"env-v1"']
+    assert second == first
+
+
+def test_structure_cache_does_not_leak_across_screens():
+    # The guard that matters: the server 304s on a matching etag WITHOUT checking the
+    # screen, so a key that ignored screen_id would serve GL101000's metadata for
+    # AP301000. A second screen must therefore be fetched in FULL, never revalidated.
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup"),
+                        "AP301000": _struct_body("APInvoice")})
+    gl = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    ap = asyncio.run(_struct_client("AP301000", http).get_ui_structure())
+    assert gl["primary_dac"] == "FinYearSetup"
+    assert ap["primary_dac"] == "APInvoice"
+    assert http.full == 2 and http.conditional == 0
+    assert http.sent_inm == [None, None]  # no cross-screen etag replay
+
+
+def test_structure_refresh_forces_full_fetch():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    s = _struct_client("GL101000", http)
+    asyncio.run(s.get_ui_structure())
+    asyncio.run(s.get_ui_structure(refresh=True))
+    assert http.full == 2 and http.sent_inm == [None, None]
+
+
+def test_clear_struct_cache_drops_entries():
+    from grp_mcp.screen import clear_struct_cache
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    assert clear_struct_cache()  # returns the keys it dropped
+    asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    # cache was empty -> a full fetch with no conditional header
+    assert http.full == 2 and http.sent_inm == [None, None]
+
+
+class _EchoHTTP:
+    """Like _FakeHTTP, but a Save can ECHO grid rows back (as the real plane does).
+
+    Counts reads vs Saves separately so a test can assert the bulk path stopped
+    re-reading the whole grid between chunks.
+    """
+
+    def __init__(self, read_body: dict, grid: str, echo_rows=None):
+        self.calls: list[dict] = []
+        self.reads = 0
+        self.saves = 0
+        self._read = read_body
+        self._grid = grid
+        self._echo = echo_rows
+
+    async def post(self, url, json=None, headers=None):  # noqa: A002
+        payload = json or {}
+        self.calls.append(payload)
+        if payload.get("command"):
+            self.saves += 1
+            body: dict = {"messages": []}
+            if self._echo is not None:
+                body["controlsData"] = {self._grid: {"rows": self._echo}}
+            return _Resp(200, body)
+        self.reads += 1
+        return _Resp(200, self._read)
+
+    async def aclose(self):
+        pass
+
+
+def _rows(n: int) -> list:
+    return [{"id": f"r{i}", "cells": {"LineNbr": {"value": str(i)}}}
+            for i in range(1, n + 1)]
+
+
+def _bulk(echo_rows, chunk_size=2, n=4):
+    rows = _rows(n)
+    s = _client("GL202500")
+    http = _EchoHTTP(_read_body("Details", [{"field": "LineNbr"}, {"field": "Descr"}],
+                                rows, ["LineNbr"]), "Details", echo_rows=echo_rows)
+    s._http = http
+    out = asyncio.run(s.ui_update_grid_rows(
+        "Details",
+        [{"key": {"LineNbr": str(i)}, "values": {"Descr": f"d{i}"}} for i in range(1, n + 1)],
+        skip_validation=True, chunk_size=chunk_size))
+    return out, http
+
+
+def test_update_grid_rows_reuses_save_echo_instead_of_rereading():
+    # The full-grid echo a Save returns carries fresh row ids, so chunk 2 must be
+    # mapped from it — the whole-grid re-read per chunk was the dominant cost.
+    out, http = _bulk(echo_rows=_rows(4))
+    assert out["updated"] == 4 and out["chunks"] == 2 and out["ok"]
+    assert http.saves == 2
+    assert http.reads == 1  # the initial read only
+
+
+def test_update_grid_rows_rereads_when_save_echoes_nothing():
+    # No echo -> must fall back to a real read, i.e. the old behaviour.
+    out, http = _bulk(echo_rows=None)
+    assert out["updated"] == 4 and out["chunks"] == 2
+    assert http.reads == 2  # initial + one re-read between the chunks
+
+
+def test_update_grid_rows_rereads_on_partial_echo():
+    # A SHORT echo is a delta, not the grid: reusing it would drop rows from the map
+    # and mis-report them as not_found. Must re-read instead.
+    out, http = _bulk(echo_rows=_rows(4)[:1])
+    assert out["updated"] == 4 and out["chunks"] == 2
+    assert out["not_found"] == []
+    assert http.reads == 2
 
 
 def test_delete_payload_sends_key_in_values():
