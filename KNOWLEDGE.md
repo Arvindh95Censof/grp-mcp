@@ -242,6 +242,21 @@ invoice (master-detail w/ computed field), journal batch (balanced debit/credit)
   target screens — use `import_excel` (classic-plane runner).
 - **Grouping:** blank document/batch number + identical header groups source rows into ONE document
   (invoice/batch). For distinct documents, supply a unique reference or force `<NEW>`.
+- **The prepared/staged rows behind a run (`SYData`) and a provider's own field schema
+  (`SYProviderField`, `SYMappingField`, `SYHistory`) have NO DAC-OData collection — not a permission
+  gate, a genuine absence of a route.** They ARE listed as `EntityType`s in the `$metadata` CSDL (so
+  a naive "is this DAC exposed" check says yes), but the platform never registers an `EntitySet` for
+  them, and Acumatica's own service document confirms it (they're absent from both). Verified this
+  is a hard dead end, not a wrong URL: a flat collection `GET`, `?$expand=`, an undeclared navigation
+  segment off a parent that DOES have an EntitySet (`SYMapping`, `SYProviderObject`), and even a
+  **direct fetch by the entity's own composite key** all `404`. Same class as the `DataProvider`
+  contract-REST 404 above, one plane over — Acumatica only gives a standalone OData route to entities
+  meant to be queried independently; pure detail/staging records reachable only through a parent
+  screen don't get one, by design. **Read them via the UI-screen grid instead**
+  (`ui_read_grid`/`screen.ui_grid_read`, `parent={"view": <header view>, "key": {"Name": <scenario>}}`)
+  — that's the only route that exists, works at any scale (proven live: 6,977 prepared rows × 41
+  columns in one call), and every field is right there including `ErrorMessage`/`IsProcessed`/
+  `IsActive` for auditing a run's failures.
 
 ### Prerequisites still apply
 
