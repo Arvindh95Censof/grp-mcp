@@ -99,10 +99,79 @@ instructions; honor it. Pure reads are exempt.
   `dialogCallback:{dialogResult:<WebDialogResult>,viewName:V}` (`OK=1, Cancel=2, Yes=6, No=7`).
 - **`commitChanges` matters:** `commitChanges:true` fields POST per change; `commitChanges:false`
   fields buffer client-side and must ride in the committing request's `data[]`. `Save` returns 200 +
-  empty `messages[]` on success; validation errors come back in `messages[]`.
+  empty `messages[]` on success; *record-level* validation errors come back in `messages[]`.
 - **`graphIsDirty:true` after a field-set is normal** (cleared by Save/Cancel). A **`409` here is a
   business-rule error** (read `messages[]`), *not* a concurrency lock — sessions are isolated by
   their own cookie/graph.
+
+### 4a. THERE ARE NO FIELD-LEVEL ERRORS — a bad value is discarded and WIPES the field
+
+The single most dangerous property of this plane. A field-set response carries **only**
+`{isNewEntry, graphIsDirty, actionStates, actionNamesPerView}` — **no `fieldStates`, no
+`messages`, no error key anywhere**. Do not go looking for a red-field-outline payload; it does
+not exist. An unparseable value is accepted with a **clean 200** and then **thrown away**, taking
+the field's existing value with it:
+
+| field | before | after setting `"NOT-A-DATE"` | what a Save then does |
+|---|---|---|---|
+| required date (e.g. `GL301000.DateEntered`) | a date | **null** | fails loudly — "cannot be empty" |
+| **optional** date (e.g. `AP301000.DueDate`) holding a real value | a date | **null** | **persists the null over your data** |
+
+Required fields are rescued by the required-check. **Optional fields have no protection: this is
+silent data loss.** And `graphIsDirty` is **`true`** throughout — the value genuinely changed, it
+changed to *nothing* — so dirtiness proves only that something moved, never that your value landed.
+
+**The reliable detector is a READ-BACK.** After setting, ask the graph what it now holds
+(`{"data":[], "viewsParams":{<view>:{}}}` returns `fieldStates` with current values; batch every
+view into one POST). **Sent non-blank → field now blank = the value was discarded.** grp-mcp does
+this automatically in `ui_screen_action` (`rejected_fields` on the result).
+
+**Judge blankness ONLY — never value equality.** The plane reformats what it stores: send
+`"01/01/2027"`, read back `"2027-01-01T00:00:00.0000000"`. An equality check fires on every date,
+enum and selector. Blank-after-non-blank is unambiguous; anything cleverer cries wolf.
+
+Screens are **not** consistent here: a few fields have a validating setter that refuses a bad value
+outright, leaving the field **unchanged** and `graphIsDirty` **false** (`GL101000.BegFinYear` does
+this). That case is invisible to a read-back and visible to a clean→clean dirty check — which is
+why grp-mcp runs both guards. Both are partial. **A read-back of the persisted record
+(`run_dac_odata` / `screen_get`) after a Save remains the only proof a write actually landed.**
+
+Metadata guards (`ui_coerce_validate`) catch read-only fields and invalid enums from `/structure`,
+but **cannot** catch an unparseable date — right field, right type name, not read-only. The two
+mechanisms are complementary and neither is sufficient alone.
+
+### 4b. Warning/info toasts, and reading `messages[]` correctly
+
+The top-right toast **is** `messages[]`, typed by `messageType` (`error`/`warning`/`info`). Only
+`error` should raise. **Warnings and info are not failures but they are not noise either** — they
+are how a screen says "I accepted your write and ignored it" ("the period is closed", "already
+generated"). An `ok:true` **with** notices still warrants a read-back. grp-mcp surfaces them as
+`notices` / `@grp.notices` rather than dropping them.
+
+### 4c. `/structure` is the only discovery endpoint — and it caches well
+
+- No slimming exists: `?fields=`, `?parts=`, `?$select=` are **ignored**; `/schema`, `/metadata`,
+  `/fields`, `/views` are `404`; the bare screen path is `405`. You get the whole descriptor.
+- It is **fat** — a document-entry screen runs 250–270 KB (a setup screen, ~15 KB) — and it is a
+  **stateless** GET describing metadata, not record state. So it caches safely.
+- It ships an **`ETag`, so revalidate instead of re-downloading**: a conditional GET is
+  ~100 ms / 0 bytes versus ~280 ms / 270 KB.
+- **TRAP:** that ETag is an **environment stamp, IDENTICAL for every screen on a tenant**
+  (`<build>$<n>$<user>$<tenant>$<locale>$<userid>$$<metadata-version>`), *not* a per-screen content
+  hash. Replaying one screen's ETag at another screen's URL returns **304**. The server will not
+  catch a cache-key mix-up for you — key on screen **and** session identity (the user and locale
+  ride in the stamp), and only ever send an entry's own ETag back to its own URL. The
+  metadata-version segment changes on a customization publish, which invalidates every screen at
+  once — so publishing must drop the whole cache.
+
+### 4d. Graph state is sticky across sessions
+
+`ui_bootstrap` deliberately does **not** send `clearSession` (that would reset company/branch and
+selected-record context, breaking process actions). Because the forms-auth cookie is shared and
+cached, a *later* client can therefore inherit a *previous* one's uncommitted graph state. When you
+need a genuinely clean graph — reproducing a bug, a controlled test — send `clearSession:true`
+explicitly. This trips up A/B comparisons: the "before" of your second case may be the "after" of
+your first.
 - **Grid rows** are addressed by their GUID `id` (from a loaded grid), via
   `activeRowContexts:[{dataView, dataKey:{…}}]` + `rowId`.
 - **Non-200s on `/structure` are informative boundaries:** `409 SetupNotEntered` (module not
@@ -329,9 +398,31 @@ what's missing before driving a screen.
 
 1. Bump `version` in `pyproject.toml` (PyPI rejects duplicate versions).
 2. `python -m build`
-3. `twine upload dist/grp_mcp-<version>*` (version-specific glob, or clear `dist/` first).
-4. Auth: API token (username `__token__`). Users upgrade with `pip install --upgrade grp-mcp` /
+3. **AUDIT THE BUILT ARTIFACTS — not the working tree.** See below. PyPI is permanent: a version
+   can never be reused or truly unpublished.
+4. `twine upload dist/grp_mcp-<version>*` (version-specific glob, or clear `dist/` first).
+5. Auth: API token (username `__token__`). Users upgrade with `pip install --upgrade grp-mcp` /
    `uvx` resolves latest automatically.
+6. Verify what landed: compare the published `sha256`
+   (`https://pypi.org/pypi/grp-mcp/<ver>/json` → `urls[].digests`) against the local file you
+   audited. A digest match is conclusive — no need to re-download and re-scan.
+
+**The audit (step 3) is not optional.** The sdist is public and the build back-end ships the
+working tree by default, which is wider than what you think you wrote:
+
+- Unpack **both** the wheel and the sdist and grep them for real credential values, internal
+  hostnames, client/tenant names, and any local config file. `pyproject.toml` excludes the obvious
+  offenders (agent scratch dirs, virtualenvs, the local connections file, binary docs) — verify,
+  don't assume.
+- **`.gitignore` protects the FILE, not values copied out of it.** A credential pasted into a source
+  comment, a test fixture, or a docstring example is tracked, committed and shipped. Grep the
+  artifacts for the *values*, not just for filenames. (Learned the hard way: a live ERP username
+  reached a built wheel via a comment pasting a captured `ETag`, whose `$<user>$` segment was
+  mistaken for a database name.)
+- Stock Acumatica names (`Company`, `SalesDemo`) are product defaults and fine to ship. Your own
+  tenant names are not.
+- `twine`'s progress bar reports the **multipart body** size (file + README metadata, tens of kB
+  larger), not the file size. That is not a mismatch — check the digest, not the bar.
 
 After upload, PyPI's `info.version` ("latest") can lag the `releases` list by a minute — a version
 is installable as soon as it appears in `releases`.
