@@ -1618,7 +1618,6 @@ def test_filter_condition_aliases():
     assert _normalize_condition({"field": "A", "value": "1", "op": ">="}) == "GreaterOrEqual"
     assert _normalize_condition({"field": "A", "value": "1", "op": ">"}) == "Greater"
     assert _normalize_condition({"field": "A", "value": "1", "op": "!="}) == "NotEqual"
-    assert _normalize_condition({"field": "A", "value": "1", "condition": "Contains"}) == "Contains"
     # canonical names pass through; alias is case-insensitive
     assert _normalize_condition({"field": "A", "value": "1", "op": "STARTSWITH"}) == "StartsWith"
     # default when neither given
@@ -1630,6 +1629,16 @@ def test_filter_rejects_unknown_condition_and_keys():
         _normalize_condition({"field": "A", "value": "1", "op": "~="})   # bad operator
     with pytest.raises(ValueError):
         _normalize_condition({"field": "A", "value": "1", "foo": "bar"})  # unknown key
+
+
+def test_filter_rejects_contains_with_working_alternatives():
+    # bug report 2026-07-10 #5 (reproduced live): the SOAP FilterCondition enum has
+    # no 'Contains' — the server 500s on it. Refuse client-side, point at what works.
+    for spec in ({"condition": "Contains"}, {"op": "contains"}, {"op": "CONTAINS"}):
+        with pytest.raises(ValueError) as e:
+            _normalize_condition({"field": "A", "value": "1", **spec})
+        msg = str(e.value)
+        assert "Contains" in msg and "StartsWith" in msg and "run_dac_odata" in msg
 
 
 def test_fault_boundary_keeps_full_message():
@@ -2858,3 +2867,105 @@ def test_verify_stored_key_none_without_key_fields():
     warn = asyncio.run(s._verify_stored_key(
         "building", g, {"Description": "X"}, {"controlsData": {}}, None))
     assert warn is None
+
+
+# ---- v0.60: external bug-report fixes (2026-07-10 report, validated live) ----
+
+def test_put_operation_infers_created_vs_updated():
+    f = server._put_operation
+    # equal audit stamps -> the PUT inserted (the partial-composite-key tripwire)
+    assert f({"CreatedDateTime": {"value": "2026-07-10T14:52:29.923+08:00"},
+              "LastModifiedDateTime": {"value": "2026-07-10T14:52:29.923+08:00"}}) == "created"
+    # modified moved days later -> update
+    assert f({"CreatedDateTime": {"value": "2026-07-10T14:52:43.73+08:00"},
+              "LastModifiedDateTime": {"value": "2026-07-15T19:22:27.727+08:00"}}) == "updated"
+    # trailing-Z form parses too
+    assert f({"CreatedDateTime": {"value": "2026-07-10T06:00:00Z"},
+              "LastModifiedDateTime": {"value": "2026-07-10T06:00:01Z"}}) == "created"
+    # absent / unparseable stamps -> no claim
+    assert f({}) is None
+    assert f({"CreatedDateTime": {"value": "garbage"},
+              "LastModifiedDateTime": {"value": "2026-07-10T06:00:00Z"}}) is None
+
+
+def test_create_or_update_raises_when_detail_readback_confirms_empty(cfg, monkeypatch):
+    # bug report #6 (reproduced live on Customer.Contacts): PUT echoes the detail
+    # as [], the read-back CONFIRMS it's empty -> must fail loud, not success-shaped.
+    async def fake_put(self, entity, body):
+        return {"id": "RID", "Contacts": []}
+
+    async def fake_get(self, entity, record_id, params=None):
+        return {"id": "RID", "Contacts": []}
+
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    monkeypatch.setattr(AcumaticaClient, "get_entity", fake_get)
+    with pytest.raises(RuntimeError) as e:
+        asyncio.run(server.create_or_update_entity(
+            "Customer", {"CustomerID": "A", "Contacts": [{"DisplayName": "c"}]},
+            instance="rw"))
+    assert "did NOT persist" in str(e.value) and "Contacts" in str(e.value)
+
+
+def test_create_or_update_soft_flags_when_readback_itself_fails(cfg, monkeypatch):
+    # read-back errored -> can't tell either way -> soft _unverified_details, no raise
+    async def fake_put(self, entity, body):
+        return {"id": "RID", "Contacts": []}
+
+    async def fake_get(self, entity, record_id, params=None):
+        raise AcumaticaError("boom")
+
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    monkeypatch.setattr(AcumaticaClient, "get_entity", fake_get)
+    out = asyncio.run(server.create_or_update_entity(
+        "Customer", {"CustomerID": "A", "Contacts": [{"DisplayName": "c"}]},
+        instance="rw"))
+    assert out["_unverified_details"] == ["Contacts"]
+
+
+def test_create_or_update_patches_echo_quirk_from_readback(cfg, monkeypatch):
+    # the known echo quirk: [] echo but the read-back has the rows -> patched in, no raise
+    async def fake_put(self, entity, body):
+        return {"id": "RID", "Contacts": []}
+
+    async def fake_get(self, entity, record_id, params=None):
+        return {"id": "RID", "Contacts": [{"DisplayName": "c"}]}
+
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    monkeypatch.setattr(AcumaticaClient, "get_entity", fake_get)
+    out = asyncio.run(server.create_or_update_entity(
+        "Customer", {"CustomerID": "A", "Contacts": [{"DisplayName": "c"}]},
+        instance="rw"))
+    assert out["Contacts"] == [{"DisplayName": "c"}]
+    assert "_unverified_details" not in out
+
+
+def test_enum_issue_accepts_value_or_text_and_flags_bogus():
+    # bug report #3 (reproduced live on GL202500): Type:'Bogus' persisted as the
+    # silent default 'Asset'. The shared enum check must flag it — and accept
+    # either the option value or its display text, case-insensitively.
+    opts = [{"value": "A", "text": "Asset"}, {"value": "E", "text": "Expense"}]
+    f = ScreenClient._enum_issue
+    bad = f(opts, "Type", "Bogus", "grid column")
+    assert bad is not None and bad["allowed"][0]["text"] == "Asset"
+    assert f(opts, "Type", "A", "grid column") is None        # option value
+    assert f(opts, "Type", "expense", "grid column") is None  # display text, any case
+    assert f(opts, "Type", None, "grid column") is None       # nothing to check
+    assert f(opts, "Type", True, "grid column") is None       # booleans pass
+    assert f(None, "Type", "Bogus", "grid column") is None    # not an enum
+
+
+def test_delete_verify_targets_pairs_nearest_preceding_set():
+    # bug #7 (found during validation cleanup): pair each delete_row with the set
+    # that navigated to the row, so the delete can be read back afterwards.
+    f = ScreenClient._delete_verify_targets
+    cmds = [{"set": "Account", "to": "99801"},
+            {"delete_row": "AccountRecords"},
+            {"action": "Save"}]
+    assert f(cmds) == [("AccountRecords", "Account", "99801")]
+    # no preceding set -> nothing to verify with
+    assert f([{"delete_row": "X"}, {"action": "Save"}]) == []
+    # blank set values are not navigation
+    assert f([{"set": "A", "to": ""}, {"delete_row": "X"}]) == []
+    # the NEAREST preceding set wins
+    cmds2 = [{"set": "A", "to": "1"}, {"set": "B", "to": "2"}, {"delete_row": "X"}]
+    assert f(cmds2) == [("X", "B", "2")]

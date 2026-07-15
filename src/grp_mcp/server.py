@@ -1200,6 +1200,28 @@ async def fetch_all_entities(
     return {"entity": entity, "count": len(rows), "records": rows}
 
 
+def _put_operation(result: dict) -> str | None:
+    """Infer whether a PUT created or updated from the echoed audit stamps:
+    a freshly created record has CreatedDateTime == LastModifiedDateTime (within
+    seconds); an update moves only LastModifiedDateTime. None when the stamps are
+    absent or unparseable. This is the caller's tripwire for the partial-composite-
+    key trap (external bug report 2026-07-10 #1): an intended UPDATE that comes
+    back "_operation": "created" silently inserted a duplicate instead."""
+    from datetime import datetime
+
+    def _parse(v):
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+    created = _parse((result.get("CreatedDateTime") or {}).get("value"))
+    modified = _parse((result.get("LastModifiedDateTime") or {}).get("value"))
+    if created is None or modified is None:
+        return None
+    return "created" if abs((modified - created).total_seconds()) <= 2.5 else "updated"
+
+
 @mcp.tool()
 async def create_or_update_entity(
     entity: str,
@@ -1208,6 +1230,14 @@ async def create_or_update_entity(
     instance: str | None = None,
 ) -> Any:
     """Create or update a record (PUT). Acumatica upserts by key fields.
+
+    COMPOSITE-KEY WARNING (proven live): on a multi-key entity, always supply the
+    FULL key. A partial key does not error — whether it matches the existing
+    record depends on whether the omitted key part's DEFAULT happens to complete
+    it (Invoice.Type defaults right and updates; PurchaseOrder created a duplicate
+    PO). The result carries "_operation": "created"|"updated" inferred from the
+    audit stamps — if you meant to update and see "created", you just inserted a
+    duplicate: delete it and re-PUT with the full key.
 
     entity: e.g. "Customer", "SalesOrder".
     fields: plain field->value map; scalars are auto-wrapped. Detail lines go in
@@ -1221,11 +1251,18 @@ async def create_or_update_entity(
     Three traps on nested DETAIL collections, each proven live:
       • ECHO QUIRK (auto-corrected here): a PUT echoes a detail collection you just
         wrote as `[]` even when it persisted correctly. This tool re-fetches and
-        patches the real values into the result; if that re-fetch fails, the suspect
-        keys carry an `_unverified_details` list naming them — verify those manually.
-      • APPEND-ONLY: a detail array never upserts-by-content — resending identical
-        detail data creates a duplicate row every time. To update or remove an
-        EXISTING row, include its own `id` from a prior get_entity fetch.
+        patches the real values into the result. If the re-fetch CONFIRMS the
+        collection is still empty despite non-empty input, the write truly did not
+        persist and this tool now RAISES (it used to return a success-shaped result
+        with only a soft flag — external bug report 2026-07-10 #6). Only when the
+        re-fetch itself fails do the suspect keys stay `[]` with an
+        `_unverified_details` list naming them — verify those manually.
+      • APPEND vs UPSERT is COLLECTION-SPECIFIC: some detail arrays append on every
+        send (TaxReportingSettings.ReportingGroups — resending identical data
+        duplicates the row), others upsert by natural key (StockItem.UOMConversions
+        updated in place). To update or remove an EXISTING row deterministically,
+        include its own `id` from a prior get_entity fetch; always re-fetch after a
+        repeated nested-detail write to see which behavior you got.
       • That `id` is NOT stable across separate requests. Fetch, then act right away;
         never cache a detail row's id across a later, separate call.
 
@@ -1236,6 +1273,9 @@ async def create_or_update_entity(
     client = _client(instance, endpoint)
     result = await client.put_entity(entity, _wrap_fields(fields))
     if isinstance(result, dict):
+        op = _put_operation(result)
+        if op:
+            result["_operation"] = op
         empty_details = [
             k for k, v in fields.items()
             if isinstance(v, list) and v
@@ -1247,16 +1287,29 @@ async def create_or_update_entity(
                 fresh = await client.get_entity(
                     entity, record_id, {"$expand": ",".join(empty_details)}
                 )
-                still_empty = []
-                for k in empty_details:
-                    if isinstance(fresh, dict) and fresh.get(k):
-                        result[k] = fresh[k]
-                    else:
-                        still_empty.append(k)
-                if still_empty:
-                    result["_unverified_details"] = still_empty
             except Exception:
+                # Can't tell either way — soft flag only (verify manually).
                 result["_unverified_details"] = empty_details
+                return result
+            still_empty = []
+            for k in empty_details:
+                if isinstance(fresh, dict) and fresh.get(k):
+                    result[k] = fresh[k]
+                else:
+                    still_empty.append(k)
+            if still_empty:
+                # Re-fetch SUCCEEDED and the collection is still empty: the nested
+                # write truly did not persist. Fail loud — a success-shaped result
+                # with a soft flag was exactly how this went unnoticed (external
+                # bug report 2026-07-10 #6, Customer.Contacts, reproduced live).
+                raise RuntimeError(
+                    f"nested detail collection(s) {still_empty} on {entity} did NOT "
+                    f"persist — the PUT returned success but a read-back of record "
+                    f"{record_id} shows them EMPTY. Scalar/header fields DID save. "
+                    "This collection likely needs a different write shape on this "
+                    "endpoint (check get_entity_schema / the endpoint definition); "
+                    "verify with get_entity(record_id=..., expand=...)."
+                )
     return result
 
 
@@ -2632,6 +2685,12 @@ async def screen_submit(
     up front (ok:false + `validation_errors`) rather than being accepted by SOAP with
     ok:true and silently dropped; skip_validation=true bypasses.
 
+    DELETE READ-BACK: on some grids delete_row returns the small "persisted" result
+    yet the row SURVIVES (silent no-op — reproduced on GL202500). After an ok Save
+    containing a delete_row, the navigated key is re-Exported: still present →
+    ok flips to false with `delete_verified: false` (use ui_delete_grid_row then);
+    gone → `delete_verified: true`.
+
     Requires "allow_write": true; a sequence containing a `delete_row` (unless
     dry_run) additionally requires "allow_delete": true, so the screen plane can't
     sidestep the delete gate. Opens/closes its own SOAP session so it never holds an
@@ -2662,6 +2721,7 @@ async def screen_insert_rows(
     save: bool = True,
     auto_answer: str | None = None,
     dry_run: bool = False,
+    check_existing: bool = True,
     instance: str | None = None,
 ) -> Any:
     """Insert many grid/detail rows into one container — ONE Submit per row.
@@ -2681,6 +2741,14 @@ async def screen_insert_rows(
     auto_answer: answer a confirmation dialog raised by Save (e.g. "Yes").
     dry_run:   preview — runs the SETs per row, drops each Save, surfaces field
                errors, without leaving dirty state for a later call to inherit.
+    check_existing (default True): on a MASTER grid (no header), each row's key is
+               pre-checked — a classic "insert" of an EXISTING key silently
+               navigates to and OVERWRITES the record in place while reporting ok
+               (reproduced live on GL202500). Conflicts refuse the whole call;
+               pass check_existing=false to intentionally update those records.
+               Detail inserts (header given) skip the check. Invalid ENUM values
+               in grid cells are also now refused pre-write (they used to persist
+               as the silent server default, e.g. Type:'Bogus' saved as 'Asset').
 
     KEY-FIELD PUNCTUATION WARNING (classic plane): this SOAP path routes writes
     through the field's input mask, which SILENTLY REPLACES punctuation in a KEY
@@ -2704,6 +2772,7 @@ async def screen_insert_rows(
         return await s.insert_rows(
             container, rows, header=header, save=save,
             auto_answer=auto_answer, dry_run=dry_run,
+            check_existing=check_existing,
         )
 
 
@@ -2822,7 +2891,10 @@ async def screen_record(
     insert=False (default): set the key field, which NAVIGATES to the existing
         record, then apply `fields` and Save — an in-place edit. Re-runnable.
     insert=True: click Insert to start a fresh record, then set the key + `fields`
-        and Save — a create.
+        and Save — a create. GUARDED: if the key already EXISTS, this refuses
+        instead of letting classic SOAP silently navigate to and OVERWRITE the
+        existing record in place (reproduced live on GL202500/FA201000). To edit
+        the existing record intentionally, call with insert=false.
 
     key_field/fields use friendly schema names (from screen_get_schema; qualify
     "Container.Field" if a name repeats). For grids with many rows per Save use
@@ -2861,12 +2933,14 @@ async def screen_get(
 
     filters: [{"field": "<Friendly>", "value": ..., "condition"/"op": ...}]. The
             condition is an Acumatica name (Equals, NotEqual, Greater, GreaterOrEqual,
-            Less, LessOrEqual, Contains, StartsWith, EndsWith, Between, IsNull,
-            IsNotNull) OR an operator alias via `op` (=, !=, >, >=, <, <=, contains,
-            startswith, ...). Default = Equals. An unrecognized condition or unknown
-            key is REJECTED with an error (it used to silently fall back to Equals and
-            return the wrong rows). Example: [{"field":"AccountRecords.Account",
-            "op":">=","value":"300000"}].
+            Less, LessOrEqual, StartsWith, EndsWith, Between, IsNull, IsNotNull) OR
+            an operator alias via `op` (=, !=, >, >=, <, <=, startswith, ...).
+            Default = Equals. NO 'Contains': the live SOAP FilterCondition enum
+            rejects it (unhandled 500) — use StartsWith/EndsWith here, or
+            run_dac_odata(filter="contains(Field,'text')") for a contains-match.
+            An unrecognized condition or unknown key is REJECTED with an error
+            (it used to silently fall back to Equals and return the wrong rows).
+            Example: [{"field":"AccountRecords.Account","op":">=","value":"300000"}].
 
     Example — read the financial calendar periods (GL101000):
         screen_get("GL101000", ["Periods.PeriodNbr","Periods.StartDate","Periods.Description"])

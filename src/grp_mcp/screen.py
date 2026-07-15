@@ -201,7 +201,7 @@ _NOBIND_LEN = 1500
 # set with no warning. Normalize aliases and REJECT anything unrecognized loudly.
 _FILTER_CONDITIONS = {
     "Equals", "NotEqual", "Greater", "GreaterOrEqual", "Less", "LessOrEqual",
-    "Contains", "StartsWith", "EndsWith", "IsNull", "IsNotNull", "Between",
+    "StartsWith", "EndsWith", "IsNull", "IsNotNull", "Between",
 }
 _CONDITION_ALIASES = {
     "=": "Equals", "==": "Equals", "eq": "Equals", "equal": "Equals", "equals": "Equals",
@@ -210,9 +210,19 @@ _CONDITION_ALIASES = {
     ">=": "GreaterOrEqual", "gte": "GreaterOrEqual", "greaterorequal": "GreaterOrEqual",
     "<": "Less", "lt": "Less", "less": "Less",
     "<=": "LessOrEqual", "lte": "LessOrEqual", "lessorequal": "LessOrEqual",
-    "contains": "Contains", "startswith": "StartsWith", "endswith": "EndsWith",
+    "startswith": "StartsWith", "endswith": "EndsWith",
     "isnull": "IsNull", "isnotnull": "IsNotNull", "between": "Between",
 }
+# 'Contains' was allow-listed here but the live screen-SOAP FilterCondition enum
+# REJECTS it ("Instance validation error: 'Contains' is not a valid value for
+# FilterCondition" — reproduced on 2025R1 and 2026R1), so passing it through only
+# produced an unhandled 500. Refuse it client-side with the working alternatives.
+_NO_CONTAINS_MSG = (
+    "the screen-SOAP FilterCondition enum has no 'Contains' on this platform — "
+    "the server rejects it with an unhandled 500. Use StartsWith/EndsWith here, "
+    "or do the contains-match on the DAC OData plane: "
+    "run_dac_odata(dac, filter=\"contains(Field,'text')\")."
+)
 
 
 def _normalize_condition(flt: dict) -> str:
@@ -226,6 +236,8 @@ def _normalize_condition(flt: dict) -> str:
     raw = flt.get("condition", flt.get("op"))
     if raw is None:
         return "Equals"
+    if str(raw).strip().lower() == "contains":
+        raise ValueError(_NO_CONTAINS_MSG)
     if raw in _FILTER_CONDITIONS:
         return raw
     norm = _CONDITION_ALIASES.get(str(raw).strip().lower())
@@ -234,7 +246,7 @@ def _normalize_condition(flt: dict) -> str:
     raise ValueError(
         f"unrecognized filter condition {raw!r}. Use an Acumatica condition "
         f"({', '.join(sorted(_FILTER_CONDITIONS))}) or an operator alias "
-        f"(=, !=, >, >=, <, <=, contains, startswith, ...).")
+        f"(=, !=, >, >=, <, <=, startswith, endswith, ...).")
 
 # Headers the modern UI-screen protocol (/t/<Tenant>/ui/screen/<ScreenID>) expects.
 _UI_HEADERS = {
@@ -436,6 +448,7 @@ class ScreenClient:
         self._active_tree_context_views: dict | None = None
         self._active_grid_row: dict | None = None  # see ui_select_grid_row
         self._ui_meta: dict[tuple[str, str], dict] | None = None  # (view,field)->meta cache
+        self._grid_enum_memo: dict[str, dict] = {}  # grid view -> column meta (see _validate_sets)
         self._struct: dict | None = None  # per-client /structure memo (see _STRUCT_CACHE)
         self._graph_dirty: bool | None = None   # last observed graphIsDirty (None = unknown)
         self._rejected_sets: list[dict] = []    # sets the plane silently dropped
@@ -2531,6 +2544,68 @@ class ScreenClient:
                 return cont.tag
         return None
 
+    def _container_has_field(self, container: str, friendly: str) -> bool:
+        """True if `friendly` resolves to a field that lives IN `container` (matched
+        on FieldName+ObjectName against the container's own descriptors)."""
+        cont = self._tree.find(container)
+        if cont is None:
+            return False
+        try:
+            el = self._find_field(friendly)
+        except ScreenError:
+            return False
+        fld, obj = el.findtext("FieldName"), el.findtext("ObjectName")
+        return any(ch.findtext("FieldName") == fld and ch.findtext("ObjectName") == obj
+                   for ch in cont)
+
+    @staticmethod
+    def _delete_verify_targets(commands: list[dict]) -> list[tuple[str, str, str]]:
+        """For each delete_row command, pair it with the nearest PRECEDING set — the
+        navigation that selected the row being deleted. Returns
+        [(container, set_field, set_value)]; a delete with no preceding set is
+        skipped (nothing key-like to read back). Pure; container membership of the
+        set field is checked separately by the caller."""
+        out: list[tuple[str, str, str]] = []
+        last_set: tuple[str, str] | None = None
+        for c in commands:
+            if "set" in c and c.get("to") not in (None, ""):
+                last_set = (c["set"], str(c["to"]))
+            elif "delete_row" in c and last_set:
+                out.append((c["delete_row"], last_set[0], last_set[1]))
+        return out
+
+    async def _verify_deletes(self, commands: list[dict], result: dict) -> dict:
+        """Read-back guard for delete_row (found live 2026-07-15): on some grids the
+        classic DeleteRow returns the small 'persisted' SubmitResult (ok:true,
+        ~335 bytes) yet the row SURVIVES — a silent no-op delete (reproduced on
+        GL202500: set Account -> delete_row -> Save 'succeeded', row still there;
+        the same shape on CA203000 deletes fine). After an ok Save that contained a
+        delete_row, re-Export the navigated key: row still present -> flip ok to
+        false and say so. Only fires when the preceding set field belongs to the
+        SAME container being deleted from (a detail delete navigated by a HEADER
+        key would false-alarm otherwise — skipped). Best-effort: an Export error
+        leaves the result untouched."""
+        for container, field, value in self._delete_verify_targets(commands):
+            if not self._container_has_field(container, field):
+                continue  # navigation key is on another container — can't verify
+            try:
+                back = await self.export([field], top=1,
+                                         filters=[{"field": field, "value": value}])
+            except Exception:  # noqa: BLE001 — verification must never break a delete
+                continue
+            if back.get("rows"):
+                result["ok"] = False
+                result["delete_verified"] = False
+                result["error"] = (
+                    f"delete_row on {container!r} reported success but the row "
+                    f"({field} = {value!r}) STILL EXISTS — a classic-SOAP silent "
+                    "no-op delete. Use ui_delete_grid_row (modern plane, key-"
+                    "addressed) to actually delete it."
+                )
+            else:
+                result["delete_verified"] = True
+        return result
+
     @staticmethod
     def _referenced_containers(commands: list[dict]) -> list[str]:
         """Containers named by command specs (the bit before '.' on set/key, or the
@@ -2679,13 +2754,50 @@ class ScreenClient:
                 writable.append(f)
         return writable, readonly
 
+    @staticmethod
+    def _enum_issue(options: list[dict] | None, friendly: str, val,
+                    where: str) -> dict | None:
+        """Pure enum check shared by the form and grid validation paths: accept the
+        option VALUE or its display TEXT (case-insensitive); anything else returns
+        an issue dict (SOAP would silently keep the current/default value). None =
+        fine / not an enum / nothing to check (booleans pass — 'True' vs 'true')."""
+        if not options or val is None or isinstance(val, bool):
+            return None
+        sval = str(val)
+        ok = any(sval == str(o.get("value")) or sval.lower() == str(o.get("text")).lower()
+                 for o in options)
+        if ok:
+            return None
+        return {"field": friendly, "value": val,
+                "problem": f"not a valid option for this {where} (SOAP would silently "
+                           "keep the current/default value)",
+                "allowed": [{"value": o.get("value"), "text": o.get("text")}
+                            for o in options]}
+
+    async def _grid_enum_meta(self, view: str) -> dict[str, dict]:
+        """Column meta {DAC field: {readonly, options}} for a grid view, memoized.
+        Best-effort: {} when the view isn't a grid or the modern plane can't serve
+        it — the caller then skips validation rather than false-flagging."""
+        if view not in self._grid_enum_memo:
+            try:
+                self._grid_enum_memo[view] = await self._grid_col_meta(view, {})
+            except Exception:  # noqa: BLE001 — never block a write on metadata
+                self._grid_enum_memo[view] = {}
+        return self._grid_enum_memo[view]
+
     async def _validate_sets(self, commands: list[dict]) -> list[dict]:
         """Best-effort pre-write validation of {set} commands against modern-plane
         field metadata. Catches two silent-corruption classes: writing a read-only
         field (accepted, ignored, ok:true) and an invalid enum value (accepted,
-        silently no-op/defaulted, ok:true). Only flags fields POSITIVELY identified
-        in the metadata — an unmappable field (grid column, modern plane unreachable)
-        is skipped, never falsely flagged. Returns a list of issue dicts."""
+        silently no-op/defaulted, ok:true). Form fields come from /structure
+        fieldStates; a field NOT there is retried against the GRID column metadata
+        (controlsData valueItems) so grid-row enums are validated too — the gap
+        that let screen_insert_rows persist Type:'Bogus' as the silent default
+        'Asset' (external bug report 2026-07-10 #3, reproduced live). Grid columns
+        get the ENUM check only, not the read-only check: allowUpdate=false means
+        'can't CHANGE an existing row', which a legitimate new-row insert of a key
+        column would trip. Fields identified on neither plane are skipped, never
+        falsely flagged. Returns a list of issue dicts."""
         meta = await self._ui_field_meta()
         if not meta:
             return []
@@ -2701,23 +2813,23 @@ class ScreenClient:
             fld, obj = el.findtext("FieldName"), el.findtext("ObjectName")
             m = meta.get((obj, fld))
             if not m:
-                continue  # grid column / unmapped — skip, don't guess
+                # Not a form field — try the GRID column metadata for this view
+                # (enum check only; see docstring for why not read-only).
+                if obj and fld:
+                    cmeta = await self._grid_enum_meta(obj)
+                    gi = self._enum_issue((cmeta.get(fld) or {}).get("options"),
+                                          c["set"], val, "grid column")
+                    if gi:
+                        issues.append(gi)
+                continue
             if m.get("readonly") or m.get("enabled") is False:
                 issues.append({"field": c["set"], "value": val,
                                "problem": "read-only / not writable — the write is "
                                "accepted by SOAP but silently ignored"})
                 continue
-            opts = m.get("options")
-            if opts and val is not None:
-                sval = str(val)
-                ok = any(sval == str(o.get("value")) or sval.lower() == str(o.get("text")).lower()
-                         for o in opts)
-                if not ok:
-                    issues.append({"field": c["set"], "value": val,
-                                   "problem": "not a valid option (SOAP would silently "
-                                   "keep the current/default value)",
-                                   "allowed": [{"value": o.get("value"), "text": o.get("text")}
-                                               for o in opts]})
+            fi = self._enum_issue(m.get("options"), c["set"], val, "field")
+            if fi:
+                issues.append(fi)
         return issues
 
     async def submit(
@@ -2811,6 +2923,9 @@ class ScreenClient:
                                 "echo, not the small empty result of a persisted "
                                 "write — likely nothing bound. Read the record back."
                             )
+                        # delete_row silent no-op guard — see _verify_deletes.
+                        if ar["ok"] and any("delete_row" in c for c in commands):
+                            ar = await self._verify_deletes(commands, ar)
                         return ar
                     except ScreenError as e2:
                         e = e2  # fall through to diagnostics with the post-answer fault
@@ -2837,6 +2952,19 @@ class ScreenClient:
                 "field_errors": field_errors,
                 "messages": [f["message"] for f in field_errors],
             }
+            # False-negative guard (external bug report 2026-07-10 #4): the PX
+            # "Another process has added the '<DAC>' record" fault is an optimistic-
+            # concurrency (stale graph tstamp) artifact that can fire even though the
+            # row WAS persisted. Reporting it as a plain failure invites a blind retry
+            # -> duplicate row. Name the fault kind and tell the caller to read back.
+            if "another process has added" in str(e).lower():
+                out["fault_kind"] = "concurrent-update"
+                out["warning"] = (
+                    "This specific fault is known to fire even when the write DID "
+                    "persist (stale optimistic-concurrency state). READ THE RECORD "
+                    "BACK (screen_get / run_dac_odata) before retrying — a blind "
+                    "retry risks creating a duplicate."
+                )
             # #4b: an insert/Save fault whose per-field diagnostic came back empty
             # (e.g. "Inserting 'X' record raised at least one error") leaves the caller
             # with nothing actionable. Best-effort: list the screen's REQUIRED fields
@@ -2882,7 +3010,36 @@ class ScreenClient:
                 "by reading the record back; check that navigation selected the "
                 "intended record."
             )
+        # delete_row silent no-op guard — see _verify_deletes.
+        if not dry_run and result["ok"] and any("delete_row" in c for c in commands):
+            result = await self._verify_deletes(commands, result)
         return result
+
+    async def _row_key_field(self, container: str, row: dict) -> tuple[str, str] | None:
+        """Best-effort (friendly_key_field, value) for a row about to be inserted
+        into `container`: prefer a row field that IS one of the grid's key fields
+        (modern /structure dataKeyNames, matched on FieldName+ObjectName); fall
+        back to the row's FIRST field (the master-grid convention). None if the
+        row is empty or the chosen value is blank."""
+        key_names: list[str] = []
+        try:
+            struct = await self.get_ui_structure()
+            key_names = ((struct.get("grids") or {}).get(container) or {}).get("key_fields") or []
+        except Exception:  # noqa: BLE001 — metadata is a nicety here
+            pass
+        for k, v in row.items():
+            if v in (None, ""):
+                continue
+            try:
+                el = self._find_field(k)
+            except Exception:  # noqa: BLE001 — schema may not be loaded; heuristic only
+                continue
+            if el.findtext("ObjectName") == container and el.findtext("FieldName") in key_names:
+                return k, str(v)
+        for k, v in row.items():  # fallback: first non-blank field
+            if v not in (None, ""):
+                return k, str(v)
+        return None
 
     async def insert_rows(
         self,
@@ -2892,6 +3049,7 @@ class ScreenClient:
         save: bool = True,
         auto_answer: str | None = None,
         dry_run: bool = False,
+        check_existing: bool = True,
     ) -> dict:
         """Insert N grid/detail rows into `container`, ONE Submit per row.
 
@@ -2917,10 +3075,44 @@ class ScreenClient:
         isolated (matches the already-safe pattern in screen_bulk_load and the
         modern-plane ui_insert_grid_row).
 
+        check_existing (default True): on a MASTER grid (no header context), each
+        row's key value is pre-checked by Export — a classic-SOAP "insert" of an
+        existing key silently NAVIGATES to and OVERWRITES the record in place while
+        reporting ok (external bug report 2026-07-10 #2, reproduced live on
+        GL202500). Conflicts refuse the WHOLE call before anything is written; pass
+        check_existing=False to intentionally update those records. Detail inserts
+        (header given) skip the check — line keys legitimately repeat across
+        documents.
+
         Returns {ok, row_count, succeeded, failed, results:[{index, ok, ...}], and
         (for back-compat with single-Submit callers) messages/field_errors merged
         across all rows}.
         """
+        if check_existing and header is None and not dry_run and rows:
+            conflicts: list[dict] = []
+            for i, row in enumerate(rows[:25]):  # bound the pre-check round-trips
+                try:  # whole check is best-effort — it must never block an insert
+                    kv = await self._row_key_field(container, row) if isinstance(row, dict) else None
+                    if not kv:
+                        continue
+                    k, v = kv
+                    pre = await self.export([k], top=1,
+                                            filters=[{"field": k, "value": v}])
+                except Exception:  # noqa: BLE001
+                    continue
+                if pre.get("rows"):
+                    conflicts.append({"index": i, "field": k, "value": v})
+            if conflicts:
+                return {
+                    "screen_id": self.screen_id, "ok": False,
+                    "error": f"{len(conflicts)} row(s) already EXIST on "
+                             f"{self.screen_id} — a classic-SOAP 'insert' of an "
+                             "existing key silently OVERWRITES the record in place "
+                             "(still reporting ok). Nothing was written.",
+                    "conflicts": conflicts,
+                    "hint": "Remove those rows, or pass check_existing=false to "
+                            "intentionally update them.",
+                }
         header_cmds = [{"set": k, "to": v} for k, v in (header or {}).items()]
         if header_cmds:
             hres = await self.submit(header_cmds, dry_run=dry_run, auto_answer=auto_answer)
@@ -2967,13 +3159,33 @@ class ScreenClient:
         insert=False (default): set the key field, which NAVIGATES to the existing
             record (via its descriptor's LinkedCommand chain), then set `fields` and
             Save — an in-place edit.
-        insert=True: click Insert first to start a fresh record, then set the key +
-            `fields` and Save — a create.
+        insert=True: click Insert to start a fresh record, then set the key +
+            `fields` and Save — a create. GUARDED (external bug report 2026-07-10
+            #2, reproduced live on GL202500): if the key ALREADY EXISTS, classic
+            SOAP silently navigates to the existing record and OVERWRITES it in
+            place while still reporting ok — so this pre-checks by Export and
+            REFUSES instead. To intentionally edit, call with insert=False.
 
         key_field/fields use friendly schema names (qualify "Container.Field" if a
         name repeats). Returns the submit() result. For grid screens with many rows
         per Save, use insert_rows instead.
         """
+        if insert and not dry_run:
+            try:
+                pre = await self.export([key_field], top=1,
+                                        filters=[{"field": key_field, "value": key_value}])
+            except Exception:  # noqa: BLE001 — best-effort; never block the create
+                pre = {}
+            if pre.get("rows"):
+                return {
+                    "screen_id": self.screen_id, "ok": False, "existing": True,
+                    "error": f"{key_field} = {key_value!r} already EXISTS on "
+                             f"{self.screen_id} — a classic-SOAP 'insert' would "
+                             "silently navigate to the existing record and OVERWRITE "
+                             "it in place (still reporting ok).",
+                    "hint": "To edit the existing record intentionally, call again "
+                            "with insert=false.",
+                }
         cmds: list[dict] = []
         if insert:
             cmds.append({"action": "Insert"})

@@ -558,6 +558,43 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.60.0 — **External bug-report fixes (2026-07-10 report, all findings validated live first).**
+Seven silent-failure/false-signal classes closed, each reproduced (or refuted) against a
+live instance before fixing:
+- **#5 `Contains` filter**: the screen-SOAP `FilterCondition` enum rejects `Contains`
+  (unhandled 500, reproduced on 2025R1 + 2026R1) yet the client allow-listed it. Now
+  refused client-side with the working alternatives (StartsWith/EndsWith, or
+  `run_dac_odata(filter="contains(...)")`).
+- **#3 grid enum validation**: `screen_insert_rows` persisted an invalid enum as the
+  silent server default (`Type:"Bogus"` saved as `Asset`, reproduced on GL202500) —
+  `_validate_sets` only covered form fields. Grid columns are now validated too
+  (enum check via the grid's `valueItems`; read-only deliberately NOT flagged there —
+  `allowUpdate:false` legitimately blocks only updates, not new-row sets).
+- **#2 silent overwrite on "insert"**: classic SOAP navigates to an EXISTING key and
+  edits it in place while reporting ok (reproduced: re-"insert" mutated an account).
+  `screen_record(insert=true)` and `screen_insert_rows` (master grids) now pre-check
+  by Export and refuse; `check_existing=false` opts out intentionally.
+- **#1 partial composite key** (contract PUT): outcome is entity-dependent — the
+  omitted key part's default may or may not complete the match (Invoice updated;
+  the reporter's PO silently duplicated). No reliable server-side guard exists, so the
+  result now carries `"_operation": "created"|"updated"` inferred from the audit
+  stamps: an intended update that returns `created` just inserted a duplicate.
+- **#6 nested-detail silent non-persist**: when the post-PUT read-back CONFIRMS a
+  detail collection is still empty (Customer.Contacts, reproduced live), the tool now
+  RAISES instead of returning a success-shaped result with a soft flag. The soft
+  `_unverified_details` remains only for the can't-tell case (read-back itself failed).
+- **#4 "Another process has added" false-negative**: not reproducible on demand
+  (3/3 clean back-to-back), but the fault can fire after a persisted write — it is now
+  tagged `fault_kind: "concurrent-update"` with a read-back-before-retry warning.
+- **NEW #7 (found during validation): silent no-op classic delete** — on GL202500,
+  `delete_row` + Save returned the small "persisted" result yet the row survived.
+  After an ok Save containing a `delete_row`, the navigated key is re-Exported:
+  still present → `ok:false` + `delete_verified:false` (use `ui_delete_grid_row`);
+  gone → `delete_verified:true`.
+Also: the `create_or_update_entity` docstring no longer claims detail arrays "always
+append" — append vs upsert-by-natural-key is collection-specific. 214 tests green;
+every guard verified live on a 2026R1 SalesDemo before release.
+
 v0.52.6 — **Key-mangle guard corrected to the right plane + broadened to truncation.**
 Live testing on CS205010 revealed the two plumbing planes alter keys DIFFERENTLY:
 the **classic** `screen_insert_rows` replaces punctuation in a key with spaces
