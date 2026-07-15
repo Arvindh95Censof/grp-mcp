@@ -13,7 +13,7 @@
  * edits do NOT need a customization publish) and is usable via the grp-mcp API.
  *
  * USAGE (PowerShell):
- *   $env:GRP_BASE="https://csmdev.censof.com/2025R1Setup"
+ *   $env:GRP_BASE="https://erp.example.com/2025R1Setup"
  *   $env:GRP_USER="<your-user>"; $env:GRP_PASS="********"
  *   $env:NODE_PATH=(npm root -g)
  *   node add_endpoint_entity.js --endpoint GRPSetup --version 24.200.001 `

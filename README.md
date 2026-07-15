@@ -623,7 +623,7 @@ So no clone tool ships; the one real fix kept from that work is `ScreenClient.ui
 answering `openMessageBox` (yes/no) confirmations, not just `openDialog` panels. 168 tests pass.
 
 v0.52.0 — **AR master-detail import PROVEN end-to-end + recipe hardened.** A committed AR301000
-invoice (BaseQty populated, zero errors) landed via the import pipeline on csmdev/AI MPM. The
+invoice (BaseQty populated, zero errors) landed via the import pipeline on a live tenant. The
 two failure modes that made every prior AR import silently fail `'BaseQty' cannot be empty` are
 now caught by a **preflight** in `build_import_scenario` (`warnings`): (1) a numeric field
 (Qty/Amount/Price) mapped to a **bare literal** — the import reads it as a source COLUMN name,
@@ -860,7 +860,7 @@ failure, falls back to the contract endpoint **`POST /entity/auth/login`** → t
 cookie that authorizes `/ui/screen/*` — so `ui_get_structure` and every modern-plane tool now
 work headlessly on SOAP-disabled instances (verified live: csmdev `PY101500`/`GL101000`
 structure). The contract login takes `company` **separately** (not `name@tenant`), which is
-required for tenants whose login has spaces (`AI MPM`); logout routes to `/entity/auth/logout`
+required for tenants whose login has spaces (e.g. `My Tenant`); logout routes to `/entity/auth/logout`
 for cookie sessions. Normal SOAP-enabled instances are unchanged. v0.41: a batch of fixes + calendar teardown from
 a live-probing session. **`delete_financial_year`**/**`reset_calendar`** tear down Master-Calendar
 years (GL201000 navigate→Delete, verified live). **`create_financial_calendar`** now drives the

@@ -1,6 +1,6 @@
 [project]
 name = "grp-mcp"
-version = "0.56.0"
+version = "0.57.0"
 description = "MCP server exposing Acumatica ERP (contract-based REST API) as tools for AI agents. Multi-instance, OAuth2."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,18 @@ grp-mcp-ui = "grp_mcp.ui:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The sdist is PUBLIC. By default hatchling ships the whole working tree, which swept in
+# a stale .claude/worktrees/ copy of the entire source (a second, divergent grp_mcp that
+# is not what anyone installs) plus local agent scratch. Ship the code, tests and docs —
+# nothing else.
+[tool.hatch.build.targets.sdist]
+exclude = [
+  ".claude",
+  ".venv",
+  "connections.json",   # local ERP credentials — also gitignored; never package it
+  "*.docx",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/grp_mcp"]

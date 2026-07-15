@@ -11,7 +11,7 @@
  *      type Action Name -> OK -> Save.
  *
  * USAGE (PowerShell):
- *   $env:GRP_BASE="https://csmdev.censof.com/2025R1Setup"
+ *   $env:GRP_BASE="https://erp.example.com/2025R1Setup"
  *   $env:GRP_USER="<user>"; $env:GRP_PASS="********"; $env:NODE_PATH=(npm root -g)
  *   # one action:
  *   node add_endpoint_action.js --endpoint GRPSetup --version 24.200.001 \

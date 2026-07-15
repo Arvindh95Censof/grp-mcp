@@ -66,9 +66,9 @@ def _session_lock(key: str) -> asyncio.Lock:
 # parsed projection.
 #
 # CAUTION — the ETag is NOT a per-screen content hash. It is an environment stamp that
-# is IDENTICAL for every screen on a tenant:
-#     25.101.0153.0049$0$<user>$<tenant>$en-MY$61$$28323058
-#     build            $?$db         $tenant      $locale$user$$metadata-version
+# is IDENTICAL for every screen on a tenant, of the shape:
+#     <build>$<n>$<user>$<tenant>$<locale>$<userid>$$<metadata-version>
+# e.g. 24.200.0001$0$jdoe$MyTenant$en-US$61$$28323058
 # Verified live: sending AP301000's ETag to GL101000's URL returns 304. The server does
 # NOT scope the validator per screen, so a cache that mixes up keys will silently serve
 # the WRONG screen's structure. Hence the key includes screen_id and we only ever send
@@ -531,7 +531,7 @@ class ScreenClient:
 
         NOTE the login SHAPE differs from SOAP: the contract login takes `company`
         SEPARATELY (not name@tenant), which is required for tenants whose login name has
-        spaces (e.g. 'AI MPM'). Does NOT hold a Web Services API SOAP seat.
+        spaces (e.g. 'My Tenant'). Does NOT hold a Web Services API SOAP seat.
         """
         body: dict = {"name": self.instance.username, "password": self.instance.password}
         if self.instance.tenant:

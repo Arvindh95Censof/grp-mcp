@@ -151,7 +151,7 @@ without a browser, use grp-mcp `get_dac_metadata("<DAC>")`.
 ## Run
 
 ```powershell
-$env:GRP_BASE="https://csmdev.censof.com/2025R1Setup"
+$env:GRP_BASE="https://erp.example.com/2025R1Setup"
 $env:GRP_USER="<your-user>"; $env:GRP_PASS="********"
 $env:NODE_PATH=(npm root -g)               # use the global Playwright install
 npx playwright install chromium            # once

@@ -1932,8 +1932,8 @@ class _FakeResp:
 
 
 def test_cookie_login_sends_company_separately():
-    # tenant with a space (like csmdev 'AI MPM') MUST go in `company`, not name@tenant
-    inst = _inst(username="csmarvindh", tenant="AI MPM", password="pw")
+    # a tenant whose name has a space MUST go in `company`, not name@tenant
+    inst = _inst(username="jdoe", tenant="My Tenant", password="pw")
     s = ScreenClient(inst, "PY101500")
     captured = {}
 
@@ -1945,7 +1945,7 @@ def test_cookie_login_sends_company_separately():
     s._http.post = fake_post
     asyncio.run(s._cookie_login())
     assert s._logged_in is True and s._cookie_session is True
-    assert captured["json"] == {"name": "csmarvindh", "password": "pw", "company": "AI MPM"}
+    assert captured["json"] == {"name": "jdoe", "password": "pw", "company": "My Tenant"}
     assert "@" not in captured["json"]["name"]
     assert captured["url"].endswith("/entity/auth/login")
 

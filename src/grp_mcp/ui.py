@@ -90,7 +90,7 @@ PAGE = """<!DOCTYPE html>
   <div class="grid">
     <div><label>Name *</label><input type="text" id="name" placeholder="financenew"></div>
     <div><label>Tenant</label><input type="text" id="tenant" placeholder="CSM"></div>
-    <div class="full"><label>Base URL *</label><input type="text" id="base_url" placeholder="https://financenew.censof.com/censof"></div>
+    <div class="full"><label>Base URL *</label><input type="text" id="base_url" placeholder="https://erp.example.com/Site"></div>
     <div><label>Endpoint name</label><input type="text" id="endpoint_name" placeholder="Default"></div>
     <div><label>Endpoint version</label><input type="text" id="endpoint_version" placeholder="24.200.001"></div>
     <div><label>Client ID *</label><input type="text" id="client_id" placeholder="GUID@Tenant"></div>

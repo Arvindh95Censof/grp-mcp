@@ -7,7 +7,7 @@
  * entity's contract (header + every detail view).
  *
  * USAGE (PowerShell):
- *   $env:GRP_BASE="https://csmdev.censof.com/2025R1Setup"
+ *   $env:GRP_BASE="https://erp.example.com/2025R1Setup"
  *   $env:GRP_USER="<user>"; $env:GRP_PASS="********"; $env:NODE_PATH=(npm root -g)
  *   node populate_all_views.js --endpoint GRPSetup --version 24.200.001 --entity DataProvider
  *     [--skip "Field Command Editor,Object Command Editor"]   # views to skip
