@@ -36,7 +36,8 @@ _KB_FIRST_POLICY = (
     "attach_file, set_note, screen_submit, screen_insert_rows, screen_record, "
     "set_segment_value, create_segmented_key, create_ledger, chart_of_accounts, "
     "create_financial_calendar, enable_features, run_import_scenario, "
-    "ui_screen_action, ui_insert_grid_row, ui_update_grid_row, ui_delete_grid_row, "
+    "ui_screen_action, ui_insert_grid_row, ui_update_grid_row, ui_update_grid_rows, "
+    "ui_delete_grid_row, "
     "or any other write — FIRST consult the Acumatica knowledge base (the kb-mcp server: "
     "search_kb, then read_kb_file) for that screen/entity and the specific action. "
     "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
@@ -1485,6 +1486,10 @@ async def screen_capabilities(screen_id: str, instance: str | None = None) -> An
         recs.append({"operation": "edit an existing grid row in place",
                      "plane": "modern", "tool": "ui_update_grid_row",
                      "why": "row addressed by key; SOAP RowNumber does not move the cursor."})
+        recs.append({"operation": "edit MANY existing grid rows",
+                     "plane": "modern", "tool": "ui_update_grid_rows",
+                     "why": "one read + one Save per chunk; ui_update_grid_row re-reads the "
+                            "whole grid per row, which does not scale past a handful."})
         recs.append({"operation": "append detail/grid rows in bulk",
                      "plane": "SOAP", "tool": "screen_insert_rows",
                      "why": "one Save commits N new rows; simplest for pure appends."})
@@ -2498,6 +2503,57 @@ async def ui_update_grid_row(
         return res  # validation refusal — surface it instead of a bogus success
     return {"screen_id": screen_id.upper(), "grid_view": grid_view,
             "key": key, "values": values, "parent": parent, "ok": True}
+
+
+@mcp.tool()
+async def ui_update_grid_rows(
+    screen_id: str,
+    grid_view: str,
+    updates: list[dict],
+    parent: dict | None = None,
+    skip_validation: bool = False,
+    chunk_size: int = 100,
+    instance: str | None = None,
+) -> Any:
+    """Edit MANY existing GRID rows in ONE pass — the bulk peer of ui_update_grid_row.
+
+    Reach for this whenever you have more than a handful of rows to change.
+    ui_update_grid_row re-reads the WHOLE grid to locate each single row, so N rows
+    cost N full reads; on a 6977-row grid (~1.6 MB per read) that is minutes of
+    wall-clock, and firing them concurrently to compensate saturates the instance
+    and trips MCP timeouts (-32001). The modern plane's changes.modified channel
+    takes a LIST, so this locates every row in ONE read and commits them in ONE
+    Save: ~chunk_size times fewer round-trips.
+
+    updates: [{"key": {keyField: value}, "values": {field: newValue}}, ...] — `key`
+        is the grid's live key (ui_get_structure grids[...].key_fields); `values`
+        are the cells to change (booleans as true/false). Same per-row shape as
+        ui_update_grid_row.
+    parent: MASTER-DETAIL — {"view", "key"} to target a CHILD grid under a header
+        record (see ui_read_grid). Omit for a top-level grid.
+    chunk_size: rows committed per Save (default 100). The grid is re-read before
+        each chunk, since a Save returns fresh row ids.
+
+    PER-ROW ISOLATION: a key matching no row lands in `not_found`, a cell failing
+    validation in `validation_errors` — neither aborts the batch, so a partial run
+    tells you exactly which rows need attention (like screen_bulk_load).
+
+    Requires allow_write; KB-first policy applies. Verify with ui_read_grid /
+    run_dac_odata. Returns {ok, total, updated, chunks, not_found, validation_errors}.
+
+    Example — deactivate 3 prepared-import rows in one Save (SM206036):
+        ui_update_grid_rows("SM206036", "PreparedData",
+            updates=[{"key": {"MappingID": mid, "LineNbr": n}, "values": {"IsActive": False}}
+                     for n in (479, 481, 482)],
+            parent={"view": "MappingsSingle", "key": {"Name": "My Scenario"}})
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        res = await s.ui_update_grid_rows(grid_view, updates, parent,
+                                          skip_validation, chunk_size)
+    return {"screen_id": screen_id.upper(), "grid_view": grid_view,
+            "parent": parent, **res}
 
 
 @mcp.tool()
@@ -6343,7 +6399,8 @@ _GUIDE = {
         "modern UI-JSON": "what classic SOAP can't: dialog actions that SOAP silently "
             "no-ops (e.g. GL201000 Generate), grid-CELL edits, row-scoped actions, "
             "processes, selector lookups. Tools: ui_get_structure, ui_screen_action, "
-            "ui_read_grid, ui_insert_grid_row, ui_update_grid_row, ui_delete_grid_row, "
+            "ui_read_grid, ui_insert_grid_row, ui_update_grid_row, ui_update_grid_rows, "
+            "ui_delete_grid_row, "
             "ui_grid_row_action, ui_run_process, ui_lookup, ui_resolve_selector, "
             "ui_preflight, ui_tree_dialog_insert, ui_populate_endpoint_entity_fields.",
     },
@@ -6363,7 +6420,10 @@ _GUIDE = {
             "ui_preflight (dry-run validate a modern write first)"],
         "grid rows": ["screen_insert_rows (bulk append, classic)",
             "ui_insert_grid_row / ui_update_grid_row / ui_delete_grid_row (modern, "
-            "key-addressed, cell-validated)", "ui_grid_row_action (select row + fire action)"],
+            "key-addressed, cell-validated)",
+            "ui_update_grid_rows (edit MANY rows: one read + one Save per chunk; "
+            "ui_update_grid_row re-reads the whole grid per row and does not scale)",
+            "ui_grid_row_action (select row + fire action)"],
         "run a process / mass-action": ["ui_run_process (Process/ProcessAll to completion)",
             "manage_financial_periods, generate_master_calendar (GL recipes)"],
         "financial-foundation / GL setup": ["get_setup_guidance FIRST (per-screen prereqs, "

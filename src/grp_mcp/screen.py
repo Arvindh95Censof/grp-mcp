@@ -1908,6 +1908,70 @@ class ScreenClient:
         return await self._grid_save(grid_view, g, {"modified": [change]}, full,
                                      "ui_update_grid_row", parent)
 
+    async def ui_update_grid_rows(self, grid_view: str, updates: list[dict],
+                                  parent: dict | None = None,
+                                  skip_validation: bool = False,
+                                  chunk_size: int = 100) -> dict:
+        """Update MANY existing grid rows — ONE grid read + ONE Save per chunk.
+
+        The bulk peer of ui_update_grid_row, which re-reads the ENTIRE grid to
+        resolve one row's id+index: N rows cost N full reads, and on a big grid
+        (6977 prepared-import rows, ~1.6 MB a read) that is minutes of wall-clock
+        and enough concurrent load to blow the MCP request timeout. changes.modified
+        is already a LIST server-side, so batching is the fix: locate every target
+        row in one read, commit the batch in one Save.
+
+        updates:    [{"key": {keyField: value}, "values": {field: newValue}}, ...]
+        chunk_size: rows per Save. The grid is RE-READ before each chunk — a Save
+            returns fresh row ids, so reusing a stale read across Saves would send
+            ids the server no longer honours.
+
+        A row whose key matches nothing is collected in `not_found` and a row whose
+        cells fail validation in `validation_errors`; neither aborts the run (the
+        rest still commit), mirroring screen_bulk_load's per-row isolation.
+        Returns {ok, total, updated, chunks, not_found, validation_errors}.
+        """
+        if not updates:
+            return {"ok": True, "total": 0, "updated": 0, "chunks": 0,
+                    "not_found": [], "validation_errors": []}
+        not_found: list[dict] = []
+        refusals: list[dict] = []
+        updated = chunks = 0
+        step = max(int(chunk_size), 1)
+        for start in range(0, len(updates), step):
+            batch = updates[start:start + step]
+            g = await self.ui_grid_read(grid_view, parent)
+            # column meta is per-grid, not per-row — resolve once per chunk rather
+            # than paying _grid_write_guard's lookup for every row.
+            cmeta = {} if skip_validation else await self._grid_col_meta(grid_view, g)
+            changes: list[dict] = []
+            last_full: dict | None = None
+            for u in batch:
+                key, vals = u["key"], u["values"]
+                if cmeta:
+                    vals, issues = self._grid_validate_coerce(cmeta, vals)
+                    if issues:
+                        refusals.append({"key": key, "validation_errors": issues})
+                        continue
+                idx, row = self._locate_row(g["rows"], key)
+                if row is None:
+                    not_found.append(key)
+                    continue
+                full = self._full_key(row, g["key_names"]) or key
+                changes.append({"id": row.get("id"), "index": idx,
+                                "values": self._kv(full) + self._kv(vals)})
+                last_full = full
+            if not changes:
+                continue
+            # dataKey mirrors the browser: the row the cursor ends on after the edits.
+            await self._grid_save(grid_view, g, {"modified": changes}, last_full,
+                                  "ui_update_grid_rows", parent)
+            updated += len(changes)
+            chunks += 1
+        return {"ok": not refusals and not not_found, "total": len(updates),
+                "updated": updated, "chunks": chunks,
+                "not_found": not_found, "validation_errors": refusals}
+
     async def ui_insert_grid_row(self, grid_view: str, values: dict,
                                  parent: dict | None = None,
                                  skip_validation: bool = False) -> dict:
