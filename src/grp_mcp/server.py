@@ -1218,29 +1218,19 @@ async def create_or_update_entity(
 
     Requires the instance's "allow_write": true (default is read-only).
 
-    Detail-collection echo quirk (auto-corrected): Acumatica's PUT response
-    echoes a nested detail collection you just wrote as `[]` even when it
-    persisted correctly (proven on TaxReportingSettings.ReportingGroups,
-    Tax.TaxSchedule, TaxCategory.Details, TaxZone.ApplicableTaxes — all `[]` on
-    write, all present on read-back). When that happens here, this tool
-    automatically re-fetches the record by id with those fields expanded and
-    patches the real values into the result — so what you get back is always
-    the true persisted state, not a misleading empty array. If that re-fetch
-    itself fails (rare), the suspect keys are still `[]` but the result carries
-    an `_unverified_details` list naming them — verify those manually with
-    get_entity(..., expand=...) before trusting them.
+    Three traps on nested DETAIL collections, each proven live:
+      • ECHO QUIRK (auto-corrected here): a PUT echoes a detail collection you just
+        wrote as `[]` even when it persisted correctly. This tool re-fetches and
+        patches the real values into the result; if that re-fetch fails, the suspect
+        keys carry an `_unverified_details` list naming them — verify those manually.
+      • APPEND-ONLY: a detail array never upserts-by-content — resending identical
+        detail data creates a duplicate row every time. To update or remove an
+        EXISTING row, include its own `id` from a prior get_entity fetch.
+      • That `id` is NOT stable across separate requests. Fetch, then act right away;
+        never cache a detail row's id across a later, separate call.
 
-    Two more real gotchas on nested detail arrays (proven on TaxReportingSettings.
-    ReportingGroups): (1) a detail array ALWAYS APPENDS, never upserts-by-content —
-    resending identical detail data creates a duplicate row every time; to update
-    or remove an EXISTING row you must include its own `id` (from a prior
-    get_entity fetch): `{"id": <id>, ...changed fields...}` to update, or
-    `{"id": <id>, "delete": true}` to remove (id/delete stay bare, never
-    {"value":...}-wrapped). (2) That `id` is NOT stable across separate requests —
-    two consecutive fetches of the same record can return different ids for the
-    same rows — but it DOES remain valid for an action issued immediately after
-    the fetch that produced it. Fetch, then act right away; never cache a detail
-    row's id across a later, separate call.
+    Full detail-row shapes, live-proven entities + rationale:
+    guide(topic="create_or_update_entity").
     """
     _require_write(instance)
     client = _client(instance, endpoint)
@@ -1574,23 +1564,20 @@ async def tree_triage(screen_id: str, instance: str | None = None) -> Any:
     "Import ..." form) and returns the best tier found:
 
       TIER 1  grid+indent   — a real grid + Left/Right (indent/outdent) actions, on THIS
-                              screen OR a companion "Import ..." form. Drivable via
-                              ui_insert_grid_row + ui_screen_action("Right")xdepth. BEST.
-                              (Company Tree: dead on EP204061, drivable on EP204060.)
-      TIER 2  parent-field  — a grid/view row carries a settable Parent* field; set it
-                              directly on ui_insert_grid_row. Pure API.
-      TIER 3  select-cmd    — a tree with a working node-select command (ui_screen_action
-                              tree_select / ui_tree_dialog_insert; e.g. SM207060). CAVEAT:
-                              fails if the tree is VIRTUALIZED (only the root node
-                              materializes) — selection then null-refs (proven live on
-                              EP204061 MoveWorkGroup). Verify with ui_read_grid(tree).
-      TIER 4  import        — a companion "Import ..." screen exists (may load a flat file
-                              with a parent column) even without indent actions.
+                              screen OR a companion "Import ..." form. BEST.
+      TIER 2  parent-field  — a row carries a settable Parent* field. Pure API.
+      TIER 3  select-cmd    — a tree with a working node-select command. CAVEAT: fails
+                              if the tree is VIRTUALIZED — selection then null-refs.
+                              Verify with ui_read_grid(tree).
+      TIER 4  import        — a companion "Import ..." screen exists, even without
+                              indent actions.
       TIER 5  browser-only  — no API lever found; last resort is Playwright/kapture.
 
     Returns {screen_id, title, best_tier, verdict, levers:{...evidence...},
     recommended_tool}. Read-only (probes /structure + SiteMap; holds one shared seat).
     Advisory — confirm the live path with a small write before trusting it at scale.
+
+    What each tier means, its driving tools + live-proven screens: guide(topic="tree_triage").
     """
     inst = _cfg().get(instance or _cfg().default)
     sid = screen_id.upper()
@@ -1723,32 +1710,23 @@ async def ui_resolve_selector(
     The modern-plane equivalent of clicking a field's magnifier, typing a search,
     and picking a row — needed before ui_screen_action can set a SELECTOR field
     (per ui_get_structure's `selector` marker; e.g. SM207060 CreateEntityView's
-    ScreenID). Setting a selector field's plain text directly does not work.
-    No browser capture needed per field — a selector's own /structure metadata
-    carries everything needed to query it, so this works on ANY selector field
-    on ANY screen (reverse-engineered + proven live, 2026-07-02).
+    ScreenID). Setting a selector field's plain text directly does not work. Works
+    on ANY selector field on ANY screen — no per-field browser capture needed.
 
     search: free-text match against the field's own search column (its display
         text, e.g. a screen's Title).
     pick:   optional {column: value} to disambiguate when `search` alone matches
-        multiple rows — Acumatica routinely has duplicate titles across modules
-        (e.g. "Companies" matches both a Generic Inquiry, CS1015PL — NOT usable as
-        an entity source — and the real maintenance screen, CS101500). ALWAYS
-        check `rows` before trusting `value` when more than one row comes back;
-        picking the wrong one fails a downstream entity-add silently.
+        multiple rows. AMBIGUITY IS THE TRAP: Acumatica routinely has duplicate
+        titles across modules, and picking the wrong one fails a downstream
+        entity-add SILENTLY. ALWAYS check `rows` before trusting `value` when more
+        than one row comes back.
 
     Returns {view, field, search, row_count, rows, value?}. `value` (ready to pass
     straight into ui_screen_action's set_fields) is present only when exactly one
     row matches. Read-only (no gate) — this only queries, never sets anything.
 
-    Example — resolve then set (two calls, same screen; see ui_screen_action for
-    why selection state needs tree_select on the SAME call as the set/action):
-        r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
-                                 search="Companies", pick={"screenID": "CS101500"})
-        ui_screen_action("SM207060", action="InsertNew",
-            tree_select={"view": "EntityTree", "key": {"Key": "ROOT#GRPMCP"}},
-            set_fields=[{"view": "CreateEntityView", "field": "ObjectName", "value": "Companies"},
-                        {"view": "CreateEntityView", "field": "ScreenID", "value": r["value"]}])
+    Live-proven duplicate-title cases + a resolve-then-set example:
+    guide(topic="ui_resolve_selector").
     """
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -2021,39 +1999,31 @@ async def ui_grid_row_action(
     the "click a row in the grid, then hit a toolbar button" flow.
 
     Closes the one thing the classic screen-SOAP plane structurally CANNOT do: it
-    navigates to a keyed MASTER record fine, but cannot select an arbitrary
-    existing GRID row by key, so a process-the-selected-row action is impossible
-    there (proven live 2026-07-02: SM203520 Restore Snapshot faulted "A snapshot is
-    not selected" via SOAP because the Snapshots row could not be made active). The
+    navigates to a keyed MASTER record fine, but cannot select an arbitrary existing
+    GRID row by key, so a process-the-selected-row action is impossible there. The
     modern plane addresses the row via activeRowContexts, which this drives.
 
     grid_view: the grid container/view (from ui_get_structure `grids`, e.g.
         "Snapshots" on SM203520).
     row_key:   {keyField: value} identifying the row (keys from ui_get_structure
-        grids[grid_view].key_fields, e.g. {"SnapshotID": "459edf6a-..."}).
+        grids[grid_view].key_fields).
     action:    the internal command to fire with that row active (from
         ui_get_structure `actions`, e.g. "importSnapshotCommand").
     parent:    tenant-scoped / master-detail screens — {"view", "key"} to load the
-        header first (e.g. SM203520 {"view":"Companies","key":{"CompanyID":3}} to
-        target the SalesDemo tenant). Omit for a top-level grid.
+        header first. Omit for a top-level grid.
     confirm:   auto-answer a confirmation dialog with OK (default True). False =
         "arm without firing": the action opens its dialog but is NOT committed
         (status "dialog_open") — a safe dry-run for a destructive action.
 
     Returns {ok, status, ...}. status is "committed" (ran / dialog answered),
     "dialog_open" (confirm=False), or "redirected" (server answered with a goTo —
-    e.g. Restore hands off to SM203510 to run/monitor; that is NOT a synchronous
-    completion, so verify the downstream effect yourself). Validates grid_view +
-    action against /structure first (both silently no-op if wrong on this
-    protocol). Requires allow_write for a committing action.
+    that is NOT a synchronous completion, so verify the downstream effect yourself).
+    Validates grid_view + action against /structure first (both silently no-op if
+    wrong on this protocol). Requires allow_write for a committing action.
 
     PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
 
-    Example — restore a snapshot into the SalesDemo tenant on SM203520:
-        ui_grid_row_action("SM203520", grid_view="Snapshots",
-            row_key={"SnapshotID": "459edf6a-70e3-4d88-ae5d-235b761e34c9"},
-            action="importSnapshotCommand",
-            parent={"view": "Companies", "key": {"CompanyID": 3}})
+    Live proof of the SOAP gap + a worked example: guide(topic="ui_grid_row_action").
     """
     if confirm:
         _require_write(instance)
@@ -2099,10 +2069,9 @@ async def ui_tree_dialog_insert(
     call reproduces. The end-to-end capability behind adding an entity to a
     web-service endpoint (SM207060); generalizes to any tree+insert-dialog screen.
 
-    Reverse-engineered + proven live from a full browser capture (2026-07-02): the
-    UI performs a 5-phase sequence — select node, OPEN the dialog, Repaint to load
-    its fields, FILL them, then COMMIT the dialog (which only STAGES the node) plus
-    a SEPARATE Save to PERSIST. This tool runs all of it in one session.
+    Runs the UI's whole 5-phase sequence in one session (select node, OPEN the dialog,
+    Repaint to load its fields, FILL them, then COMMIT the dialog — which only STAGES
+    the node — plus a SEPARATE Save to PERSIST).
 
     tree_view/node_key/parent_key: identify the tree + node to insert under (from
         ui_read_grid; e.g. "EntityTree", {"Key": "ROOT#GRPMCP"}). parent_key omitted
@@ -2110,14 +2079,13 @@ async def ui_tree_dialog_insert(
     open_action: the tree's insert command (from ui_get_structure `actions`; e.g.
         "InsertNew" on SM207060).
     dialog_view: the popup view name (e.g. "CreateEntityView" on SM207060).
-    fields:      [{"field": <name>, "value": <value>}] to fill the dialog. For a
-        SELECTOR field (per ui_get_structure's `selector` marker; e.g. ScreenID)
-        resolve it FIRST with ui_resolve_selector and pass its `value` ({id,text})
-        here unchanged. A required-looking field the server fills itself at commit
-        (e.g. SM207060's EntityType, resolved from ScreenID) can be omitted.
+    fields:      [{"field": <name>, "value": <value>}] to fill the dialog. A SELECTOR
+        field (per ui_get_structure's `selector` marker) must be resolved FIRST with
+        ui_resolve_selector and its `value` ({id,text}) passed here unchanged. A
+        required-looking field the server fills itself at commit can be omitted.
     record_key:  {"view": <ViewName>, "key": {...}} if the screen's primary view is
-        keyed to a specific record (SM207060's Endpoint: InterfaceName+GateVersion)
-        — REQUIRED there, else the commit fails "Insert button is disabled".
+        keyed to a specific record — REQUIRED there, else the commit fails opaquely
+        ("Insert button is disabled").
     save:        persist to the DB (default True).
 
     Requires allow_write. Verify the result with get_entity_schema/list_entities
@@ -2125,16 +2093,8 @@ async def ui_tree_dialog_insert(
 
     PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
 
-    Example — add the Companies entity to endpoint GRPMCP on SM207060:
-        r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
-                                 search="Companies", pick={"screenID": "CS101500"})
-        ui_tree_dialog_insert("SM207060", tree_view="EntityTree",
-            node_key={"Key": "ROOT#GRPMCP"}, open_action="InsertNew",
-            dialog_view="CreateEntityView",
-            record_key={"view": "Endpoint",
-                        "key": {"InterfaceName": "GRPMCP", "GateVersion": "25.200.001"}},
-            fields=[{"field": "ObjectName", "value": "Companies"},
-                    {"field": "ScreenID", "value": r["value"]}])
+    Capture provenance, the 5 phases + a worked SM207060 example:
+    guide(topic="ui_tree_dialog_insert").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2181,9 +2141,6 @@ async def ui_populate_endpoint_entity_fields(
     Save"). `ui_tree_dialog_insert` adds an entity SHELL; this fills in the scalar
     fields of the picked view so they show on the contract.
 
-    Proven live (2026-07-02): ImportScenarios ← "Scenario Summary" took field_count
-    1 → 20 (Name, Provider, SyncType, …); GenInquiry ← "Data Sources" 1 → 7.
-
     endpoint_name/endpoint_version: the endpoint the entity lives on (e.g. "GRPMCP",
         "25.200.001") — its header record is navigated first (required, else the
         Populate context is wrong).
@@ -2197,16 +2154,13 @@ async def ui_populate_endpoint_entity_fields(
     detail_title:   to populate a nested DETAIL COLLECTION instead of the top-level
         entity, its collection name (e.g. "CompaniesDetails" for the
         "CompaniesDetails: CompaniesDetail[]" node). The detail node is selected with
-        its full ancestor path (root→entity→detail) — a depth-2 node the plain tree
-        selector previously couldn't reach (fixed 2026-07-02). Omit for the entity.
+        its full ancestor path (root→entity→detail). Omit for the entity.
     save:           persist (default True).
 
     Requires allow_write. Verify with get_entity_schema (field_count jumps).
     Adds fields from ONE view; call again per view for a multi-view entity/detail.
 
-    Example:
-        ui_populate_endpoint_entity_fields("GRPMCP", "25.200.001",
-            entity_object_name="DataProvider", data_view="Provider Summary")
+    Live proof + example: guide(topic="ui_populate_endpoint_entity_fields").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2414,8 +2368,7 @@ async def ui_update_grid_row(
     The capability the classic screen SOAP engine lacks: change a cell of an
     EXISTING detail/grid row. (Classic positional selection is inert — a {"row":N}
     there silently hits row 1, so it now hard-errors.) This drives the modern
-    plane's `controlsParams.<grid>.changes.modified` channel, reverse-engineered
-    from a live browser capture (GL202500, 2026-07-01). No browser, same session.
+    plane's `controlsParams.<grid>.changes.modified` channel. No browser, same session.
 
     grid_view: the grid container/view (from ui_get_structure `grids`, e.g.
         "AccountRecords" on GL202500 Chart of Accounts).
@@ -2439,9 +2392,7 @@ async def ui_update_grid_row(
     coerced to its stored value. Best-effort (skipped only when the grid exposes no
     column shape); skip_validation=true bypasses.
 
-    Example — rename a GL account's description:
-        ui_update_grid_row("GL202500", "AccountRecords",
-            key={"AccountCD": "40000"}, values={"Description": "Sales Revenue"})
+    Capture provenance + example: guide(topic="ui_update_grid_row").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2515,8 +2466,8 @@ async def ui_insert_grid_row(
 ) -> Any:
     """Append a NEW row to a GRID on the MODERN UI-screen plane.
 
-    Drives the modern plane's `controlsParams.<grid>.changes.inserted` channel
-    (reverse-engineered live on GL202500). A client rowId is generated for you.
+    Drives the modern plane's `controlsParams.<grid>.changes.inserted` channel. A
+    client rowId is generated for you.
 
     grid_view: the grid container/view (from ui_get_structure `grids`).
     values:    {field: value} for the new row — MUST include the grid's KEY
@@ -2537,19 +2488,13 @@ async def ui_insert_grid_row(
     KEY-MANGLE GUARD: after the insert, the row is checked to have persisted under the
     EXACT key you sent. This MODERN plane PRESERVES punctuation (unlike the classic
     screen_insert_rows, which replaces '.' '/' '*' in a key with spaces) but it does
-    silently RIGHT-TRUNCATE a key at the field length (proven CS205010: an 11-char
-    'ZZ.TEST/GRD' persists as 'ZZ.TEST/GR'). Either alteration makes a later
-    lookup/import by the original key miss. When the stored key differs from what was
-    sent, the result carries `key_mangled: true` + a `warnings` entry with {sent_key,
-    stored_key} so you learn the real key immediately. Reference the STORED key in
-    later updates/deletes/imports. (For keys with punctuation, this modern tool is the
-    SAFE choice — it keeps them; the classic path does not.)
+    silently RIGHT-TRUNCATE a key at the field length. Either alteration makes a later
+    lookup/import by the original key miss, so when the stored key differs the result
+    carries `key_mangled: true` + a `warnings` entry with {sent_key, stored_key} —
+    reference the STORED key in later updates/deletes/imports. (For keys with
+    punctuation, this modern tool is the SAFE choice; the classic path is not.)
 
-    Examples:
-        ui_insert_grid_row("GL202500", "AccountRecords",
-            values={"AccountCD": "40100", "Type": "I", "Description": "Service Revenue"})
-        ui_insert_grid_row("CA202000", "ETDetails", values={"EntryTypeID": "BANKCHG"},
-            parent={"view": "CashAccount", "key": {"CashAccountCD": "10200"}})
+    Live-proven mangle cases + examples: guide(topic="ui_insert_grid_row").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2615,20 +2560,10 @@ async def screen_submit(
     rules, and verify each prerequisite exists — Acumatica screens have hard
     dependencies they won't surface until a write fails. See the server instructions.
 
-    dry_run=True previews: it drops the committing commands (button actions like
-    Save + row deletes) so the field SETs run but nothing persists, and still
-    returns any field-level errors. Use it to validate a sequence before writing.
-
-    auto_answer (e.g. "Yes"): if the Submit faults, retry once with a confirmation
-    dialog answered — clears "Are you sure?" pop-ups that block Save/Release on
-    some screens. Only applied to containers that actually expose a dialog.
-
     Replays a UI command sequence *as a user*, so it works on context screens
     the contract REST API refuses (insert enabled only with a parent loaded).
     Commands reference the schema's FRIENDLY field/action names (from
-    screen_get_schema) — the client clones the matching descriptor, which
-    carries the LinkedCommand navigation chain that actually loads/edits the
-    record (bare field-name commands silently no-op). Spec shapes:
+    screen_get_schema) — bare field-name commands silently no-op. Spec shapes:
         {"set": "<FriendlyName>", "to": <value>}   set a field (navigates if key)
         {"action": "<FriendlyName>"}               click a button (e.g. "Save")
         {"new_row": "<Container>"}                 add a detail row
@@ -2637,32 +2572,31 @@ async def screen_submit(
     Use "Container.Field" for `set` when a friendly name repeats across
     containers. Friendly names + containers come from screen_get_schema.
 
-    Recipe — update a record: set the key field, set other fields, Save:
-        [{"set":"CustomerID","to":"ABARTENDE"},
-         {"set":"AccountName","to":"New Name"},
-         {"action":"Save"}]
-    Add a detail row (master-detail/context screen): set the parent key(s),
-    new_row the detail container, set the row's fields, Save.
+    dry_run=True previews: it drops the committing commands (button actions like
+    Save + row deletes) so the field SETs run but nothing persists, and still
+    returns any field-level errors. Use it to validate a sequence before writing.
+    auto_answer (e.g. "Yes"): if the Submit faults, retry once with a confirmation
+    dialog answered — clears "Are you sure?" pop-ups that block Save/Release on
+    some screens. Only applied to containers that actually expose a dialog.
 
-    CAUTION — MULTIPLE new_row IN ONE SUBMIT CAN CORRUPT SILENTLY. Proven live on
-    SM206025's mapping grid (2026-07-08): batching 2 new_row blocks returned ok:true
-    but persisted values CROSSED between rows plus phantom "<Cancel>"/"@@" artifact
-    rows. Grids whose combo values depend on the current row's state are the danger;
-    simple grids (e.g. GL202500 accounts) batch fine. When in doubt: ONE row per
-    screen_submit call (nav-key + new_row + sets + Save each time), and READ BACK
-    what persisted (run_dac_odata / screen_get) — ok:true alone proves nothing.
+    CAUTION — MULTIPLE new_row IN ONE SUBMIT CAN CORRUPT SILENTLY: values CROSS
+    between rows plus phantom artifact rows, all under ok:true. Grids whose combo
+    values depend on the current row's state are the danger; simple grids batch fine.
+    When in doubt: ONE row per screen_submit call, and READ BACK what persisted
+    (run_dac_odata / screen_get) — ok:true alone proves nothing.
 
     Field-level errors are returned in `messages` (the API reports them inside a
-    200, not as a fault). Requires "allow_write": true; a sequence containing a
-    `delete_row` (unless dry_run) additionally requires "allow_delete": true, so
-    the screen plane can't sidestep the delete gate. Opens/closes its own SOAP
-    session so it never holds an API seat at idle (trial = 2 seats — always frees).
+    200, not as a fault). PRE-WRITE VALIDATION: each `set` is checked against the
+    screen's modern-plane metadata — a read-only field or an invalid enum is rejected
+    up front (ok:false + `validation_errors`) rather than being accepted by SOAP with
+    ok:true and silently dropped; skip_validation=true bypasses.
 
-    PRE-WRITE VALIDATION: before submitting, each `set` is checked against the
-    screen's modern-plane metadata — a read-only field or an invalid enum value is
-    rejected up front (returns ok:false + `validation_errors`) rather than being
-    accepted by SOAP with ok:true and silently dropped. Best-effort (only fires when
-    the field is identified); pass skip_validation=true to bypass.
+    Requires "allow_write": true; a sequence containing a `delete_row` (unless
+    dry_run) additionally requires "allow_delete": true, so the screen plane can't
+    sidestep the delete gate. Opens/closes its own SOAP session so it never holds an
+    API seat at idle.
+
+    Live proof of the new_row corruption + recipes: guide(topic="screen_submit").
     """
     _require_write(instance)
     # A delete_row OR a record-level Delete action destroys data — hold it to the
@@ -2709,32 +2643,19 @@ async def screen_insert_rows(
 
     KEY-FIELD PUNCTUATION WARNING (classic plane): this SOAP path routes writes
     through the field's input mask, which SILENTLY REPLACES punctuation in a KEY
-    field with spaces on save — proven live on CS205010: BuildingCD 'A. SELERA'
-    persists as 'A  SELERA', 'BP/KPK/HT' as 'BP KPK HT'. The insert still returns
-    ok:true, so a later lookup/import by the ORIGINAL key misses. If your KEY values
-    contain '.', '/', '*' etc., prefer the MODERN ui_insert_grid_row — it PRESERVES
-    punctuation (it only truncates at the field length, and warns via key_mangled
-    when it does). This classic path does NOT read keys back, so it can't warn.
+    field with spaces on save, while still returning ok:true — so a later
+    lookup/import by the ORIGINAL key misses, and this path cannot warn you (it does
+    NOT read keys back). If your KEY values contain '.', '/', '*' etc., prefer the
+    MODERN ui_insert_grid_row — it PRESERVES punctuation (it only truncates at the
+    field length, and warns via key_mangled when it does).
 
-    Example — add two GL accounts (GL202500):
-        screen_insert_rows("GL202500", "AccountRecords", [
-          {"Account":"10100","Type":"Asset","AccountClass":"CASH","Description":"Cash"},
-          {"Account":"40100","Type":"Income","Description":"Sales"}])
     Requires allow_write. Opens/closes its own SOAP session (frees the API seat).
+    Returns {ok, row_count, succeeded, failed, results:[{index, ok, ...}], messages,
+    field_errors} — messages/field_errors are merged across all rows for back-compat
+    with old single-Submit callers.
 
-    FIXED 2026-07-13 (was the single biggest data-corruption footgun in this
-    server): this used to bundle every row's NewRow+Set into ONE Submit envelope.
-    The screen-SOAP command stream carries no explicit row-index on a Value
-    command — it relies entirely on the server's "current row after the last
-    NewRow" state, which does not reliably hold across multiple NewRows in one
-    Submit, AND dry_run only dropped the Save (not the NewRow/Set), so a "preview"
-    could leave the graph dirty for the NEXT call to inherit. Proven live on
-    CS205010 (Buildings grid): values crossed onto the wrong row, and a dry_run's
-    leftover dirty rows corrupted a later real Save. Now every row is its own
-    isolated Submit — same proven-safe shape as screen_bulk_load / the
-    modern-plane ui_insert_grid_row. Returns {ok, row_count, succeeded, failed,
-    results:[{index, ok, ...}], messages, field_errors} — messages/field_errors
-    are merged across all rows for back-compat with old single-Submit callers.
+    Live-proven mangle cases, the one-Submit-per-row history + an example:
+    guide(topic="screen_insert_rows").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2761,12 +2682,11 @@ async def screen_bulk_load(
     is its own set-fields-then-Save, written THROUGH the screen's graph (so every
     business rule + prerequisite is honoured), with NO endpoint entity required.
 
-    The screen-plane peer of load_from_excel: load_from_excel needs the entity on a
-    contract endpoint (custom screens have none); screen_insert_rows adds many DETAIL
-    rows under ONE header. This fills the remaining gap — many SEPARATE master records
-    on ANY screen with a classic page (e.g. 50 Pay Codes on PY302000, no endpoint). Each
-    row is isolated: one failing row is recorded and the rest continue, so a partial
-    batch tells you exactly which rows need attention.
+    Picking between the bulk writers: load_from_excel needs the entity on a contract
+    endpoint (custom screens have none); screen_insert_rows adds many DETAIL rows under
+    ONE header; this does many SEPARATE master records on ANY screen with a classic page
+    (e.g. 50 Pay Codes on PY302000, no endpoint). Each row is isolated: one failing row
+    is recorded and the rest continue.
 
     rows:      list of {FriendlyField: value} — one master record each (friendly names
                from screen_get_schema; qualify "Container.Field" if a name repeats). The
@@ -2784,6 +2704,8 @@ async def screen_bulk_load(
     messages?/error?}], next_offset?}. Requires allow_write; KB-first policy applies.
     Reuses ONE SOAP session across all rows (schema fetched once; classic SOAP frees the
     seat per call). Preview with dry_run FIRST, then write.
+
+    Plane-choice rationale + row-isolation detail: guide(topic="screen_bulk_load").
     """
     _require_write(instance)
     _require_range("offset", offset, 0, 100_000_000)
@@ -3862,7 +3784,8 @@ async def create_segmented_key(
 
     key_id:      the segmented key identifier (e.g. "SUBACCOUNT", "ZZFUND").
     description: key description.
-    segments:    list of dicts, one per segment (at least one required). Per segment:
+    segments:    list of dicts, one per segment (at least one required — a key with
+                 none fails "Segmented key must have at least one segment"). Per segment:
         length      (required) int, segment length in characters
         description optional segment label
         validate    optional bool — ON = segment holds a validated value list you
@@ -3880,17 +3803,13 @@ async def create_segmented_key(
     numbering_id:    optional numbering sequence ID (required if any auto_number
                      segment; its length must match that segment's length).
 
-    Verify creation against the MASTER table: run_dac_odata('Dimension',
-    filter="DimensionID eq '<key_id>'") — the CS202000 picker lists Dimension, not
-    Segment. (Segment/SegmentValue are the children.) Always pass >=1 segment; a key
-    with none fails "Segmented key must have at least one segment".
-
-    To DELETE a key later, tear down children-first (deleting the master alone
-    orphans the children, which then can't be removed via the API): delete the
-    segment values on CS203000, then the segments on CS202000 LAST-segment-first,
-    then delete_row the master + Save.
+    Verify creation against the MASTER table (Dimension), NOT Segment — the CS202000
+    picker lists Dimension. To DELETE a key later, tear down CHILDREN-FIRST: deleting
+    the master alone orphans the children, which then can't be removed via the API.
 
     Requires allow_write. Total of all segment lengths must not exceed the key max.
+
+    Verify query + the exact teardown order: guide(topic="create_segmented_key").
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -5049,26 +4968,26 @@ async def import_excel(
     (file, provider pointing, Prepare, Import). The reliable CLASSIC-plane runner —
     the contract path (run_import_scenario) crashes in SYImportSimple on many screens.
 
-    Steps (each failure mode was hit live and is now guarded):
-      1. FILE GUARD — reject an .xlsx authored by openpyxl / an inline-strings writer
-         (reads as 0 rows, silently; author with real Excel / excel-mcp). force=true
-         overrides. Also compares the scenario's provider OBJECT to the file's actual
-         worksheet names (a mismatch is another silent 0).
-      2. ATTACH FRESH — upload under a UNIQUE timestamped filename (defends against any
-         same-name caching) and REPOINT the provider's FileName parameter to it (a
-         provider at '<EmptyFileName>' reads nothing — THE historical 0-row root cause).
-      3. PREPARE — classic SM206036 (proven; Status/PreparedOn verified from the DB, not
-         the optimistic screen reply). NbrRecords == 0 → ok:false with a checklist.
-      4. IMPORT (do_import=true) — classic action; per-row errors read back from the
-         PreparedData grid, plus structured hints (numbering range / closed period /
-         date-format — the recurring gates).
-
     scenario_name: an existing SM206025 scenario (build one with build_import_scenario).
     file_path:     .xlsx/.csv within read_roots. do_import: False = Prepare only (safe).
+    force:    bypass the FILE GUARD, which rejects an .xlsx authored by openpyxl / an
+        inline-strings writer (it reads as 0 rows, SILENTLY — author with real Excel /
+        excel-mcp) and catches a provider-object vs worksheet-name mismatch (another
+        silent 0).
     validate: run validate_import_setup first and attach it as `validation` (non-blocking
-    auto-warn — surfaces lookup values missing from the instance's masters BEFORE they
-    fail on commit; set False to skip). Requires allow_write. Returns
-    {ok, validation?, prepared:{...}, import?:{...}, errors?, hints?}.
+        auto-warn — surfaces lookup values missing from the instance's masters BEFORE
+        they fail on commit; set False to skip).
+
+    Each silent failure mode below was hit live and is now guarded: the file guard
+    above; ATTACH FRESH (a provider left at '<EmptyFileName>' reads nothing — THE
+    historical 0-row root cause; a same-name upload can also read a cached copy);
+    PREPARE verified from the DB, not the optimistic screen reply; and per-row IMPORT
+    errors read back from the PreparedData grid with structured hints.
+
+    Requires allow_write. Returns {ok, validation?, prepared:{...}, import?:{...},
+    errors?, hints?}.
+
+    The 4 stages in full + each guarded failure mode: guide(topic="import_excel").
     """
     import time as _time
 
@@ -5618,12 +5537,10 @@ async def build_import_scenario(
     patterns proven to persist correctly. Screen-agnostic: pass any target screen's
     field list once and the scenario carries it thereafter (run with import_excel).
 
-    Two proven landmines are baked in:
-      • the Screen combo is set by RAW ScreenID (e.g. "CS204000") — setting it by title
-        breaks on titles containing "/" (truncates server-side, proven);
-      • mapping rows are written ONE ROW PER SUBMIT — batching many new_row commands in
-        one Submit returns ok:true but persists CORRUPTED rows (values crossed between
-        rows, phantom "<Cancel>"/"@@" artifacts; reproduced live on this very grid).
+    Two proven landmines are baked in: the Screen combo is set by RAW ScreenID (setting
+    it by title truncates server-side on titles containing "/"), and mapping rows are
+    written ONE ROW PER SUBMIT (batching them returns ok:true but persists CORRUPTED
+    rows — values crossed between rows, phantom artifacts).
 
     name:            scenario name (must NOT exist — this tool refuses to touch an
                      existing scenario; record-level deletes are blocked by a confirm
@@ -5631,55 +5548,39 @@ async def build_import_scenario(
     screen_id:       target screen (raw ID, e.g. "AR301000").
     provider:        Data Provider name (SM206015; see setup_data_provider).
     provider_object: the provider's schema object (= the worksheet name for Excel).
-    mapping:         ordered list of rows. A FIELD row:
-                       {"target_object": <screen object, e.g. "Country" / "Document" /
-                                 "Transactions">,
-                        "field": <target field LABEL as in the mapping combo, e.g.
-                                 "Country ID" — from ui_get_structure(screen)'s labels>,
-                        "source": <provider column, or a literal like "<NEW>" / "=...">,
-                        "commit": <optional bool — set true on the key + required fields>}
-                     MASTER-DETAIL (grid line items): put the header field rows first, then
-                     start each detail line with a LINE-BREAK marker and follow it with that
-                     detail object's field rows:
-                       {"line_break": "Transactions"}   # ## grid new-row on the detail view
-                     e.g. AR301000: Document header fields → {"line_break":"Transactions"} →
-                     Transactions.AccountID/Amount/... rows. You can also pass a raw marker
-                     row ({"target_object":"Transactions","field":"##"}) or any `<...>` action.
+    mapping:         ordered list of rows. A FIELD row is {"target_object", "field",
+                     "source", "commit"?} — `field` is the target field LABEL as shown
+                     in the mapping combo (from ui_get_structure(screen)'s labels), NOT
+                     its name; `source` is a provider column or a literal ("<NEW>",
+                     "=..."); `commit` goes true on the key + required fields.
+                     MASTER-DETAIL (grid line items): header field rows first, then a
+                     {"line_break": <detail object>} marker to start each detail line,
+                     then that object's field rows.
     add_save:        append the trailing `<Save>` ACTION row (default True). This is
                      ESSENTIAL: without it the import stages every field into the graph
-                     but NEVER commits (0 rows Processed, no error — proven live). Every
-                     working scenario ends with `<Save>` (confirmed from stock ARTEST).
+                     but NEVER commits (0 rows Processed, no error — proven live).
 
-    RECIPE (proven on AR301000, 2026-07-09 — a committed invoice, BaseQty populated):
-      • CLONE, don't guess: call stock_scenario_info(screen_id) first. Acumatica ships a
-        vendor 'ACU Import …' scenario for the migration screens; mirror its field ORDER,
-        source columns, and which detail fields precede Qty.
-      • Map numeric fields (Qty, Amount, Unit Price) to a REAL provider COLUMN, never a
-        bare literal like "1" — a bare Value binds as a source COLUMN name and imports
-        EMPTY (this is what made every prior AR import fail 'BaseQty cannot be empty':
-        Qty="1" -> empty Qty -> empty BaseQty).
-      • Map the line's PRIMING field before Qty (AR301000: Transactions.InventoryID, even
-        blank) so Qty's FieldUpdated can default the computed base field (BaseQty).
-      • `=` FORMULA sources ARE now supported (`='H'`, `=[Asset.RecordType]`,
-        `=IsNull([col],[obj.field])`, `=LEFT(Concat([A],' - ',[B]),256)`, ...). Classic
-        screen_submit mangles them (drops `=[field]` to null, strips `='X'` to a phantom
-        literal), so after the classic build this tool AUTOMATICALLY re-writes every `=`
-        row's Value through the MODERN grid plane (ui_update_grid_row on FieldMappings),
-        which persists formulas intact (proven live 2026-07-14). `formula_rows_fixed` in
-        the result reports how many were rewritten; a still-null `=` row is warned. So you
-        CAN clone the vendor's `=IsNull(...)` guards / computed values verbatim now.
-      • For paired debit/credit columns that ALTERNATE blanks per line (GL301000
-        CuryDebitAmt/CuryCreditAmt), put an explicit 0 in the empty side — a truly blank
-        cell imports as EMPTY ('CreditAmt cannot be empty'); a 0 imports as zero. Attach a
-        FRESH file (a same-filename re-upload can read a stale cached copy). Proven: a
-        plain both-column GL mapping with 0-filled cells committed a balanced batch
-        (GL301000, 2026-07-09) — the IsNull guards are NOT required.
+    MAPPING TRAPS — each proven live, each failing SILENTLY or opaquely. Read the notes
+    before writing a mapping:
+      • CLONE, don't guess — call stock_scenario_info(screen_id) for the vendor scenario.
+      • Map numeric fields to a REAL provider COLUMN, never a bare literal — a bare
+        Value binds as a source COLUMN name and imports EMPTY.
+      • Map a line's PRIMING field before Qty so the computed base field can default.
+      • `=` FORMULA sources ARE supported (classic SOAP mangles them, so this tool
+        re-writes every `=` row through the MODERN grid plane; `formula_rows_fixed`
+        reports how many, and a still-null `=` row is warned).
+      • Paired debit/credit columns need an explicit 0 in the empty side — a truly
+        blank cell imports as EMPTY. Attach a FRESH file (a same-filename re-upload
+        can read a stale cached copy).
 
-    After writing, the mapping is READ BACK from the DB and verified: `persisted` lists
-    every row, `action_rows` are the STRUCTURAL rows (`@@` key restrictions, `<Cancel>`/
-    `<Save>` actions, `##` line markers — normal, present in every real mapping, NOT
-    corruption), `has_save_action` confirms the commit row is there, and ok=false if a
-    field row failed or `<Save>` is missing. Requires allow_write; KB-first policy applies.
+    After writing, the mapping is READ BACK from the DB and verified: ok=false if a
+    field row failed or `<Save>` is missing. `action_rows` in the result are STRUCTURAL
+    rows, present in every real mapping — NOT corruption.
+
+    Requires allow_write; KB-first policy applies.
+
+    The full proven recipe, live dates/screens + formula syntax:
+    guide(topic="build_import_scenario").
     """
     _require_write(instance)
     client = _client(instance)
@@ -6387,6 +6288,339 @@ Examples —
     ui_screen_action("SM207060", action="InsertNew",
         record_key={"view":"Endpoint","key":{"InterfaceName":"GRPMCP","GateVersion":"25.200.001"}},
         tree_select={"view":"EntityTree","key":{"Key":"ROOT#GRPMCP"}})
+""",
+    "build_import_scenario": """\
+build_import_scenario — full notes.
+
+Two proven landmines are baked in:
+  • the Screen combo is set by RAW ScreenID (e.g. "CS204000") — setting it by title
+    breaks on titles containing "/" (truncates server-side, proven);
+  • mapping rows are written ONE ROW PER SUBMIT — batching many new_row commands in
+    one Submit returns ok:true but persists CORRUPTED rows (values crossed between
+    rows, phantom "<Cancel>"/"@@" artifacts; reproduced live on this very grid).
+
+mapping — ordered list of rows. A FIELD row:
+  {"target_object": <screen object, e.g. "Country" / "Document" / "Transactions">,
+   "field": <target field LABEL as in the mapping combo, e.g. "Country ID" — from
+             ui_get_structure(screen)'s labels>,
+   "source": <provider column, or a literal like "<NEW>" / "=...">,
+   "commit": <optional bool — set true on the key + required fields>}
+
+MASTER-DETAIL (grid line items): put the header field rows first, then start each detail
+line with a LINE-BREAK marker and follow it with that detail object's field rows:
+  {"line_break": "Transactions"}   # ## grid new-row on the detail view
+e.g. AR301000: Document header fields → {"line_break":"Transactions"} →
+Transactions.AccountID/Amount/... rows. You can also pass a raw marker row
+({"target_object":"Transactions","field":"##"}) or any `<...>` action.
+
+add_save: every working scenario ends with `<Save>` (confirmed from stock ARTEST).
+
+READ-BACK VERIFY: after writing, the mapping is read back from the DB and verified.
+`persisted` lists every row; `action_rows` are the STRUCTURAL rows (`@@` key
+restrictions, `<Cancel>`/`<Save>` actions, `##` line markers — normal, present in every
+real mapping, NOT corruption); `has_save_action` confirms the commit row is there; and
+ok=false if a field row failed or `<Save>` is missing.
+
+RECIPE (proven on AR301000, 2026-07-09 — a committed invoice, BaseQty populated):
+  • CLONE, don't guess: call stock_scenario_info(screen_id) first. Acumatica ships a
+    vendor 'ACU Import …' scenario for the migration screens; mirror its field ORDER,
+    source columns, and which detail fields precede Qty.
+  • Map numeric fields (Qty, Amount, Unit Price) to a REAL provider COLUMN, never a
+    bare literal like "1" — a bare Value binds as a source COLUMN name and imports
+    EMPTY (this is what made every prior AR import fail 'BaseQty cannot be empty':
+    Qty="1" -> empty Qty -> empty BaseQty).
+  • Map the line's PRIMING field before Qty (AR301000: Transactions.InventoryID, even
+    blank) so Qty's FieldUpdated can default the computed base field (BaseQty).
+  • `=` FORMULA sources ARE now supported (`='H'`, `=[Asset.RecordType]`,
+    `=IsNull([col],[obj.field])`, `=LEFT(Concat([A],' - ',[B]),256)`, ...). Classic
+    screen_submit mangles them (drops `=[field]` to null, strips `='X'` to a phantom
+    literal), so after the classic build this tool AUTOMATICALLY re-writes every `=`
+    row's Value through the MODERN grid plane (ui_update_grid_row on FieldMappings),
+    which persists formulas intact (proven live 2026-07-14). `formula_rows_fixed` in
+    the result reports how many were rewritten; a still-null `=` row is warned. So you
+    CAN clone the vendor's `=IsNull(...)` guards / computed values verbatim now.
+  • For paired debit/credit columns that ALTERNATE blanks per line (GL301000
+    CuryDebitAmt/CuryCreditAmt), put an explicit 0 in the empty side — a truly blank
+    cell imports as EMPTY ('CreditAmt cannot be empty'); a 0 imports as zero. Attach a
+    FRESH file (a same-filename re-upload can read a stale cached copy). Proven: a
+    plain both-column GL mapping with 0-filled cells committed a balanced batch
+    (GL301000, 2026-07-09) — the IsNull guards are NOT required.
+""",
+    "screen_submit": """\
+screen_submit — full notes.
+
+Recipe — update a record: set the key field, set other fields, Save:
+    [{"set":"CustomerID","to":"ABARTENDE"},
+     {"set":"AccountName","to":"New Name"},
+     {"action":"Save"}]
+Add a detail row (master-detail/context screen): set the parent key(s), new_row the
+detail container, set the row's fields, Save.
+
+CAUTION — MULTIPLE new_row IN ONE SUBMIT CAN CORRUPT SILENTLY. Proven live on
+SM206025's mapping grid (2026-07-08): batching 2 new_row blocks returned ok:true but
+persisted values CROSSED between rows plus phantom "<Cancel>"/"@@" artifact rows. Grids
+whose combo values depend on the current row's state are the danger; simple grids (e.g.
+GL202500 accounts) batch fine. When in doubt: ONE row per screen_submit call (nav-key +
+new_row + sets + Save each time), and READ BACK what persisted (run_dac_odata /
+screen_get) — ok:true alone proves nothing.
+
+Session/seat: opens and closes its own SOAP session so it never holds an API seat at
+idle (trial = 2 seats — always frees).
+""",
+    "screen_insert_rows": """\
+screen_insert_rows — full notes.
+
+KEY-FIELD PUNCTUATION WARNING (classic plane): this SOAP path routes writes through the
+field's input mask, which SILENTLY REPLACES punctuation in a KEY field with spaces on
+save — proven live on CS205010: BuildingCD 'A. SELERA' persists as 'A  SELERA',
+'BP/KPK/HT' as 'BP KPK HT'. The insert still returns ok:true, so a later lookup/import
+by the ORIGINAL key misses. If your KEY values contain '.', '/', '*' etc., prefer the
+MODERN ui_insert_grid_row — it PRESERVES punctuation (it only truncates at the field
+length, and warns via key_mangled when it does). This classic path does NOT read keys
+back, so it can't warn.
+
+Example — add two GL accounts (GL202500):
+    screen_insert_rows("GL202500", "AccountRecords", [
+      {"Account":"10100","Type":"Asset","AccountClass":"CASH","Description":"Cash"},
+      {"Account":"40100","Type":"Income","Description":"Sales"}])
+
+FIXED 2026-07-13 (was the single biggest data-corruption footgun in this server): this
+used to bundle every row's NewRow+Set into ONE Submit envelope. The screen-SOAP command
+stream carries no explicit row-index on a Value command — it relies entirely on the
+server's "current row after the last NewRow" state, which does not reliably hold across
+multiple NewRows in one Submit, AND dry_run only dropped the Save (not the NewRow/Set),
+so a "preview" could leave the graph dirty for the NEXT call to inherit. Proven live on
+CS205010 (Buildings grid): values crossed onto the wrong row, and a dry_run's leftover
+dirty rows corrupted a later real Save. Now every row is its own isolated Submit — same
+proven-safe shape as screen_bulk_load / the modern-plane ui_insert_grid_row.
+""",
+    "ui_tree_dialog_insert": """\
+ui_tree_dialog_insert — full notes.
+
+Reverse-engineered + proven live from a full browser capture (2026-07-02): the UI
+performs a 5-phase sequence — select node, OPEN the dialog, Repaint to load its fields,
+FILL them, then COMMIT the dialog (which only STAGES the node) plus a SEPARATE Save to
+PERSIST. This tool runs all of it in one session.
+
+tree_view/node_key/parent_key: from ui_read_grid; e.g. "EntityTree",
+    {"Key": "ROOT#GRPMCP"}. parent_key omitted for a root-level node.
+open_action: e.g. "InsertNew" on SM207060.
+dialog_view: e.g. "CreateEntityView" on SM207060.
+fields: for a SELECTOR field (per ui_get_structure's `selector` marker; e.g. ScreenID)
+    resolve it FIRST with ui_resolve_selector and pass its `value` ({id,text}) here
+    unchanged. A required-looking field the server fills itself at commit (e.g.
+    SM207060's EntityType, resolved from ScreenID) can be omitted.
+record_key: {"view": <ViewName>, "key": {...}} if the screen's primary view is keyed to
+    a specific record (SM207060's Endpoint: InterfaceName+GateVersion) — REQUIRED
+    there, else the commit fails "Insert button is disabled".
+
+Example — add the Companies entity to endpoint GRPMCP on SM207060:
+    r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
+                             search="Companies", pick={"screenID": "CS101500"})
+    ui_tree_dialog_insert("SM207060", tree_view="EntityTree",
+        node_key={"Key": "ROOT#GRPMCP"}, open_action="InsertNew",
+        dialog_view="CreateEntityView",
+        record_key={"view": "Endpoint",
+                    "key": {"InterfaceName": "GRPMCP", "GateVersion": "25.200.001"}},
+        fields=[{"field": "ObjectName", "value": "Companies"},
+                {"field": "ScreenID", "value": r["value"]}])
+""",
+    "ui_insert_grid_row": """\
+ui_insert_grid_row — full notes.
+
+Drives the modern plane's `controlsParams.<grid>.changes.inserted` channel
+(reverse-engineered live on GL202500). A client rowId is generated for you.
+
+KEY-MANGLE GUARD: after the insert, the row is checked to have persisted under the
+EXACT key you sent. This MODERN plane PRESERVES punctuation (unlike the classic
+screen_insert_rows, which replaces '.' '/' '*' in a key with spaces) but it does
+silently RIGHT-TRUNCATE a key at the field length (proven CS205010: an 11-char
+'ZZ.TEST/GRD' persists as 'ZZ.TEST/GR'). Either alteration makes a later lookup/import
+by the original key miss. When the stored key differs from what was sent, the result
+carries `key_mangled: true` + a `warnings` entry with {sent_key, stored_key} so you
+learn the real key immediately. Reference the STORED key in later
+updates/deletes/imports. (For keys with punctuation, this modern tool is the SAFE
+choice — it keeps them; the classic path does not.)
+
+Examples:
+    ui_insert_grid_row("GL202500", "AccountRecords",
+        values={"AccountCD": "40100", "Type": "I", "Description": "Service Revenue"})
+    ui_insert_grid_row("CA202000", "ETDetails", values={"EntryTypeID": "BANKCHG"},
+        parent={"view": "CashAccount", "key": {"CashAccountCD": "10200"}})
+""",
+    "import_excel": """\
+import_excel — full notes.
+
+Steps (each failure mode was hit live and is now guarded):
+  1. FILE GUARD — reject an .xlsx authored by openpyxl / an inline-strings writer
+     (reads as 0 rows, silently; author with real Excel / excel-mcp). force=true
+     overrides. Also compares the scenario's provider OBJECT to the file's actual
+     worksheet names (a mismatch is another silent 0).
+  2. ATTACH FRESH — upload under a UNIQUE timestamped filename (defends against any
+     same-name caching) and REPOINT the provider's FileName parameter to it (a
+     provider at '<EmptyFileName>' reads nothing — THE historical 0-row root cause).
+  3. PREPARE — classic SM206036 (proven; Status/PreparedOn verified from the DB, not
+     the optimistic screen reply). NbrRecords == 0 → ok:false with a checklist.
+  4. IMPORT (do_import=true) — classic action; per-row errors read back from the
+     PreparedData grid, plus structured hints (numbering range / closed period /
+     date-format — the recurring gates).
+""",
+    "ui_grid_row_action": """\
+ui_grid_row_action — full notes.
+
+Closes the one thing the classic screen-SOAP plane structurally CANNOT do: it navigates
+to a keyed MASTER record fine, but cannot select an arbitrary existing GRID row by key,
+so a process-the-selected-row action is impossible there (proven live 2026-07-02:
+SM203520 Restore Snapshot faulted "A snapshot is not selected" via SOAP because the
+Snapshots row could not be made active). The modern plane addresses the row via
+activeRowContexts, which this drives.
+
+grid_view: e.g. "Snapshots" on SM203520.
+row_key:   e.g. {"SnapshotID": "459edf6a-..."}.
+action:    e.g. "importSnapshotCommand".
+parent:    e.g. SM203520 {"view":"Companies","key":{"CompanyID":3}} to target the
+    SalesDemo tenant.
+
+status "redirected" = the server answered with a goTo — e.g. Restore hands off to
+SM203510 to run/monitor; that is NOT a synchronous completion, so verify the downstream
+effect yourself.
+
+Example — restore a snapshot into the SalesDemo tenant on SM203520:
+    ui_grid_row_action("SM203520", grid_view="Snapshots",
+        row_key={"SnapshotID": "459edf6a-70e3-4d88-ae5d-235b761e34c9"},
+        action="importSnapshotCommand",
+        parent={"view": "Companies", "key": {"CompanyID": 3}})
+""",
+    "create_segmented_key": """\
+create_segmented_key — full notes.
+
+Verify creation against the MASTER table: run_dac_odata('Dimension',
+filter="DimensionID eq '<key_id>'") — the CS202000 picker lists Dimension, not Segment.
+(Segment/SegmentValue are the children.) Always pass >=1 segment; a key with none fails
+"Segmented key must have at least one segment".
+
+lookup_mode: a validated segment needs a lookup mode that supports validation (see KB
+'Lookup Modes for Segmented Keys').
+
+To DELETE a key later, tear down children-first (deleting the master alone orphans the
+children, which then can't be removed via the API): delete the segment values on
+CS203000, then the segments on CS202000 LAST-segment-first, then delete_row the master
++ Save.
+""",
+    "create_or_update_entity": """\
+create_or_update_entity — full notes.
+
+Detail-collection echo quirk (auto-corrected): Acumatica's PUT response echoes a nested
+detail collection you just wrote as `[]` even when it persisted correctly (proven on
+TaxReportingSettings.ReportingGroups, Tax.TaxSchedule, TaxCategory.Details,
+TaxZone.ApplicableTaxes — all `[]` on write, all present on read-back). When that
+happens here, this tool automatically re-fetches the record by id with those fields
+expanded and patches the real values into the result — so what you get back is always
+the true persisted state, not a misleading empty array. If that re-fetch itself fails
+(rare), the suspect keys are still `[]` but the result carries an `_unverified_details`
+list naming them — verify those manually with get_entity(..., expand=...) before
+trusting them.
+
+Two more real gotchas on nested detail arrays (proven on
+TaxReportingSettings.ReportingGroups): (1) a detail array ALWAYS APPENDS, never
+upserts-by-content — resending identical detail data creates a duplicate row every time;
+to update or remove an EXISTING row you must include its own `id` (from a prior
+get_entity fetch): `{"id": <id>, ...changed fields...}` to update, or
+`{"id": <id>, "delete": true}` to remove (id/delete stay bare, never
+{"value":...}-wrapped). (2) That `id` is NOT stable across separate requests — two
+consecutive fetches of the same record can return different ids for the same rows — but
+it DOES remain valid for an action issued immediately after the fetch that produced it.
+Fetch, then act right away; never cache a detail row's id across a later, separate call.
+""",
+    "ui_resolve_selector": """\
+ui_resolve_selector — full notes.
+
+Needed before ui_screen_action can set a SELECTOR field (per ui_get_structure's
+`selector` marker; e.g. SM207060 CreateEntityView's ScreenID). No browser capture needed
+per field — a selector's own /structure metadata carries everything needed to query it,
+so this works on ANY selector field on ANY screen (reverse-engineered + proven live,
+2026-07-02).
+
+pick: optional {column: value} to disambiguate when `search` alone matches multiple
+    rows — Acumatica routinely has duplicate titles across modules (e.g. "Companies"
+    matches both a Generic Inquiry, CS1015PL — NOT usable as an entity source — and the
+    real maintenance screen, CS101500). ALWAYS check `rows` before trusting `value` when
+    more than one row comes back; picking the wrong one fails a downstream entity-add
+    silently.
+
+Example — resolve then set (two calls, same screen; see ui_screen_action for why
+selection state needs tree_select on the SAME call as the set/action):
+    r = ui_resolve_selector("SM207060", "CreateEntityView", "ScreenID",
+                             search="Companies", pick={"screenID": "CS101500"})
+    ui_screen_action("SM207060", action="InsertNew",
+        tree_select={"view": "EntityTree", "key": {"Key": "ROOT#GRPMCP"}},
+        set_fields=[{"view": "CreateEntityView", "field": "ObjectName", "value": "Companies"},
+                    {"view": "CreateEntityView", "field": "ScreenID", "value": r["value"]}])
+""",
+    "ui_update_grid_row": """\
+ui_update_grid_row — full notes.
+
+The capability the classic screen SOAP engine lacks: change a cell of an EXISTING
+detail/grid row. (Classic positional selection is inert — a {"row":N} there silently
+hits row 1, so it now hard-errors.) This drives the modern plane's
+`controlsParams.<grid>.changes.modified` channel, reverse-engineered from a live browser
+capture (GL202500, 2026-07-01). No browser, same session.
+
+Example — rename a GL account's description:
+    ui_update_grid_row("GL202500", "AccountRecords",
+        key={"AccountCD": "40000"}, values={"Description": "Sales Revenue"})
+""",
+    "tree_triage": """\
+tree_triage — full notes.
+
+A tree control's parent link is normally set ONLY by clicking a node, which no API
+reproduces. But a given screen usually ships an alternative lever; this probes for all
+of them (the target screen's /structure + a scan of the site map for a companion
+"Import ..." form) and returns the best tier found:
+
+  TIER 1  grid+indent   — a real grid + Left/Right (indent/outdent) actions, on THIS
+                          screen OR a companion "Import ..." form. Drivable via
+                          ui_insert_grid_row + ui_screen_action("Right")xdepth. BEST.
+                          (Company Tree: dead on EP204061, drivable on EP204060.)
+  TIER 2  parent-field  — a grid/view row carries a settable Parent* field; set it
+                          directly on ui_insert_grid_row. Pure API.
+  TIER 3  select-cmd    — a tree with a working node-select command (ui_screen_action
+                          tree_select / ui_tree_dialog_insert; e.g. SM207060). CAVEAT:
+                          fails if the tree is VIRTUALIZED (only the root node
+                          materializes) — selection then null-refs (proven live on
+                          EP204061 MoveWorkGroup). Verify with ui_read_grid(tree).
+  TIER 4  import        — a companion "Import ..." screen exists (may load a flat file
+                          with a parent column) even without indent actions.
+  TIER 5  browser-only  — no API lever found; last resort is Playwright/kapture.
+""",
+    "screen_bulk_load": """\
+screen_bulk_load — full notes.
+
+The screen-plane peer of load_from_excel: load_from_excel needs the entity on a contract
+endpoint (custom screens have none); screen_insert_rows adds many DETAIL rows under ONE
+header. This fills the remaining gap — many SEPARATE master records on ANY screen with a
+classic page (e.g. 50 Pay Codes on PY302000, no endpoint). Each row is isolated: one
+failing row is recorded and the rest continue, so a partial batch tells you exactly which
+rows need attention.
+
+Reuses ONE SOAP session across all rows (schema fetched once; classic SOAP frees the seat
+per call). Preview with dry_run FIRST, then write.
+""",
+    "ui_populate_endpoint_entity_fields": """\
+ui_populate_endpoint_entity_fields — full notes.
+
+Proven live (2026-07-02): ImportScenarios ← "Scenario Summary" took field_count 1 → 20
+(Name, Provider, SyncType, …); GenInquiry ← "Data Sources" 1 → 7.
+
+detail_title: to populate a nested DETAIL COLLECTION instead of the top-level entity,
+    its collection name (e.g. "CompaniesDetails" for the "CompaniesDetails:
+    CompaniesDetail[]" node). The detail node is selected with its full ancestor path
+    (root→entity→detail) — a depth-2 node the plain tree selector previously couldn't
+    reach (fixed 2026-07-02). Omit for the entity.
+
+Example:
+    ui_populate_endpoint_entity_fields("GRPMCP", "25.200.001",
+        entity_object_name="DataProvider", data_view="Provider Summary")
 """,
 }
 
