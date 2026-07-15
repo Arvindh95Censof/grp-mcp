@@ -31,11 +31,13 @@ def _inst(**over) -> Instance:
 
 @pytest.fixture(autouse=True)
 def _clear_ui_session_cache():
-    """The shared UI-plane cookie cache is module-global; isolate tests from each other."""
+    """The shared UI-plane cookie + /structure caches are module-global; isolate tests."""
     from grp_mcp import screen as _screen
     _screen._SESSION_CACHE.clear()
+    _screen._STRUCT_CACHE.clear()
     yield
     _screen._SESSION_CACHE.clear()
+    _screen._STRUCT_CACHE.clear()
 
 
 @pytest.fixture
@@ -137,9 +139,10 @@ def test_wrap_list_of_rows():
 # ---- modern UI-screen error parser -----------------------------------------
 
 class _Resp:
-    def __init__(self, status: int, body):
+    def __init__(self, status: int, body, headers: dict | None = None):
         self.status_code = status
         self._body = body
+        self.headers = headers or {}
         self.text = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
 
     def json(self):
@@ -306,6 +309,385 @@ def test_update_payload_resends_key_in_values():
     fields = {v["field"]: v["value"] for v in mod["values"]}
     assert fields.get("AccountCD") == "40000" and fields.get("Description") == "New"
     assert ctrl["dataKey"] == {"AccountCD": "40000"} and mod["id"] == "g8"
+
+
+# ---- warning/info toasts ----------------------------------------------------
+#
+# The top-right toast is `messages[]`. _ui_error only surfaces messageType=="error"
+# on a 200 -- correctly, since its return value raises and a warning is not a failure
+# -- so warnings/info were dropped entirely. They are the messages that explain an
+# accepted-but-ignored write, so they must ride on the RESULT instead.
+
+def test_notices_returns_warnings_and_info_not_errors():
+    j = {"messages": [
+        {"message": "The period is closed.", "messageType": "Warning"},
+        {"message": "3 rows skipped.", "messageType": "Info"},
+        {"message": "boom", "messageType": "Error"},   # already raises via _ui_error
+        {"message": "untyped note"},                     # no type -> info
+        {"messageType": "Warning"},                      # no text -> dropped
+    ]}
+    assert ScreenClient._notices(j) == [
+        {"type": "warning", "message": "The period is closed."},
+        {"type": "info", "message": "3 rows skipped."},
+        {"type": "info", "message": "untyped note"},
+    ]
+
+
+def test_notices_tolerates_junk():
+    assert ScreenClient._notices(None) == []
+    assert ScreenClient._notices({"messages": None}) == []
+    assert ScreenClient._notices({}) == []
+
+
+def test_warning_on_200_does_not_raise_but_is_reported():
+    # The whole point: a warning must NOT become an error (that filter is deliberate),
+    # yet must stop being invisible.
+    warn = _Resp(200, {"messages": [{"message": "Year already generated.",
+                                     "messageType": "Warning"}]})
+    assert ScreenClient._ui_error(warn) is None          # unchanged: does not raise
+    assert ScreenClient._notices(warn.json()) == [
+        {"type": "warning", "message": "Year already generated."}]
+
+
+def test_grid_save_annotates_notices():
+    class _WarnHTTP(_FakeHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            if (json or {}).get("command"):
+                return _Resp(200, {"messages": [{"message": "Row ignored.",
+                                                 "messageType": "Warning"}]})
+            return _Resp(200, self._read)
+
+    s = _client("GL202500")
+    s._http = _WarnHTTP(_read_body(
+        "AccountRecords", [{"field": "AccountCD"}, {"field": "Description"}],
+        [{"id": "g8", "cells": {"AccountCD": {"value": "40000"},
+                                "Description": {"value": "Sales"}}}], ["AccountCD"]))
+    out = asyncio.run(s.ui_update_grid_row("AccountRecords", {"AccountCD": "40000"},
+                                           {"Description": "New"}))
+    assert out["@grp.notices"] == [{"type": "warning", "message": "Row ignored."}]
+
+
+def test_update_grid_rows_surfaces_per_chunk_notices():
+    rows = _rows(4)
+    s = _client("GL202500")
+    http = _EchoHTTP(_read_body("Details", [{"field": "LineNbr"}, {"field": "Descr"}],
+                                rows, ["LineNbr"]), "Details", echo_rows=rows)
+    s._http = http
+    orig = http.post
+
+    async def post(url, json=None, headers=None):  # noqa: A002
+        r = await orig(url, json=json, headers=headers)
+        if (json or {}).get("command"):
+            body = dict(r.json())
+            body["messages"] = [{"message": "Locked.", "messageType": "Warning"}]
+            return _Resp(200, body)
+        return r
+
+    http.post = post
+    out = asyncio.run(s.ui_update_grid_rows(
+        "Details",
+        [{"key": {"LineNbr": str(i)}, "values": {"Descr": f"d{i}"}} for i in range(1, 5)],
+        skip_validation=True, chunk_size=2))
+    assert out["notices"] == [{"chunk": 1, "type": "warning", "message": "Locked."},
+                              {"chunk": 2, "type": "warning", "message": "Locked."}]
+    assert "note" in out  # updated counts rows SENT, not rows kept
+
+
+# ---- silent-rejection net (graphIsDirty) ------------------------------------
+#
+# Probed live on GL101000 (2026-07-15): the plane reports NOTHING when it refuses a
+# value -- no messages, no fieldStates, clean 200. graphIsDirty is the only signal,
+# and only in the clean->still-clean direction. These lock that reading, including
+# the control that makes it trustworthy and the limitation that bounds it.
+
+class _DirtyHTTP:
+    """Serves a scripted graphIsDirty per POST (bootstrap first, then each set)."""
+
+    def __init__(self, dirty_seq):
+        self.seq = list(dirty_seq)
+        self.calls = []
+
+    async def post(self, url, json=None, headers=None):  # noqa: A002
+        self.calls.append(json or {})
+        d = self.seq.pop(0) if self.seq else False
+        return _Resp(200, {"graphIsDirty": d, "messages": []})
+
+    async def aclose(self):
+        pass
+
+
+def _set_field(dirty_seq, value="x"):
+    s = _client("GL101000")
+    s._http = _DirtyHTTP(dirty_seq)
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", value))
+    return s
+
+
+def test_set_field_flags_silently_refused_value():
+    # bootstrap -> clean, set -> STILL clean = refused (the live invalid-date case)
+    s = _set_field([False, False], value="NOT-A-DATE")
+    assert len(s._rejected_sets) == 1
+    r = s._rejected_sets[0]
+    assert r["field"] == "BegFinYear" and r["value"] == "NOT-A-DATE"
+    assert "REFUSED" in r["reason"]
+
+
+def test_set_field_accepts_when_graph_goes_dirty():
+    # clean -> dirty = the value landed
+    assert _set_field([False, True])._rejected_sets == []
+
+
+def test_set_field_no_change_is_not_a_false_positive():
+    # THE control that makes this signal usable: setting a field to its own current
+    # value still returns dirty=True live, so clean->clean cannot be explained away as
+    # "nothing changed". If that ever regressed to dirty=False, this net would cry wolf
+    # on every no-op write -- so pin the accepted reading explicitly.
+    assert _set_field([False, True])._rejected_sets == []
+
+
+def test_set_field_does_not_guess_when_dirty_state_unknown():
+    # Never observed clean (non-JSON bootstrap) -> must NOT flag.
+    class _JunkHTTP(_DirtyHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            return _Resp(200, "not json")
+
+    s = _client("GL101000")
+    s._http = _JunkHTTP([])
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    assert s._graph_dirty is None
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", "x"))
+    assert s._rejected_sets == []
+
+
+def test_set_field_net_misses_values_the_plane_accepts():
+    # COVERAGE, pinned so nobody re-generalizes this net from its one hit. Live probe
+    # (2026-07-15, 5 screens / 4 graphs) found most bad values are ACCEPTED into the
+    # graph -- AP301000 DocDate="NOT-A-DATE", "abc" into an Int16, even a read-only
+    # write, all returned dirty=True. clean->dirty is indistinguishable from a good
+    # set, so the net cannot flag them. "No rejected_fields" != "the values were good".
+    s = _set_field([False, True], value="NOT-A-DATE")   # accepted-but-invalid
+    assert s._rejected_sets == []
+
+
+def test_set_field_cannot_see_refusal_once_graph_is_dirty():
+    # Documented LIMIT: dirty stays dirty, so a refusal after a successful set is
+    # invisible. Pin it so nobody mistakes this net for a guarantee.
+    s = _client("GL101000")
+    s._http = _DirtyHTTP([False, True, True])
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", "01/01/2027"))  # lands
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "FinPeriods", "abc"))         # refused
+    assert s._rejected_sets == []  # not a bug: the signal genuinely cannot discriminate
+
+
+# ---- relocated tool notes ---------------------------------------------------
+#
+# Trimming a docstring only saves tokens if the text it dropped is still REACHABLE.
+# These lock both halves of that bargain: guide() serves every note, and no docstring
+# advertises a note that doesn't exist.
+
+def test_guide_serves_every_relocated_tool_note():
+    from grp_mcp.server import _TOOL_NOTES, guide
+    assert _TOOL_NOTES, "no notes relocated yet"
+    for name, text in _TOOL_NOTES.items():
+        got = guide(topic=name)
+        assert got["tool"] == name
+        assert got["notes"] == text
+
+
+def test_unknown_guide_topic_lists_available_tool_notes():
+    from grp_mcp.server import _TOOL_NOTES, guide
+    got = guide(topic="definitely-not-a-topic")
+    assert "error" in got
+    assert got["tool_notes"] == sorted(_TOOL_NOTES)
+
+
+def test_docstring_note_pointers_resolve():
+    # A docstring saying guide(topic="X") must actually reach a note named X, or the
+    # trim silently destroyed the guidance instead of relocating it.
+    import pathlib
+    import re
+    from grp_mcp import server as _server
+    from grp_mcp.server import _TOOL_NOTES
+    src = pathlib.Path(_server.__file__).read_text(encoding="utf-8")
+    pointed = set(re.findall(r'guide\(topic="([a-z_]+)"\)', src))
+    # the generic routing topics guide() already knew about are not tool notes
+    pointed -= {"read", "write", "grid", "process", "setup", "lookup", "customization",
+                "import", "files", "actions", "session", "discover", "planes"}
+    assert pointed, "no docstring points at a tool note"
+    missing = pointed - set(_TOOL_NOTES)
+    assert not missing, f"docstrings point at notes that don't exist: {sorted(missing)}"
+
+
+# ---- /structure ETag cache --------------------------------------------------
+#
+# The endpoint's ETag is an ENVIRONMENT stamp, identical for every screen on a
+# tenant (verified live on 25.101: AP301000's etag replayed at GL101000's url
+# returns 304). So the server cannot be relied on to notice a screen mix-up — the
+# cache key has to, which is what these lock.
+
+class _StructHTTP:
+    """Serves /structure with an ETag; 304s when the matching If-None-Match arrives."""
+
+    def __init__(self, bodies: dict, etag: str = 'W/"env-v1"'):
+        self.bodies = bodies          # screen_id -> raw structure body
+        self.etag = etag
+        self.full = 0
+        self.conditional = 0
+        self.sent_inm: list = []
+
+    async def get(self, url, headers=None):
+        h = headers or {}
+        inm = h.get("If-None-Match")
+        self.sent_inm.append(inm)
+        if inm == self.etag:
+            self.conditional += 1
+            return _Resp(304, None, headers={"ETag": self.etag})
+        self.full += 1
+        screen = url.split("/ui/screen/")[1].split("/")[0]
+        return _Resp(200, self.bodies[screen], headers={"ETag": self.etag})
+
+    async def aclose(self):
+        pass
+
+
+def _struct_body(dac: str) -> dict:
+    return {"primaryDacName": dac, "fieldStates": {}, "actionStates": {},
+            "controlsData": {}}
+
+
+def _struct_client(screen: str, http) -> ScreenClient:
+    s = ScreenClient(_inst(), screen)
+    s._logged_in = True
+    s._http = http
+    return s
+
+
+def test_structure_memoized_within_one_client():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    s = _struct_client("GL101000", http)
+    for _ in range(3):
+        asyncio.run(s.get_ui_structure())
+    assert http.full == 1 and http.conditional == 0  # memo: no repeat HTTP at all
+
+
+def test_structure_revalidates_with_etag_across_clients():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    first = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    # a NEW client (as every tool call builds) must revalidate, not re-download
+    second = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    assert http.full == 1 and http.conditional == 1
+    assert http.sent_inm == [None, 'W/"env-v1"']
+    assert second == first
+
+
+def test_structure_cache_does_not_leak_across_screens():
+    # The guard that matters: the server 304s on a matching etag WITHOUT checking the
+    # screen, so a key that ignored screen_id would serve GL101000's metadata for
+    # AP301000. A second screen must therefore be fetched in FULL, never revalidated.
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup"),
+                        "AP301000": _struct_body("APInvoice")})
+    gl = asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    ap = asyncio.run(_struct_client("AP301000", http).get_ui_structure())
+    assert gl["primary_dac"] == "FinYearSetup"
+    assert ap["primary_dac"] == "APInvoice"
+    assert http.full == 2 and http.conditional == 0
+    assert http.sent_inm == [None, None]  # no cross-screen etag replay
+
+
+def test_structure_refresh_forces_full_fetch():
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    s = _struct_client("GL101000", http)
+    asyncio.run(s.get_ui_structure())
+    asyncio.run(s.get_ui_structure(refresh=True))
+    assert http.full == 2 and http.sent_inm == [None, None]
+
+
+def test_clear_struct_cache_drops_entries():
+    from grp_mcp.screen import clear_struct_cache
+    http = _StructHTTP({"GL101000": _struct_body("FinYearSetup")})
+    asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    assert clear_struct_cache()  # returns the keys it dropped
+    asyncio.run(_struct_client("GL101000", http).get_ui_structure())
+    # cache was empty -> a full fetch with no conditional header
+    assert http.full == 2 and http.sent_inm == [None, None]
+
+
+class _EchoHTTP:
+    """Like _FakeHTTP, but a Save can ECHO grid rows back (as the real plane does).
+
+    Counts reads vs Saves separately so a test can assert the bulk path stopped
+    re-reading the whole grid between chunks.
+    """
+
+    def __init__(self, read_body: dict, grid: str, echo_rows=None):
+        self.calls: list[dict] = []
+        self.reads = 0
+        self.saves = 0
+        self._read = read_body
+        self._grid = grid
+        self._echo = echo_rows
+
+    async def post(self, url, json=None, headers=None):  # noqa: A002
+        payload = json or {}
+        self.calls.append(payload)
+        if payload.get("command"):
+            self.saves += 1
+            body: dict = {"messages": []}
+            if self._echo is not None:
+                body["controlsData"] = {self._grid: {"rows": self._echo}}
+            return _Resp(200, body)
+        self.reads += 1
+        return _Resp(200, self._read)
+
+    async def aclose(self):
+        pass
+
+
+def _rows(n: int) -> list:
+    return [{"id": f"r{i}", "cells": {"LineNbr": {"value": str(i)}}}
+            for i in range(1, n + 1)]
+
+
+def _bulk(echo_rows, chunk_size=2, n=4):
+    rows = _rows(n)
+    s = _client("GL202500")
+    http = _EchoHTTP(_read_body("Details", [{"field": "LineNbr"}, {"field": "Descr"}],
+                                rows, ["LineNbr"]), "Details", echo_rows=echo_rows)
+    s._http = http
+    out = asyncio.run(s.ui_update_grid_rows(
+        "Details",
+        [{"key": {"LineNbr": str(i)}, "values": {"Descr": f"d{i}"}} for i in range(1, n + 1)],
+        skip_validation=True, chunk_size=chunk_size))
+    return out, http
+
+
+def test_update_grid_rows_reuses_save_echo_instead_of_rereading():
+    # The full-grid echo a Save returns carries fresh row ids, so chunk 2 must be
+    # mapped from it — the whole-grid re-read per chunk was the dominant cost.
+    out, http = _bulk(echo_rows=_rows(4))
+    assert out["updated"] == 4 and out["chunks"] == 2 and out["ok"]
+    assert http.saves == 2
+    assert http.reads == 1  # the initial read only
+
+
+def test_update_grid_rows_rereads_when_save_echoes_nothing():
+    # No echo -> must fall back to a real read, i.e. the old behaviour.
+    out, http = _bulk(echo_rows=None)
+    assert out["updated"] == 4 and out["chunks"] == 2
+    assert http.reads == 2  # initial + one re-read between the chunks
+
+
+def test_update_grid_rows_rereads_on_partial_echo():
+    # A SHORT echo is a delta, not the grid: reusing it would drop rows from the map
+    # and mis-report them as not_found. Must re-read instead.
+    out, http = _bulk(echo_rows=_rows(4)[:1])
+    assert out["updated"] == 4 and out["chunks"] == 2
+    assert out["not_found"] == []
+    assert http.reads == 2
 
 
 def test_delete_payload_sends_key_in_values():

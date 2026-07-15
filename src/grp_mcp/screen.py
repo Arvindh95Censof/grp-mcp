@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import re
 import time
 import uuid
@@ -38,7 +39,12 @@ from .config import Instance
 # server has since dropped is invalidated on the next auth failure so the next call re-logs.
 _SESSION_CACHE: dict[str, dict] = {}          # key -> {"cookies": httpx.Cookies, "at": ts, "kind": str}
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}  # key -> lock (serialize logins per identity)
-_SESSION_TTL = 240.0                          # reuse a cached cookie for up to 4 min
+# Reuse a cached cookie for up to 15 min. This is a LOCAL freshness bound, not the
+# server's: Acumatica's forms-auth idle timeout is typically 20-60 min, so the old 240s
+# meant any pause longer than 4 min (routine between agent turns) forced a logout+login
+# — 2 extra serial round-trips before the tool did any work. `at` is refreshed on every
+# reuse (see _ensure_login), so a continuously-used session never goes stale at all.
+_SESSION_TTL = 900.0
 
 
 def _session_lock(key: str) -> asyncio.Lock:
@@ -46,6 +52,82 @@ def _session_lock(key: str) -> asyncio.Lock:
     if lock is None:
         lock = _SESSION_LOCKS[key] = asyncio.Lock()
     return lock
+
+
+# --- shared UI-plane /structure cache (ETag-validated) ------------------------
+# /structure is the ONLY discovery endpoint on the modern plane (no slimming params
+# exist: ?fields=/?parts=/?$select= are ignored, /schema + /fields + /views 404), and
+# it is FAT — measured live on 25.101: AP301000 264KB, IN202500 250KB, FA303000 91KB.
+# It was re-fetched on every call from ~15 call sites with no cache, because the only
+# cache (_ui_meta) is per-ScreenClient and every tool builds a fresh client.
+#
+# The endpoint sends an ETag, so we revalidate instead of re-downloading: a conditional
+# GET costs ~100ms/0 bytes vs ~280ms/270KB (measured). Entries store the etag + the
+# parsed projection.
+#
+# CAUTION — the ETag is NOT a per-screen content hash. It is an environment stamp that
+# is IDENTICAL for every screen on a tenant:
+#     25.101.0153.0049$0$<user>$<tenant>$en-MY$61$$28323058
+#     build            $?$db         $tenant      $locale$user$$metadata-version
+# Verified live: sending AP301000's ETag to GL101000's URL returns 304. The server does
+# NOT scope the validator per screen, so a cache that mixes up keys will silently serve
+# the WRONG screen's structure. Hence the key includes screen_id and we only ever send
+# an entry's OWN etag back to its OWN url. The user + locale ride in the stamp too, so
+# the key includes the session identity (base_url|username|tenant) rather than base_url.
+_STRUCT_CACHE: dict[str, dict] = {}  # key -> {"etag": str|None, "parsed": dict}
+# Seconds an entry is served with NO revalidation at all. 0 (default) = always send a
+# conditional GET, which is always correct. Raise it via GRP_MCP_STRUCT_TTL to trade a
+# staleness window for ~100ms/call; a customization publish clears the cache regardless.
+_STRUCT_TTL = float(os.environ.get("GRP_MCP_STRUCT_TTL", "0") or 0)
+
+
+# --- shared UI-plane HTTP pool ------------------------------------------------
+# Every ScreenClient used to build its own httpx.AsyncClient, so although the LOGIN was
+# shared via _SESSION_CACHE, the connection pool was not: each of the ~60 per-tool-call
+# ScreenClients paid a fresh TCP + TLS handshake (~2-3 RTT) before its first byte. These
+# are pooled by session identity (so cookie scope matches _SESSION_CACHE exactly — a
+# pooled client is never shared across sites/users/tenants) plus timeout (only 3 call
+# sites use a non-default one, all short polls). Pooled clients outlive any single
+# ScreenClient, so aclose() must NOT close them; close_http_pool() does, at shutdown.
+_HTTP_POOL: dict[str, httpx.AsyncClient] = {}
+
+
+def _pooled_http(key: str, timeout: float) -> httpx.AsyncClient:
+    pk = f"{key}|{timeout}"
+    c = _HTTP_POOL.get(pk)
+    if c is None or c.is_closed:
+        c = _HTTP_POOL[pk] = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    return c
+
+
+async def close_http_pool() -> list[str]:
+    """Close every pooled UI-plane HTTP client. For process shutdown only — closing a
+    pooled client mid-session forces the next ScreenClient to re-handshake."""
+    items = list(_HTTP_POOL.items())
+    _HTTP_POOL.clear()
+    for _, c in items:
+        try:
+            await c.aclose()
+        except Exception:  # noqa: BLE001 — best-effort at shutdown
+            pass
+    return [k for k, _ in items]
+
+
+def clear_struct_cache(key: str | None = None) -> list[str]:
+    """Drop cached /structure entries (all, or every entry for one identity prefix).
+
+    Call after anything that can change screen metadata — publishing/unpublishing a
+    customization is the real one, since that bumps the metadata-version segment of
+    the ETag for every screen at once.
+    """
+    if key is None:
+        cleared = list(_STRUCT_CACHE)
+        _STRUCT_CACHE.clear()
+        return cleared
+    hit = [k for k in _STRUCT_CACHE if k.startswith(key)]
+    for k in hit:
+        _STRUCT_CACHE.pop(k, None)
+    return hit
 
 
 def clear_session_cache(key: str | None = None) -> list[str]:
@@ -340,7 +422,8 @@ class ScreenClient:
     def __init__(self, instance: Instance, screen_id: str, timeout: float = 120.0) -> None:
         self.instance = instance
         self.screen_id = screen_id.upper()
-        self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        self._http = _pooled_http(f"{instance.base_url}|{instance.username}|{instance.tenant}",
+                                  timeout)
         self.seat_reliever = None
         self._logged_in = False
         self._cookie_session = False  # True if logged in via /entity/auth/login (non-SOAP)
@@ -353,6 +436,9 @@ class ScreenClient:
         self._active_tree_context_views: dict | None = None
         self._active_grid_row: dict | None = None  # see ui_select_grid_row
         self._ui_meta: dict[tuple[str, str], dict] | None = None  # (view,field)->meta cache
+        self._struct: dict | None = None  # per-client /structure memo (see _STRUCT_CACHE)
+        self._graph_dirty: bool | None = None   # last observed graphIsDirty (None = unknown)
+        self._rejected_sets: list[dict] = []    # sets the plane silently dropped
 
     @property
     def url(self) -> str:
@@ -498,6 +584,12 @@ class ScreenClient:
             if cached and (time.monotonic() - cached["at"]) < _SESSION_TTL:
                 # reuse the shared cookie — no new login, no extra seat
                 self._http.cookies.update(cached["cookies"])
+                # Slide the freshness window forward on every reuse. The TTL exists to
+                # bound how long we trust a cookie we haven't exercised; a session that
+                # is actively being used has just proven itself, so a busy identity now
+                # never pays the stale-path logout+login (it used to, every TTL, purely
+                # because `at` was only ever set at creation).
+                cached["at"] = time.monotonic()
                 self._logged_in = True
                 self._cookie_session = cached["kind"] == "cookie"
                 self._shared = True
@@ -550,11 +642,12 @@ class ScreenClient:
             pass
 
     async def aclose(self) -> None:
+        # NOTE: self._http is POOLED (see _pooled_http) and shared with every other
+        # ScreenClient of this identity — closing it here would tear down a pool that
+        # in-flight clients are still using, and put back the per-call TLS handshake
+        # this pool exists to remove. The pool is closed once, at shutdown, by
+        # close_http_pool(). Only the session is released here.
         await self.logout()
-        try:
-            await self._http.aclose()
-        except Exception:
-            pass
 
     # ---- modern UI-screen plane (/ui/screen/<ScreenID>) ------------------
     #
@@ -633,6 +726,45 @@ class ScreenClient:
             return f"HTTP {resp.status_code}: {resp.text[:300]}"
         return None
 
+    @staticmethod
+    def _notices(j: Any) -> list[dict]:
+        """The NON-error messages from a modern-plane response — the yellow/blue toasts
+        the browser shows top-right.
+
+        _ui_error deliberately surfaces only messageType=="error" on an HTTP 200, because
+        its return value RAISES and a warning is not a failure. The cost of that filter
+        was that warnings and info were dropped entirely: "the period is closed", "the
+        year is already generated" — exactly the messages that explain why a write was
+        accepted with a clean 200 and then quietly did nothing. They belong on the
+        RESULT, not on an exception, so they are extracted separately here.
+
+        Errors are excluded: those already raise via _ui_error, and repeating them as a
+        notice would report one failure twice.
+        """
+        if not isinstance(j, dict):
+            return []
+        out = []
+        for m in (j.get("messages") or []):
+            if not isinstance(m, dict) or not m.get("message"):
+                continue
+            mtype = str(m.get("messageType") or "info").lower()
+            if mtype == "error":
+                continue
+            out.append({"type": mtype, "message": m["message"]})
+        return out
+
+    @classmethod
+    def _annotate_notices(cls, j: Any) -> Any:
+        """Tag a raw plane response with its non-error messages under `@grp.notices`.
+
+        The `@grp.` prefix marks the key as added by this server, not returned by
+        Acumatica, so it can never be mistaken for a server field.
+        """
+        notices = cls._notices(j)
+        if notices and isinstance(j, dict):
+            j["@grp.notices"] = notices
+        return j
+
     async def ui_bootstrap(self, views: list[str] | None = None) -> None:
         """Load the modern-UI graph, populating the given views from the DB.
 
@@ -651,12 +783,19 @@ class ScreenClient:
         """
         await self._ensure_login()
         vp = {v: {} for v in (views or [])}
-        await self._http.post(
+        resp = await self._http.post(
             self.ui_url,
             json={"isFirstRequest": True, "data": [], "controlsParams": {},
                   "activeRowContexts": [], "viewsParams": vp},
             headers=_UI_HEADERS,
         )
+        # Record the graph's dirty state from the LOAD (a load should leave it clean).
+        # ui_set_field's silent-rejection check needs a KNOWN-clean starting point —
+        # see there for why it can't just assume one.
+        try:
+            self._graph_dirty = (resp.json() or {}).get("graphIsDirty")
+        except Exception:  # noqa: BLE001 — non-JSON body; leave the state unknown
+            self._graph_dirty = None
         self._ui_booted = True
         self._classic_used = False
         self._active_tree_row = None  # a fresh graph has no node selected
@@ -682,12 +821,28 @@ class ScreenClient:
         the same technique ui_grid_read uses for a master-detail parent (some
         screens only resolve on the LAST field of a composite key).
         """
+        if not key:
+            raise ValueError(
+                f"ui_navigate_record {view} on {self.screen_id}: `key` is empty — pass the "
+                f"key field(s) identifying the record to select.")
+        resp = None
         for f, v in key.items():
             resp = await self._ui_post({
                 "data": [{"viewName": view, "fieldName": f, "value": str(v),
                           "rowId": "", "changeType": 5}],
                 "controlsParams": {}, "activeRowContexts": [], "viewsParams": {},
             })
+            # Only a HARD failure is checked per-field. A composite key resolves on its
+            # LAST field, so an intermediate response legitimately carries a business
+            # error ("record not found") while half the key is set — raising on that
+            # would break the very screens this method exists for. An HTTP >=400 is not
+            # that: it's the transport/server failing, and continuing to post more
+            # fields at a broken graph only buries the cause.
+            if resp.status_code >= 400:
+                raise ScreenError(
+                    f"ui_navigate_record {view}.{f} on {self.screen_id}: "
+                    f"{self._ui_error(resp)}")
+        # Business errors are judged on the final response, once the whole key is set.
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
@@ -1043,7 +1198,13 @@ class ScreenClient:
             raise ScreenError(f"ui_populate_entity_fields save on {self.screen_id}: {err}")
         return save_resp.json()
 
-    async def get_ui_structure(self) -> dict:
+    @property
+    def _struct_key(self) -> str:
+        """Cache key for this screen's /structure — see _STRUCT_CACHE on why the
+        session identity (not just base_url) AND the screen_id must both be in it."""
+        return f"{self._session_key}|{self.screen_id}"
+
+    async def get_ui_structure(self, refresh: bool = False) -> dict:
         """Read the modern UI-screen `/structure` — the schema/metadata endpoint.
 
         The modern-plane analog of get_schema(): returns the screen's views +
@@ -1051,9 +1212,33 @@ class ScreenClient:
         action inventory (enabled/visible/confirmation message), and grid key
         fields. Use it to discover what ui_set_field/ui_command can drive on any
         screen — no browser capture needed. Read-only GET (stateless, no bootstrap).
+
+        Cached twice over (see _STRUCT_CACHE): a per-client memo makes the repeat
+        calls within one tool call free, and the shared cache revalidates with the
+        endpoint's ETag (~100ms/0 bytes) instead of re-downloading (~280ms/270KB).
+        Safe to cache precisely BECAUSE the GET is stateless — it describes screen
+        metadata, not record state, which is why the server's own validator is keyed
+        on build+tenant+locale+metadata-version and not on any graph state.
+        refresh=True forces a full re-fetch and re-seeds both layers.
         """
+        if self._struct is not None and not refresh:
+            return self._struct
+        key = self._struct_key
+        entry = None if refresh else _STRUCT_CACHE.get(key)
+        if entry is not None and _STRUCT_TTL > 0 and (
+                time.monotonic() - entry["at"]) < _STRUCT_TTL:
+            self._struct = entry["parsed"]
+            return self._struct
+
         await self._ensure_login()
-        resp = await self._http.get(self.ui_url + "/structure", headers={"Accept": "application/json"})
+        url = self.ui_url + "/structure"
+        headers = {"Accept": "application/json"}
+        if entry and entry.get("etag"):
+            # ONLY ever this entry's own etag, on this entry's own url. The server
+            # 304s on an etag match without checking the screen (proven live), so
+            # replaying one screen's etag at another's url would serve wrong metadata.
+            headers["If-None-Match"] = entry["etag"]
+        resp = await self._http.get(url, headers=headers)
         err = self._ui_error(resp)
         if err and self._shared and "not authenticated" in err.lower():
             # reused cookie was dropped server-side — re-login fresh and retry once
@@ -1061,12 +1246,26 @@ class ScreenClient:
             self._logged_in = False
             self._shared = False
             await self._ensure_login()
-            resp = await self._http.get(self.ui_url + "/structure",
-                                        headers={"Accept": "application/json"})
+            resp = await self._http.get(url, headers=headers)
             err = self._ui_error(resp)
         if err:
             raise ScreenError(f"get_ui_structure {self.screen_id}: {err}")
-        d = resp.json()
+        if resp.status_code == 304:
+            if entry is not None:  # validated: our copy is still current
+                entry["at"] = time.monotonic()
+                self._struct = entry["parsed"]
+                return self._struct
+            # 304 with nothing cached (entry evicted mid-flight) — no body to parse,
+            # so re-ask unconditionally rather than returning something wrong.
+            return await self.get_ui_structure(refresh=True)
+        parsed = self._parse_structure(resp.json())
+        _STRUCT_CACHE[key] = {"etag": resp.headers.get("ETag"), "parsed": parsed,
+                              "at": time.monotonic()}
+        self._struct = parsed
+        return parsed
+
+    def _parse_structure(self, d: dict) -> dict:
+        """Project the raw /structure descriptor into the compact shape callers use."""
         views: dict[str, list] = {}
         for vname, fields in (d.get("fieldStates") or {}).items():
             if not isinstance(fields, list):
@@ -1132,6 +1331,7 @@ class ScreenClient:
         # record's OWN key (you create it HERE) — not a foreign-key prerequisite you
         # populate on another screen. Compare on the leaf class name (namespaces vary).
         own = {_leaf(struct.get("screen_graph")), _leaf(struct.get("primary_dac"))} - {None}
+        jobs: list[tuple[dict, dict]] = []  # (entry, field meta) for the selectors to probe
         for vname, fields in (struct.get("views") or {}).items():
             for f in fields:
                 if not (f.get("required") and f.get("enabled") and not f.get("readonly")):
@@ -1139,32 +1339,50 @@ class ScreenClient:
                 fname, label = f.get("field"), f.get("label")
                 entry = {"view": vname, "field": fname, "label": label}
                 if f.get("selector"):
-                    sel_graph = (f["selector"] or {}).get("graph")
-                    try:
-                        r = await self.ui_resolve_selector(vname, fname, "")
-                    except ScreenError as e:
-                        probe_errors.append({**entry, "probe_error": str(e)})
-                        continue
-                    n = r.get("row_count", 0)
-                    self_key = _leaf(sel_graph) in own
-                    if n and not self_key:
-                        satisfiable.append({**entry, "kind": "selector", "candidates": n})
-                    elif self_key:
-                        # own key: you're creating this record's key value here, not
-                        # sourcing it elsewhere. Not a prereq regardless of row_count.
-                        supply.append({**entry, "kind": "new_key",
-                                       "existing": n, "selector_graph": sel_graph})
-                    else:
-                        gaps.append({**entry, "kind": "empty_selector_source",
-                                     "selector_graph": sel_graph,
-                                     "reason": "required lookup has NO candidate rows — populate "
-                                               "its source screen before this field can be set."})
+                    jobs.append((entry, f))
                 elif f.get("options"):
                     supply.append({**entry, "kind": "enum",
                                    "allowed": [o.get("value") for o in f["options"]]})
                 else:
                     supply.append({**entry, "kind": "scalar",
                                    "type": f.get("type")})
+
+        # Probe the required selectors CONCURRENTLY: each is an independent read-only
+        # query against its own lookup grid, with no graph state involved, so nothing
+        # here needs serializing. Bounded so a wide screen doesn't burst connections.
+        sem = asyncio.Semaphore(4)
+
+        async def _probe(entry: dict, f: dict) -> tuple[dict, dict, dict | None, str | None]:
+            async with sem:
+                try:
+                    # selector_probe, NOT ui_resolve_selector: it takes the struct we
+                    # already hold, where ui_resolve_selector re-fetches /structure per
+                    # field. Same payload builder and same rows, so this is a drop-in.
+                    return entry, f, await self.selector_probe(
+                        struct, entry["view"], entry["field"], ""), None
+                except ScreenError as e:
+                    return entry, f, None, str(e)
+
+        # gather preserves input order, so the report stays deterministic.
+        for entry, f, r, perr in await asyncio.gather(*(_probe(e, f) for e, f in jobs)):
+            if perr is not None:
+                probe_errors.append({**entry, "probe_error": perr})
+                continue
+            sel_graph = (f["selector"] or {}).get("graph")
+            n = len((r or {}).get("rows") or [])
+            self_key = _leaf(sel_graph) in own
+            if n and not self_key:
+                satisfiable.append({**entry, "kind": "selector", "candidates": n})
+            elif self_key:
+                # own key: you're creating this record's key value here, not
+                # sourcing it elsewhere. Not a prereq regardless of row_count.
+                supply.append({**entry, "kind": "new_key",
+                               "existing": n, "selector_graph": sel_graph})
+            else:
+                gaps.append({**entry, "kind": "empty_selector_source",
+                             "selector_graph": sel_graph,
+                             "reason": "required lookup has NO candidate rows — populate "
+                                       "its source screen before this field can be set."})
         return {"gaps": gaps, "satisfiable": satisfiable, "supply": supply,
                 "probe_errors": probe_errors}
 
@@ -1240,6 +1458,7 @@ class ScreenClient:
         (separate graph state).
         """
         v = value if isinstance(value, (dict, bool)) else str(value)
+        was_dirty = self._graph_dirty
         resp = await self._ui_post({
             "data": [{"viewName": view, "fieldName": field, "value": v,
                        "rowId": "", "changeType": 5}],
@@ -1248,6 +1467,46 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_set_field {view}.{field} on {self.screen_id}: {err}")
+        try:
+            now_dirty = (resp.json() or {}).get("graphIsDirty")
+        except Exception:  # noqa: BLE001 — non-JSON body; state unknown
+            now_dirty = None
+        self._graph_dirty = now_dirty if now_dirty is not None else was_dirty
+        # SILENT-REJECTION NET — a NARROW one. Read the coverage note before trusting it.
+        #
+        # This plane reports NOTHING when it refuses a value: no messages, no fieldStates,
+        # no error — just a clean 200. The only signal is graphIsDirty, readable in one
+        # direction only:
+        #   clean -> still clean  = the set was REFUSED (nothing staged).
+        #   clean -> dirty        = the value landed. NOT proof it is valid.
+        #
+        # MEASURED COVERAGE (live, 2026-07-15, 5 screens / 4 graphs). It fires on ONE:
+        #   GL101000 FiscalYearSetup.BegFinYear = "NOT-A-DATE"  -> clean  (REFUSED)  <-- only hit
+        #   AP301000 Document.DocDate           = "NOT-A-DATE"  -> dirty  (accepted!)
+        #   GL301000 BatchModule.DateEntered    = "NOT-A-DATE"  -> dirty  (accepted!)
+        #   AP101000 Setup.PastDue00            = "abc" (Int16) -> dirty  (accepted!)
+        #   CS101500 commonsetup.DecPlQty       = "abc" (Int16) -> dirty  (accepted!)
+        #   AP101000 Setup.<read-only field>    = write         -> dirty  (accepted!)
+        # So this is NOT a general validity guard and not even general to dates —
+        # BegFinYear happens to have a validating setter. Most bad values sail through as
+        # clean->dirty and this net never sees them. It is a cheap true-positive catcher,
+        # nothing more; do not read "no rejected_fields" as "the values were good".
+        # The read-only/bad-enum class is ui_coerce_validate's job (metadata-based), which
+        # in turn cannot catch an unparseable date. The two are complementary and BOTH
+        # partial.
+        #
+        # No false positives observed across those 5 screens. "No change" is specifically
+        # NOT one: setting a field to its own current value still returns dirty=True
+        # (verified against the record's live value on GL101000 and AP101000).
+        # LIMIT: once the graph is dirty it stays dirty, so a refusal AFTER the first
+        # successful set is invisible here. Only flag on a KNOWN-clean graph — was_dirty
+        # None means we never observed it, and guessing would cry wolf.
+        if was_dirty is False and now_dirty is False:
+            self._rejected_sets.append({
+                "view": view, "field": field, "value": v,
+                "reason": "the screen silently REFUSED this value — the graph stayed "
+                          "clean, so nothing was staged. The value was NOT written.",
+            })
 
     async def ui_resolve_selector(self, view: str, field: str, search: str,
                                    pick: dict | None = None) -> dict:
@@ -1387,7 +1646,9 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
-        return resp.json()
+        # A command that "succeeds" but was actually declined explains itself in a
+        # WARNING toast, not an error — carry it back instead of dropping it.
+        return self._annotate_notices(resp.json())
 
     @staticmethod
     def _is_processing(j: dict) -> bool:
@@ -1458,9 +1719,16 @@ class ScreenClient:
             raise ScreenError(f"ui_run_process {action} on {self.screen_id}: {err}")
         j = resp.json()
         waited = 0.0
+        # Back off from a short first wait up to poll_interval, instead of sleeping the
+        # full interval before the FIRST poll. Most process actions here finish in well
+        # under a second, and the old fixed 3s meant every one of them cost 3s of pure
+        # sleep. The cap keeps a genuinely long process at the same steady-state poll
+        # rate (and the same request count) as before.
+        delay = min(0.25, poll_interval)
         while waited < timeout and self._is_processing(j):
-            await asyncio.sleep(poll_interval)
-            waited += poll_interval
+            await asyncio.sleep(delay)
+            waited += delay
+            delay = min(delay * 2, poll_interval)
             rp = await self._ui_post({"command": [{"name": "actionCloseProcessing"}],
                 "data": [], "controlsParams": {}, "activeRowContexts": [], "viewsParams": {}})
             if self._ui_error(rp):
@@ -1786,7 +2054,9 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"{op} {grid_view}{dataKey or ''} on {self.screen_id}: {err}")
-        return resp.json()
+        # Grid Saves are the classic silent-no-op surface: a clean 200 whose warning
+        # toast is the only clue the rows didn't take. Carry it on the result.
+        return self._annotate_notices(resp.json())
 
     @staticmethod
     def _parse_grid_cols(columns: list | None) -> dict[str, dict]:
@@ -1911,7 +2181,7 @@ class ScreenClient:
     async def ui_update_grid_rows(self, grid_view: str, updates: list[dict],
                                   parent: dict | None = None,
                                   skip_validation: bool = False,
-                                  chunk_size: int = 100) -> dict:
+                                  chunk_size: int = 500) -> dict:
         """Update MANY existing grid rows — ONE grid read + ONE Save per chunk.
 
         The bulk peer of ui_update_grid_row, which re-reads the ENTIRE grid to
@@ -1922,28 +2192,37 @@ class ScreenClient:
         row in one read, commit the batch in one Save.
 
         updates:    [{"key": {keyField: value}, "values": {field: newValue}}, ...]
-        chunk_size: rows per Save. The grid is RE-READ before each chunk — a Save
-            returns fresh row ids, so reusing a stale read across Saves would send
-            ids the server no longer honours.
+        chunk_size: rows per Save.
+
+        The grid is read ONCE up front. A Save echoes the grid back with fresh row
+        ids (the same echo _verify_stored_key relies on), so each chunk re-seeds the
+        next chunk's row map from its own Save response instead of paying another
+        full read — the read was the dominant cost, not the Save (that 6977-row grid
+        was 70 chunks x ~1.6 MB = ~112 MB of pure re-reading). A fresh read is still
+        issued if a Save echoes no usable rows, so correctness never depends on the
+        echo being present.
 
         A row whose key matches nothing is collected in `not_found` and a row whose
         cells fail validation in `validation_errors`; neither aborts the run (the
         rest still commit), mirroring screen_bulk_load's per-row isolation.
-        Returns {ok, total, updated, chunks, not_found, validation_errors}.
+        Returns {ok, total, updated, chunks, not_found, validation_errors, notices?}.
+        `notices` carries any WARNING/INFO toast a chunk's Save returned (tagged with
+        its chunk) — those are not errors, but they are how the screen says it ignored
+        what you sent, so `updated` counts rows SENT, not rows the screen kept.
         """
         if not updates:
             return {"ok": True, "total": 0, "updated": 0, "chunks": 0,
                     "not_found": [], "validation_errors": []}
         not_found: list[dict] = []
         refusals: list[dict] = []
+        notices: list[dict] = []
         updated = chunks = 0
         step = max(int(chunk_size), 1)
+        g = await self.ui_grid_read(grid_view, parent)
+        # column meta is per-grid, not per-row (and not per-chunk) — resolve once.
+        cmeta = {} if skip_validation else await self._grid_col_meta(grid_view, g)
         for start in range(0, len(updates), step):
             batch = updates[start:start + step]
-            g = await self.ui_grid_read(grid_view, parent)
-            # column meta is per-grid, not per-row — resolve once per chunk rather
-            # than paying _grid_write_guard's lookup for every row.
-            cmeta = {} if skip_validation else await self._grid_col_meta(grid_view, g)
             changes: list[dict] = []
             last_full: dict | None = None
             for u in batch:
@@ -1964,13 +2243,44 @@ class ScreenClient:
             if not changes:
                 continue
             # dataKey mirrors the browser: the row the cursor ends on after the edits.
-            await self._grid_save(grid_view, g, {"modified": changes}, last_full,
-                                  "ui_update_grid_rows", parent)
+            save_resp = await self._grid_save(grid_view, g, {"modified": changes}, last_full,
+                                              "ui_update_grid_rows", parent)
             updated += len(changes)
             chunks += 1
-        return {"ok": not refusals and not not_found, "total": len(updates),
-                "updated": updated, "chunks": chunks,
-                "not_found": not_found, "validation_errors": refusals}
+            # A warning toast on a chunk explains an accepted-but-ignored Save; keep it
+            # per-chunk so it can be tied back to which rows it applied to.
+            for n in self._notices(save_resp):
+                notices.append({"chunk": chunks, **n})
+            if start + step >= len(updates):
+                break  # last chunk — nothing left to re-map
+            g = await self._regrid(grid_view, g, save_resp, parent)
+        out = {"ok": not refusals and not not_found, "total": len(updates),
+               "updated": updated, "chunks": chunks,
+               "not_found": not_found, "validation_errors": refusals}
+        if notices:
+            out["notices"] = notices
+            out["note"] = ("The screen returned warning/info messages — `updated` counts "
+                           "rows SENT, not rows the screen necessarily kept. Read them.")
+        return out
+
+    async def _regrid(self, grid_view: str, g: dict, save_resp: Any,
+                      parent: dict | None) -> dict:
+        """Row map for the NEXT chunk: reuse the Save's echoed rows when they look like
+        a full-grid echo, else re-read.
+
+        A Save echoes controlsData.<grid>.rows with fresh ids (pageSize is set to the
+        whole grid in _grid_ctrl), which makes the re-read redundant. The guard is the
+        row COUNT: an update-only Save cannot shrink the grid, so an echo with fewer
+        rows than we had is a partial/delta echo, not the full grid — reusing it would
+        silently lose rows from the map and report them `not_found`. That falls back to
+        a real read, i.e. exactly the old behaviour.
+        """
+        echoed = None
+        if isinstance(save_resp, dict):
+            echoed = (((save_resp.get("controlsData") or {}).get(grid_view)) or {}).get("rows")
+        if echoed and len(echoed) >= len(g.get("rows") or []):
+            return {**g, "rows": echoed}
+        return await self.ui_grid_read(grid_view, parent)
 
     async def ui_insert_grid_row(self, grid_view: str, values: dict,
                                  parent: dict | None = None,

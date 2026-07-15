@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
@@ -43,6 +45,30 @@ def looks_like_seat_limit(text: str | None, status: int | None = None) -> bool:
     return bool(text and _SEAT_LIMIT_PAT.search(text))
 
 
+def _retry_after_seconds(resp: httpx.Response, default: float = 1.0,
+                         cap: float = 30.0) -> float:
+    """Seconds to wait per a 429's Retry-After header (delta-seconds or HTTP-date).
+
+    Falls back to `default` when absent/unparseable, and is capped so a server that
+    asks for a very long wait can't stall a tool call past its own timeout.
+    """
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, min(float(raw), cap))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        delta = (when - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, min(delta, cap))
+    except Exception:  # noqa: BLE001 — unparseable date; use the default
+        return default
+
+
 # A reliever frees seats by logging out OTHER cached sessions; it takes the client to
 # EXCLUDE (never log out the one mid-request). Wired by server.py at import so both
 # client types can self-recover from a seat-limit fault without the tool layer retrying.
@@ -72,6 +98,7 @@ class AcumaticaClient:
         self._refresh_token: str | None = None
         self._expires_at: float = 0.0
         self._swagger: dict | None = None
+        self._csdl: str | None = None  # DAC OData CSDL ($metadata) — see dac_metadata
         self._token_lock = asyncio.Lock()  # serialize token fetch -> one session, not N
         self.seat_reliever: Optional[SeatReliever] = None
 
@@ -223,7 +250,7 @@ class AcumaticaClient:
     # ---- request plumbing ----------------------------------------------
 
     async def _request_raw(self, method: str, url: str, _seat_retried: bool = False,
-                           **kwargs: Any) -> httpx.Response:
+                           _rate_retried: bool = False, **kwargs: Any) -> httpx.Response:
         """Issue an authenticated request and return the raw httpx.Response.
 
         Used for binary payloads (file downloads, report PDFs) and when the caller
@@ -248,6 +275,18 @@ class AcumaticaClient:
             headers.update(await self._auth_header())
             resp = await self._http.request(method, url, headers=headers, **kwargs)
         if resp.status_code >= 400:
+            # A 429 whose body does NOT mention the seat limit is ordinary THROTTLING.
+            # Back off and retry just this request. Letting it fall through to the seat
+            # path below would call _relieve_api_seats, which logs out and evicts every
+            # cached client + UI session process-wide — turning a brief rate limit into
+            # a full cold start (fresh OAuth + login + swagger refetch) for the next
+            # call. If the retry still 429s, the seat path below still gets its shot.
+            if (resp.status_code == 429 and not _rate_retried
+                    and not _SEAT_LIMIT_PAT.search(resp.text or "")):
+                await asyncio.sleep(_retry_after_seconds(resp))
+                return await self._request_raw(
+                    method, url, _seat_retried=_seat_retried, _rate_retried=True,
+                    headers=headers, **kwargs)
             # seat exhaustion mid-request: free other cached sessions and retry once.
             if not _seat_retried and looks_like_seat_limit(resp.text, resp.status_code):
                 if await self._relieve_seats_once():
@@ -561,8 +600,8 @@ class AcumaticaClient:
             kw["timeout"] = httpx.Timeout(timeout, connect=min(30.0, timeout))
         return await self._request("GET", url, **kw)
 
-    async def dac_metadata(self) -> str:
-        """Fetch the DAC-based OData CSDL ($metadata) as XML text.
+    async def dac_metadata(self, refresh: bool = False) -> str:
+        """Fetch the DAC-based OData CSDL ($metadata) as XML text (cached per client).
 
         Returns the EDMX/CSDL document describing every exposed DAC: its
         properties, types, key, and Nullable flag (Nullable="false" = mandatory).
@@ -570,9 +609,17 @@ class AcumaticaClient:
         JSON metadata ("only supported at platform implementing .NETStandard 2.0"),
         and does NOT take $format. This is the only reliable mandatory-field source
         for DACs (incl. single-row config DACs like GLSetup that serve no collection).
+
+        Cached like get_swagger: this is the largest single document the server hands
+        back (it describes EVERY exposed DAC) and it only changes when the published
+        DAC surface does, yet it was re-fetched on every call — validate_import_setup
+        alone pulled it twice per invocation.
         """
-        url = f"{self.instance.dac_odata_base}/$metadata"
-        return await self._request("GET", url, headers={"Accept": "application/xml"})
+        if self._csdl is None or refresh:
+            url = f"{self.instance.dac_odata_base}/$metadata"
+            self._csdl = await self._request(
+                "GET", url, headers={"Accept": "application/xml"})
+        return self._csdl
 
     # ---- report entities (contract API, async) -------------------------
 
