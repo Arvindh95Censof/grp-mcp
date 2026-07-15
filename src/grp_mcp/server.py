@@ -1772,88 +1772,31 @@ async def ui_screen_action(
     """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
 
     The general driver for the modern plane. Use it for screens/actions the classic
-    screen SOAP engine can't reach: notably dialog-driven actions whose classic tag
-    is a silent no-op (e.g. GL201000 "Generate Calendar"), and plain record edits
-    (set fields + action="Save"). Reuses the same login session as the rest of the
-    engine — no browser, no separate auth.
+    screen SOAP engine can't reach: dialog-driven actions whose classic tag is a silent
+    no-op (e.g. GL201000 "Generate Calendar"), and plain record edits (set fields +
+    action="Save"). Same login session as the rest of the engine — no browser.
 
-    WRITE SAFETY (parity with screen_submit): before firing, each set_field is
-    checked against the screen's /structure metadata — a read-only field or an
-    invalid enum value is REFUSED up front (returns ok:false + validation_errors)
-    instead of being accepted with a clean 200 and silently dropped. An enum's
-    DISPLAY TEXT is auto-coerced to its option value (pass "Reversed" OR "R"). The
-    `view` may be omitted when the field name is unique across the screen's views
-    (it's resolved for you). skip_validation=true bypasses; verify=true re-reads the
-    screen after the action and reports whether the graph still shows unsaved changes.
+    action:      internal command from ui_get_structure `actions` ("Save", "generateYears").
+    set_fields:  [{"view", "field", "value"}] from ui_get_structure; `view` optional when
+        the field name is unique. Enum display text is coerced to its value.
+    record_key / tree_select / grid_select: select a keyed HEADER record, a TREE node, or
+        a DATA-GRID row before the action. Each is REQUIRED on some screens and the
+        failure mode without it is a SILENT no-op or an opaque later error, not a clear
+        one — see the notes before driving an unfamiliar screen.
+    save_after:  commit a "fill"-type action that only stages changes (else they are lost).
+    dialog_answer: "ok"|"yes"|"no"|"cancel"|"none" ("none" returns the dialog unanswered).
+    skip_validation / verify: bypass the write guard, or re-read after the action.
 
-    set_fields:  optional list of {"view": <ViewName>, "field": <FieldName>,
-        "value": <value>} — from ui_get_structure. `view` optional if the field name
-        is unambiguous. For enum fields pass the option value OR its display text
-        (auto-coerced); booleans are "true"/"false".
-    tree_select: optional {"view": <TreeView>, "key": {keyField: value},
-        "parent_key": {keyField: value} (omit for a root-level node)} — selects a
-        node in a TREE control (e.g. SM207060's EntityTree) before set_fields/action
-        run, the modern-plane equivalent of clicking it. Trees aren't normal data
-        grids (ui_insert_grid_row etc. throw a null-reference against one); an
-        action like "InsertNew" that depends on a selected tree node silently
-        no-ops without this. `key`/`parent_key` come from ui_read_grid(tree_view)
-        rows. Selection stays active for set_fields + action in THIS call only
-        (each ui_screen_action call is its own fresh session).
-    grid_select: optional {"view": <GridView>, "key": {keyField: value}} — marks an
-        existing DATA-GRID row as the graph's current row before the action, the
-        modern-plane equivalent of clicking a detail-grid row. REQUIRED for codebehind
-        actions that operate on the selected row: e.g. SM206015 `fillSchemaFields`
-        faults "A schema object is not selected" without it. `key` is the grid's FULL
-        key (ui_get_structure grids[view].key_fields; e.g. {"ProviderID": <id>,
-        "LineNbr": 1}) — for a detail grid, navigate the header first via record_key so
-        the right parent's rows load. Pair with save_after=true for fill/generate
-        actions that stage changes needing a commit. Proven live 2026-07-14.
-    save_after: after the action, fire a Save in the SAME session (default False). A
-        "fill"/edit-type action (fillSchemaFields, ...) leaves graphIsDirty=true and is
-        LOST when the session closes; save_after commits it. Skipped when action itself
-        is "Save". The result's `saved` reports the post-Save graphIsDirty (False = ok).
-    record_key:  optional {"view": <ViewName>, "key": {keyField: value}} — selects
-        a SPECIFIC EXISTING record before tree_select/set_fields/action run. Needed
-        whenever the screen's PRIMARY view is itself keyed to one record instead of
-        being a single always-current one (e.g. SM207060's Endpoint header —
-        InterfaceName + GateVersion identify WHICH endpoint you're editing).
-        Omitting this on such a screen doesn't error — the dialog can still open —
-        but committing later fails opaquely ("The Insert button is disabled", proven
-        live) because the graph never actually loaded a valid record. Most
-        Preferences/Setup screens don't need this (nothing to select).
-    action:      the internal command to fire after setting (from ui_get_structure
-        `actions`), e.g. "Save" to commit a record edit, or a screen action like
-        "generateYears".
-    dialog_answer: how to answer a confirmation dialog the action opens — "ok"
-        (default), "yes", "no", "cancel", or "none" to NOT answer it: the call then
-        returns {dialog_open: true, dialog_view} so you can see what the screen is
-        asking (useful when an action raises an UNEXPECTED secondary dialog you
-        don't want blindly confirmed) and re-fire with an explicit answer.
+    Read-only fields and invalid enums are REFUSED up front (a clean 200 would otherwise
+    drop them silently). Validation failures RETURN {ok:false, status:"validation_failed",
+    flagged_fields, required_fields} rather than raising — that means the screen IS
+    writable and you should supply the missing field and retry, NOT that it's unreachable.
 
-    Business/validation errors are returned as an ACTIONABLE result, not raised:
-    {ok:false, status:"validation_failed", reachable:true, writable:true, message,
-    flagged_fields, required_fields, guidance}. This is deliberate — a rejection like
-    "PCB Pay Code can not be empty" proves the screen IS reachable and writable (the
-    write reached Acumatica's business rules); it means "supply the missing field and
-    retry", NOT "this screen can't be set up". Fill the flagged/required fields and
-    re-call. PRECONDITION (KB-first policy): consult kb-mcp for the screen's
-    prerequisites first — an unconfigured module returns "PREREQUISITE NOT MET". Requires allow_write; a DESTRUCTIVE action (Delete,
-    ...) additionally requires allow_delete. Only FORM-view fields are supported;
-    grid-cell edits aren't yet (no per-row addressing). Verify the write with
-    ui_get_structure, screen_get, or run_dac_odata.
+    KB-first: check the screen's prerequisites before writing. Requires allow_write
+    (+ allow_delete for destructive actions). FORM-view fields only — no grid-cell edits.
+    Verify writes via ui_get_structure / screen_get / run_dac_odata.
 
-    Example — generate financial periods (what generate_master_calendar does):
-        ui_screen_action("GL201000", action="generateYears",
-            set_fields=[{"view":"GenerateParams","field":"FromYear","value":"2026"},
-                        {"view":"GenerateParams","field":"ToYear","value":"2026"}])
-    Example — edit a record: set fields, then Save:
-        ui_screen_action("GL102000", action="Save",
-            set_fields=[{"view":"GLSetupRecord","field":"ConsolidatedPosting","value":"true"}])
-    Example — insert a node under a selected TREE row (SM207060 Endpoint Structure —
-    record_key selects WHICH endpoint; tree_select then selects its root node):
-        ui_screen_action("SM207060", action="InsertNew",
-            record_key={"view":"Endpoint","key":{"InterfaceName":"GRPMCP","GateVersion":"25.200.001"}},
-            tree_select={"view":"EntityTree","key":{"Key":"ROOT#GRPMCP"}})
+    Arg shapes, live-proven traps + worked examples: guide(topic="ui_screen_action").
     """
     _require_write(instance)
     # A destructive action deletes data — hold it to the stricter allow_delete gate,
@@ -6356,6 +6299,98 @@ async def _probe_exists(client, dac: str, key: str):
         return None
 
 
+# Long-form per-tool caveats, relocated OUT of the tool docstrings.
+#
+# Every docstring is prefilled into the model's context on EVERY request, so carrying
+# the full reverse-engineering narrative on ~97 tools (112k chars, ~28k tokens) taxes
+# every turn to serve a page that most calls never open. The knowledge is NOT deleted:
+# the trimmed docstring still NAMES each trap in a line (so a reader knows there is
+# something to look up, which is what stops the silent-no-op class of bug), and the
+# full text — captured payload shapes, proof dates, worked examples — is served on
+# demand by guide(topic="<tool_name>").
+#
+# Rule when trimming a docstring: the summary line, the argument semantics, and the
+# permission gates STAY (they drive tool selection and safety). Provenance, live-proof
+# narration, and examples MOVE here.
+_TOOL_NOTES: dict[str, str] = {
+    "ui_screen_action": """\
+ui_screen_action — full notes.
+
+WRITE SAFETY (parity with screen_submit): before firing, each set_field is checked
+against the screen's /structure metadata — a read-only field or an invalid enum value
+is REFUSED up front (returns ok:false + validation_errors) instead of being accepted
+with a clean 200 and silently dropped. An enum's DISPLAY TEXT is auto-coerced to its
+option value (pass "Reversed" OR "R"). The `view` may be omitted when the field name is
+unique across the screen's views. skip_validation=true bypasses; verify=true re-reads
+the screen after the action and reports whether the graph still shows unsaved changes.
+
+set_fields: [{"view": <ViewName>, "field": <FieldName>, "value": <value>}] — from
+    ui_get_structure. `view` optional if the field name is unambiguous. For enum fields
+    pass the option value OR its display text (auto-coerced); booleans are "true"/"false".
+
+tree_select: {"view": <TreeView>, "key": {keyField: value}, "parent_key": {...} (omit
+    for a root-level node)} — selects a node in a TREE control (e.g. SM207060's
+    EntityTree) before set_fields/action run, the modern-plane equivalent of clicking
+    it. Trees aren't normal data grids (ui_insert_grid_row etc. throw a null-reference
+    against one); an action like "InsertNew" that depends on a selected tree node
+    silently no-ops without this. `key`/`parent_key` come from ui_read_grid(tree_view)
+    rows. Selection stays active for set_fields + action in THIS call only (each
+    ui_screen_action call is its own fresh session).
+
+grid_select: {"view": <GridView>, "key": {keyField: value}} — marks an existing
+    DATA-GRID row as the graph's current row before the action, the modern-plane
+    equivalent of clicking a detail-grid row. REQUIRED for codebehind actions that
+    operate on the selected row: e.g. SM206015 `fillSchemaFields` faults "A schema
+    object is not selected" without it. `key` is the grid's FULL key (ui_get_structure
+    grids[view].key_fields; e.g. {"ProviderID": <id>, "LineNbr": 1}) — for a detail
+    grid, navigate the header first via record_key so the right parent's rows load.
+    Pair with save_after=true for fill/generate actions that stage changes needing a
+    commit. Proven live 2026-07-14.
+
+save_after: after the action, fire a Save in the SAME session (default False). A
+    "fill"/edit-type action (fillSchemaFields, ...) leaves graphIsDirty=true and is LOST
+    when the session closes; save_after commits it. Skipped when action itself is
+    "Save". The result's `saved` reports the post-Save graphIsDirty (False = ok).
+
+record_key: {"view": <ViewName>, "key": {keyField: value}} — selects a SPECIFIC
+    EXISTING record before tree_select/set_fields/action run. Needed whenever the
+    screen's PRIMARY view is itself keyed to one record instead of being a single
+    always-current one (e.g. SM207060's Endpoint header — InterfaceName + GateVersion
+    identify WHICH endpoint you're editing). Omitting this on such a screen doesn't
+    error — the dialog can still open — but committing later fails opaquely ("The
+    Insert button is disabled", proven live) because the graph never actually loaded a
+    valid record. Most Preferences/Setup screens don't need this.
+
+dialog_answer: how to answer a confirmation dialog the action opens — "ok" (default),
+    "yes", "no", "cancel", or "none" to NOT answer it: the call then returns
+    {dialog_open: true, dialog_view} so you can see what the screen is asking (useful
+    when an action raises an UNEXPECTED secondary dialog you don't want blindly
+    confirmed) and re-fire with an explicit answer.
+
+Business/validation errors are returned as an ACTIONABLE result, not raised:
+{ok:false, status:"validation_failed", reachable:true, writable:true, message,
+flagged_fields, required_fields, guidance}. This is deliberate — a rejection like "PCB
+Pay Code can not be empty" proves the screen IS reachable and writable (the write
+reached Acumatica's business rules); it means "supply the missing field and retry", NOT
+"this screen can't be set up".
+
+Examples —
+  generate financial periods (what generate_master_calendar does):
+    ui_screen_action("GL201000", action="generateYears",
+        set_fields=[{"view":"GenerateParams","field":"FromYear","value":"2026"},
+                    {"view":"GenerateParams","field":"ToYear","value":"2026"}])
+  edit a record: set fields, then Save:
+    ui_screen_action("GL102000", action="Save",
+        set_fields=[{"view":"GLSetupRecord","field":"ConsolidatedPosting","value":"true"}])
+  insert a node under a selected TREE row (SM207060 Endpoint Structure — record_key
+  selects WHICH endpoint; tree_select then selects its root node):
+    ui_screen_action("SM207060", action="InsertNew",
+        record_key={"view":"Endpoint","key":{"InterfaceName":"GRPMCP","GateVersion":"25.200.001"}},
+        tree_select={"view":"EntityTree","key":{"Key":"ROOT#GRPMCP"}})
+""",
+}
+
+
 _GUIDE = {
     "start_here": (
         "grp-mcp exposes Acumatica over FOUR planes. Don't guess — pick by task shape "
@@ -6514,9 +6549,16 @@ def guide(topic: str | None = None) -> Any:
         "planes". Omit for the full overview. (For a SPECIFIC screen use
         screen_capabilities(screen_id); for financial-foundation setup use
         get_setup_guidance.)
+
+        A TOOL NAME (e.g. "ui_screen_action") returns that tool's full notes — the
+        arg shapes, live-proven traps and worked examples kept out of its docstring so
+        they don't cost every request. Pass one before driving an unfamiliar screen.
     """
     if topic:
         t = topic.strip().lower()
+        note = _TOOL_NOTES.get(t)
+        if note:
+            return {"tool": t, "notes": note}
         aliases = {
             "read": "read data", "write": "write ONE record", "grid": "grid rows",
             "process": "run a process / mass-action",
@@ -6540,7 +6582,8 @@ def guide(topic: str | None = None) -> Any:
                     "golden_rules": _GUIDE["start_here"]}
         return {"error": f"unknown topic {topic!r}",
                 "topics": sorted(set(aliases) | {"planes"}),
-                "tip": "omit topic for the full overview."}
+                "tool_notes": sorted(_TOOL_NOTES),
+                "tip": "omit topic for the full overview; pass a tool name for its notes."}
     return _GUIDE
 
 

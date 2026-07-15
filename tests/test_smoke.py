@@ -311,6 +311,45 @@ def test_update_payload_resends_key_in_values():
     assert ctrl["dataKey"] == {"AccountCD": "40000"} and mod["id"] == "g8"
 
 
+# ---- relocated tool notes ---------------------------------------------------
+#
+# Trimming a docstring only saves tokens if the text it dropped is still REACHABLE.
+# These lock both halves of that bargain: guide() serves every note, and no docstring
+# advertises a note that doesn't exist.
+
+def test_guide_serves_every_relocated_tool_note():
+    from grp_mcp.server import _TOOL_NOTES, guide
+    assert _TOOL_NOTES, "no notes relocated yet"
+    for name, text in _TOOL_NOTES.items():
+        got = guide(topic=name)
+        assert got["tool"] == name
+        assert got["notes"] == text
+
+
+def test_unknown_guide_topic_lists_available_tool_notes():
+    from grp_mcp.server import _TOOL_NOTES, guide
+    got = guide(topic="definitely-not-a-topic")
+    assert "error" in got
+    assert got["tool_notes"] == sorted(_TOOL_NOTES)
+
+
+def test_docstring_note_pointers_resolve():
+    # A docstring saying guide(topic="X") must actually reach a note named X, or the
+    # trim silently destroyed the guidance instead of relocating it.
+    import pathlib
+    import re
+    from grp_mcp import server as _server
+    from grp_mcp.server import _TOOL_NOTES
+    src = pathlib.Path(_server.__file__).read_text(encoding="utf-8")
+    pointed = set(re.findall(r'guide\(topic="([a-z_]+)"\)', src))
+    # the generic routing topics guide() already knew about are not tool notes
+    pointed -= {"read", "write", "grid", "process", "setup", "lookup", "customization",
+                "import", "files", "actions", "session", "discover", "planes"}
+    assert pointed, "no docstring points at a tool note"
+    missing = pointed - set(_TOOL_NOTES)
+    assert not missing, f"docstrings point at notes that don't exist: {sorted(missing)}"
+
+
 # ---- /structure ETag cache --------------------------------------------------
 #
 # The endpoint's ETag is an ENVIRONMENT stamp, identical for every screen on a
