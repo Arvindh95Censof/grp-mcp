@@ -1472,17 +1472,32 @@ class ScreenClient:
         except Exception:  # noqa: BLE001 — non-JSON body; state unknown
             now_dirty = None
         self._graph_dirty = now_dirty if now_dirty is not None else was_dirty
-        # SILENT-REJECTION NET. This plane reports NOTHING when it refuses a value: no
-        # messages, no fieldStates, no error — just a clean 200 (probed live on GL101000,
-        # 2026-07-15). The one signal is graphIsDirty, and it is only readable in this
-        # one direction:
-        #   clean -> still clean  = the set was REFUSED (e.g. an unparseable date).
-        #   clean -> dirty        = the value landed. NOT proof it is valid: a write to a
-        #                           READ-ONLY field also returns dirty (hence the separate
-        #                           metadata guard in ui_coerce_validate, which catches the
-        #                           read-only/bad-enum class this cannot).
-        # "No change" is NOT a false positive: setting a field to its own current value
-        # still returns dirty=True (verified against the record's live value).
+        # SILENT-REJECTION NET — a NARROW one. Read the coverage note before trusting it.
+        #
+        # This plane reports NOTHING when it refuses a value: no messages, no fieldStates,
+        # no error — just a clean 200. The only signal is graphIsDirty, readable in one
+        # direction only:
+        #   clean -> still clean  = the set was REFUSED (nothing staged).
+        #   clean -> dirty        = the value landed. NOT proof it is valid.
+        #
+        # MEASURED COVERAGE (live, 2026-07-15, 5 screens / 4 graphs). It fires on ONE:
+        #   GL101000 FiscalYearSetup.BegFinYear = "NOT-A-DATE"  -> clean  (REFUSED)  <-- only hit
+        #   AP301000 Document.DocDate           = "NOT-A-DATE"  -> dirty  (accepted!)
+        #   GL301000 BatchModule.DateEntered    = "NOT-A-DATE"  -> dirty  (accepted!)
+        #   AP101000 Setup.PastDue00            = "abc" (Int16) -> dirty  (accepted!)
+        #   CS101500 commonsetup.DecPlQty       = "abc" (Int16) -> dirty  (accepted!)
+        #   AP101000 Setup.<read-only field>    = write         -> dirty  (accepted!)
+        # So this is NOT a general validity guard and not even general to dates —
+        # BegFinYear happens to have a validating setter. Most bad values sail through as
+        # clean->dirty and this net never sees them. It is a cheap true-positive catcher,
+        # nothing more; do not read "no rejected_fields" as "the values were good".
+        # The read-only/bad-enum class is ui_coerce_validate's job (metadata-based), which
+        # in turn cannot catch an unparseable date. The two are complementary and BOTH
+        # partial.
+        #
+        # No false positives observed across those 5 screens. "No change" is specifically
+        # NOT one: setting a field to its own current value still returns dirty=True
+        # (verified against the record's live value on GL101000 and AP101000).
         # LIMIT: once the graph is dirty it stays dirty, so a refusal AFTER the first
         # successful set is invisible here. Only flag on a KNOWN-clean graph — was_dirty
         # None means we never observed it, and guessing would cry wolf.
@@ -1490,8 +1505,7 @@ class ScreenClient:
             self._rejected_sets.append({
                 "view": view, "field": field, "value": v,
                 "reason": "the screen silently REFUSED this value — the graph stayed "
-                          "clean, so nothing was staged (typically an unparseable "
-                          "date/number for the field's type). The value was NOT written.",
+                          "clean, so nothing was staged. The value was NOT written.",
             })
 
     async def ui_resolve_selector(self, view: str, field: str, search: str,

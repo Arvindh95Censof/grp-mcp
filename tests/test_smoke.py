@@ -462,6 +462,16 @@ def test_set_field_does_not_guess_when_dirty_state_unknown():
     assert s._rejected_sets == []
 
 
+def test_set_field_net_misses_values_the_plane_accepts():
+    # COVERAGE, pinned so nobody re-generalizes this net from its one hit. Live probe
+    # (2026-07-15, 5 screens / 4 graphs) found most bad values are ACCEPTED into the
+    # graph -- AP301000 DocDate="NOT-A-DATE", "abc" into an Int16, even a read-only
+    # write, all returned dirty=True. clean->dirty is indistinguishable from a good
+    # set, so the net cannot flag them. "No rejected_fields" != "the values were good".
+    s = _set_field([False, True], value="NOT-A-DATE")   # accepted-but-invalid
+    assert s._rejected_sets == []
+
+
 def test_set_field_cannot_see_refusal_once_graph_is_dirty():
     # Documented LIMIT: dirty stays dirty, so a refusal after a successful set is
     # invisible. Pin it so nobody mistakes this net for a guarantee.
