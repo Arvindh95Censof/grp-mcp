@@ -311,6 +311,89 @@ def test_update_payload_resends_key_in_values():
     assert ctrl["dataKey"] == {"AccountCD": "40000"} and mod["id"] == "g8"
 
 
+# ---- warning/info toasts ----------------------------------------------------
+#
+# The top-right toast is `messages[]`. _ui_error only surfaces messageType=="error"
+# on a 200 -- correctly, since its return value raises and a warning is not a failure
+# -- so warnings/info were dropped entirely. They are the messages that explain an
+# accepted-but-ignored write, so they must ride on the RESULT instead.
+
+def test_notices_returns_warnings_and_info_not_errors():
+    j = {"messages": [
+        {"message": "The period is closed.", "messageType": "Warning"},
+        {"message": "3 rows skipped.", "messageType": "Info"},
+        {"message": "boom", "messageType": "Error"},   # already raises via _ui_error
+        {"message": "untyped note"},                     # no type -> info
+        {"messageType": "Warning"},                      # no text -> dropped
+    ]}
+    assert ScreenClient._notices(j) == [
+        {"type": "warning", "message": "The period is closed."},
+        {"type": "info", "message": "3 rows skipped."},
+        {"type": "info", "message": "untyped note"},
+    ]
+
+
+def test_notices_tolerates_junk():
+    assert ScreenClient._notices(None) == []
+    assert ScreenClient._notices({"messages": None}) == []
+    assert ScreenClient._notices({}) == []
+
+
+def test_warning_on_200_does_not_raise_but_is_reported():
+    # The whole point: a warning must NOT become an error (that filter is deliberate),
+    # yet must stop being invisible.
+    warn = _Resp(200, {"messages": [{"message": "Year already generated.",
+                                     "messageType": "Warning"}]})
+    assert ScreenClient._ui_error(warn) is None          # unchanged: does not raise
+    assert ScreenClient._notices(warn.json()) == [
+        {"type": "warning", "message": "Year already generated."}]
+
+
+def test_grid_save_annotates_notices():
+    class _WarnHTTP(_FakeHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            if (json or {}).get("command"):
+                return _Resp(200, {"messages": [{"message": "Row ignored.",
+                                                 "messageType": "Warning"}]})
+            return _Resp(200, self._read)
+
+    s = _client("GL202500")
+    s._http = _WarnHTTP(_read_body(
+        "AccountRecords", [{"field": "AccountCD"}, {"field": "Description"}],
+        [{"id": "g8", "cells": {"AccountCD": {"value": "40000"},
+                                "Description": {"value": "Sales"}}}], ["AccountCD"]))
+    out = asyncio.run(s.ui_update_grid_row("AccountRecords", {"AccountCD": "40000"},
+                                           {"Description": "New"}))
+    assert out["@grp.notices"] == [{"type": "warning", "message": "Row ignored."}]
+
+
+def test_update_grid_rows_surfaces_per_chunk_notices():
+    rows = _rows(4)
+    s = _client("GL202500")
+    http = _EchoHTTP(_read_body("Details", [{"field": "LineNbr"}, {"field": "Descr"}],
+                                rows, ["LineNbr"]), "Details", echo_rows=rows)
+    s._http = http
+    orig = http.post
+
+    async def post(url, json=None, headers=None):  # noqa: A002
+        r = await orig(url, json=json, headers=headers)
+        if (json or {}).get("command"):
+            body = dict(r.json())
+            body["messages"] = [{"message": "Locked.", "messageType": "Warning"}]
+            return _Resp(200, body)
+        return r
+
+    http.post = post
+    out = asyncio.run(s.ui_update_grid_rows(
+        "Details",
+        [{"key": {"LineNbr": str(i)}, "values": {"Descr": f"d{i}"}} for i in range(1, 5)],
+        skip_validation=True, chunk_size=2))
+    assert out["notices"] == [{"chunk": 1, "type": "warning", "message": "Locked."},
+                              {"chunk": 2, "type": "warning", "message": "Locked."}]
+    assert "note" in out  # updated counts rows SENT, not rows kept
+
+
 # ---- relocated tool notes ---------------------------------------------------
 #
 # Trimming a docstring only saves tokens if the text it dropped is still REACHABLE.

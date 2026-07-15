@@ -1770,6 +1770,11 @@ async def ui_screen_action(
     flagged_fields, required_fields} rather than raising — that means the screen IS
     writable and you should supply the missing field and retry, NOT that it's unreachable.
 
+    `notices` on the result carries the screen's WARNING/INFO toasts ("the period is
+    closed", "already generated"). They are not errors and do not fail the call, but
+    they are how a screen tells you it accepted the write and then ignored it — so an
+    ok:true WITH notices still warrants a read-back.
+
     KB-first: check the screen's prerequisites before writing. Requires allow_write
     (+ allow_delete for destructive actions). FORM-view fields only — no grid-cell edits.
     Verify writes via ui_get_structure / screen_get / run_dac_odata.
@@ -1878,11 +1883,17 @@ async def ui_screen_action(
         # save_after: a fill/edit action stages changes (graphIsDirty) that are LOST at
         # session close — commit them with a Save in THIS session (the selected grid row
         # stays active via _active_grid_row, auto-attached). Skip if the action WAS Save.
+        # Warning/info toasts from the action (and from the trailing Save). These are
+        # the messages that explain an accepted-but-ignored write; _ui_error drops them
+        # on a 200 by design (it raises, and a warning must not), so promote them to the
+        # result rather than leaving them buried in `raw`.
+        notices = list(s._notices(result))
         saved = None
         if save_after and action != "Save":
             save_res = await s.ui_command("Save", answer=dialog_answer)
             saved = save_res.get("graphIsDirty") if isinstance(save_res, dict) else None
             dirty = saved  # reflect the post-Save state
+            notices += s._notices(save_res)
         verified = None
         if verify:
             try:
@@ -1896,6 +1907,8 @@ async def ui_screen_action(
            "ok": ok, "raw": result}
     if coercions:
         out["coercions"] = coercions
+    if notices:
+        out["notices"] = notices
     if saved is not None:
         out["saved"] = (saved is False)
     if dirty is not None:

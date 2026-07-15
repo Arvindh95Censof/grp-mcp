@@ -724,6 +724,45 @@ class ScreenClient:
             return f"HTTP {resp.status_code}: {resp.text[:300]}"
         return None
 
+    @staticmethod
+    def _notices(j: Any) -> list[dict]:
+        """The NON-error messages from a modern-plane response — the yellow/blue toasts
+        the browser shows top-right.
+
+        _ui_error deliberately surfaces only messageType=="error" on an HTTP 200, because
+        its return value RAISES and a warning is not a failure. The cost of that filter
+        was that warnings and info were dropped entirely: "the period is closed", "the
+        year is already generated" — exactly the messages that explain why a write was
+        accepted with a clean 200 and then quietly did nothing. They belong on the
+        RESULT, not on an exception, so they are extracted separately here.
+
+        Errors are excluded: those already raise via _ui_error, and repeating them as a
+        notice would report one failure twice.
+        """
+        if not isinstance(j, dict):
+            return []
+        out = []
+        for m in (j.get("messages") or []):
+            if not isinstance(m, dict) or not m.get("message"):
+                continue
+            mtype = str(m.get("messageType") or "info").lower()
+            if mtype == "error":
+                continue
+            out.append({"type": mtype, "message": m["message"]})
+        return out
+
+    @classmethod
+    def _annotate_notices(cls, j: Any) -> Any:
+        """Tag a raw plane response with its non-error messages under `@grp.notices`.
+
+        The `@grp.` prefix marks the key as added by this server, not returned by
+        Acumatica, so it can never be mistaken for a server field.
+        """
+        notices = cls._notices(j)
+        if notices and isinstance(j, dict):
+            j["@grp.notices"] = notices
+        return j
+
     async def ui_bootstrap(self, views: list[str] | None = None) -> None:
         """Load the modern-UI graph, populating the given views from the DB.
 
@@ -1557,7 +1596,9 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_command {name} on {self.screen_id}: {err}")
-        return resp.json()
+        # A command that "succeeds" but was actually declined explains itself in a
+        # WARNING toast, not an error — carry it back instead of dropping it.
+        return self._annotate_notices(resp.json())
 
     @staticmethod
     def _is_processing(j: dict) -> bool:
@@ -1963,7 +2004,9 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"{op} {grid_view}{dataKey or ''} on {self.screen_id}: {err}")
-        return resp.json()
+        # Grid Saves are the classic silent-no-op surface: a clean 200 whose warning
+        # toast is the only clue the rows didn't take. Carry it on the result.
+        return self._annotate_notices(resp.json())
 
     @staticmethod
     def _parse_grid_cols(columns: list | None) -> dict[str, dict]:
@@ -2112,13 +2155,17 @@ class ScreenClient:
         A row whose key matches nothing is collected in `not_found` and a row whose
         cells fail validation in `validation_errors`; neither aborts the run (the
         rest still commit), mirroring screen_bulk_load's per-row isolation.
-        Returns {ok, total, updated, chunks, not_found, validation_errors}.
+        Returns {ok, total, updated, chunks, not_found, validation_errors, notices?}.
+        `notices` carries any WARNING/INFO toast a chunk's Save returned (tagged with
+        its chunk) — those are not errors, but they are how the screen says it ignored
+        what you sent, so `updated` counts rows SENT, not rows the screen kept.
         """
         if not updates:
             return {"ok": True, "total": 0, "updated": 0, "chunks": 0,
                     "not_found": [], "validation_errors": []}
         not_found: list[dict] = []
         refusals: list[dict] = []
+        notices: list[dict] = []
         updated = chunks = 0
         step = max(int(chunk_size), 1)
         g = await self.ui_grid_read(grid_view, parent)
@@ -2150,12 +2197,21 @@ class ScreenClient:
                                               "ui_update_grid_rows", parent)
             updated += len(changes)
             chunks += 1
+            # A warning toast on a chunk explains an accepted-but-ignored Save; keep it
+            # per-chunk so it can be tied back to which rows it applied to.
+            for n in self._notices(save_resp):
+                notices.append({"chunk": chunks, **n})
             if start + step >= len(updates):
                 break  # last chunk — nothing left to re-map
             g = await self._regrid(grid_view, g, save_resp, parent)
-        return {"ok": not refusals and not not_found, "total": len(updates),
-                "updated": updated, "chunks": chunks,
-                "not_found": not_found, "validation_errors": refusals}
+        out = {"ok": not refusals and not not_found, "total": len(updates),
+               "updated": updated, "chunks": chunks,
+               "not_found": not_found, "validation_errors": refusals}
+        if notices:
+            out["notices"] = notices
+            out["note"] = ("The screen returned warning/info messages — `updated` counts "
+                           "rows SENT, not rows the screen necessarily kept. Read them.")
+        return out
 
     async def _regrid(self, grid_view: str, g: dict, save_resp: Any,
                       parent: dict | None) -> dict:
