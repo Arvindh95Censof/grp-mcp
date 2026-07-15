@@ -1859,6 +1859,12 @@ async def ui_screen_action(
             s.ui_select_grid_row(grid_select["view"], grid_select["key"])
         for f in (set_fields or []):
             await s.ui_set_field(f["view"], f["field"], f["value"])
+        # READ-BACK GUARD: one round-trip, before the action fires. This plane discards a
+        # value it can't parse and returns a clean 200 — worse, it WIPES the field, so a
+        # Save would write the blank over existing data (proven live on AP301000.DueDate).
+        # Checked here rather than after the action so a doomed set is reported even when
+        # the action itself "succeeds" on the record without it.
+        read_back = await s.verify_sets(set_fields or [])
         try:
             result = await s.ui_command(action, answer=dialog_answer)
         except ScreenError as e:
@@ -1891,7 +1897,13 @@ async def ui_screen_action(
         # Values the plane silently refused (graph stayed clean). Captured before the
         # action fired, but reported on the result — the action may well have "succeeded"
         # on top of a field that never took.
-        rejected = list(s._rejected_sets)
+        # Both nets, deduped by field. They catch DIFFERENT failures and neither is
+        # redundant: the read-back sees a value that was discarded/wiped (dirty=True, so
+        # the dirty net is blind to it), while the dirty net sees a value refused outright
+        # without changing the field (nothing to read back, so the read-back is blind).
+        rejected = list(read_back)
+        seen = {(r["view"], r["field"]) for r in rejected}
+        rejected += [r for r in s._rejected_sets if (r["view"], r["field"]) not in seen]
         saved = None
         if save_after and action != "Save":
             save_res = await s.ui_command("Save", answer=dialog_answer)

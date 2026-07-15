@@ -394,6 +394,84 @@ def test_update_grid_rows_surfaces_per_chunk_notices():
     assert "note" in out  # updated counts rows SENT, not rows kept
 
 
+# ---- read-back guard --------------------------------------------------------
+#
+# The plane discards an unparseable value and WIPES the field (proven live on
+# AP301000: DueDate 2027-01-01 -> null, clean 200, graphIsDirty TRUE). A Save then
+# persists the blank over real data. Reading the field back is the only signal that
+# catches it -- but it must flag ONLY blank-after-non-blank, because the plane
+# reformats what it stores and value-equality would fire on every date.
+
+class _ReadBackHTTP:
+    """Serves scripted fieldStates to the read-back POST."""
+
+    def __init__(self, values):
+        self.values = values      # {(view, field): stored_value}
+        self.posts = 0
+
+    async def post(self, url, json=None, headers=None):  # noqa: A002
+        self.posts += 1
+        views = {}
+        for (v, f), val in self.values.items():
+            views.setdefault(v, []).append({"fieldName": f, "fieldState": {"value": val}})
+        return _Resp(200, {"graphIsDirty": True, "fieldStates": views, "messages": []})
+
+    async def aclose(self):
+        pass
+
+
+def _verify(sets, stored):
+    s = _client("AP301000")
+    s._http = _ReadBackHTTP(stored)
+    s._logged_in = True
+    s._ui_booted = True
+    return asyncio.run(s.verify_sets(sets)), s._http
+
+
+def test_read_back_flags_a_wiped_field():
+    # the live AP301000.DueDate case: sent a date, field now holds nothing
+    out, http = _verify([{"view": "Document", "field": "DueDate", "value": "NOT-A-DATE"}],
+                        {("Document", "DueDate"): None})
+    assert len(out) == 1
+    assert out[0]["field"] == "DueDate" and out[0]["stored"] is None
+    assert "did NOT take" in out[0]["reason"]
+    assert http.posts == 1  # ONE round-trip for the whole guard
+
+
+def test_read_back_does_not_flag_a_reformatted_value():
+    # THE false-positive trap: the plane stores its own format. Sent "01/01/2027",
+    # reads back "2027-01-01T00:00:00.0000000". Equality-checking would flag every
+    # date, enum and selector on every call -- so only blankness may be judged.
+    out, _ = _verify([{"view": "Document", "field": "DueDate", "value": "01/01/2027"}],
+                     {("Document", "DueDate"): "2027-01-01T00:00:00.0000000"})
+    assert out == []
+
+
+def test_read_back_ignores_deliberately_blank_sets():
+    # clearing a field on purpose is not a rejection
+    out, http = _verify([{"view": "Document", "field": "DueDate", "value": ""}],
+                        {("Document", "DueDate"): None})
+    assert out == [] and http.posts == 0  # nothing to check -> no round-trip at all
+
+
+def test_read_back_handles_selector_and_bool_shapes():
+    out, _ = _verify(
+        [{"view": "Document", "field": "Vendor", "value": {"id": "V1", "text": "Acme"}},
+         {"view": "Document", "field": "Hold", "value": True},
+         {"view": "Document", "field": "Ref", "value": "X"}],
+        {("Document", "Vendor"): {"id": "V1", "text": "Acme"},   # took
+         ("Document", "Hold"): False,                             # False is NOT blank
+         ("Document", "Ref"): "   "})                             # whitespace = blank
+    assert [r["field"] for r in out] == ["Ref"]
+
+
+def test_read_back_skips_fields_the_graph_did_not_echo():
+    # no fieldState for it -> nothing can be concluded, so don't guess
+    out, _ = _verify([{"view": "Document", "field": "Missing", "value": "x"}],
+                     {("Document", "DueDate"): None})
+    assert out == []
+
+
 # ---- silent-rejection net (graphIsDirty) ------------------------------------
 #
 # Probed live on GL101000 (2026-07-15): the plane reports NOTHING when it refuses a

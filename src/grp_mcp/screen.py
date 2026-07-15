@@ -1508,6 +1508,84 @@ class ScreenClient:
                           "clean, so nothing was staged. The value was NOT written.",
             })
 
+    async def read_field_values(self, views: list[str]) -> dict[tuple[str, str], Any]:
+        """Current GRAPH values for every field in `views` — ONE round-trip, no Save.
+
+        Asks the plane what it actually holds right now (as opposed to /structure, which
+        is stateless metadata and cannot answer this). Pass every view at once: the cost
+        is one POST regardless of how many.
+        """
+        if not views:
+            return {}
+        resp = await self._ui_post({
+            "data": [], "controlsParams": {}, "activeRowContexts": [],
+            "viewsParams": {v: {} for v in views if v},
+        })
+        out: dict[tuple[str, str], Any] = {}
+        try:
+            j = resp.json() or {}
+        except Exception:  # noqa: BLE001 — non-JSON body; nothing to read back
+            return out
+        for vname, fields in (j.get("fieldStates") or {}).items():
+            for f in fields or []:
+                if isinstance(f, dict) and f.get("fieldName"):
+                    out[(vname, f["fieldName"])] = (f.get("fieldState") or {}).get("value")
+        return out
+
+    @staticmethod
+    def _is_blank(v: Any) -> bool:
+        """True for a value the graph is treating as 'nothing there'."""
+        if v is None:
+            return True
+        if isinstance(v, str):
+            return not v.strip()
+        if isinstance(v, dict):  # selector cell {id, text}
+            return not (v.get("id") or v.get("text"))
+        return False
+
+    async def verify_sets(self, sets: list[dict]) -> list[dict]:
+        """Read the fields back and report any whose value did NOT take. ONE round-trip.
+
+        The strongest rejection signal this plane offers, and the only one that catches
+        SILENT DATA LOSS. Proven live on AP301000 (2026-07-15): setting an unparseable
+        date does not store garbage — it WIPES the field to null. On a REQUIRED field the
+        Save then fails loudly ("cannot be empty"), but on an OPTIONAL field that already
+        held a good value, the Save happily persists the null over real data: clean 200,
+        no message, and graphIsDirty is TRUE (the value did change — to nothing), so the
+        _rejected_sets net in ui_set_field cannot see it at all.
+
+        Deliberately narrow: it flags ONLY "sent something, field now holds nothing".
+        It does NOT compare values for equality, because the plane legitimately reformats
+        what it stores — send "01/01/2027", read back "2027-01-01T00:00:00.0000000" —
+        so equality would fire on every date, enum and selector. Blank-after-non-blank is
+        unambiguous; anything cleverer would cry wolf.
+
+        Complements (does not replace) ui_set_field's graphIsDirty net: a screen that
+        REFUSES a value outright without nulling it (GL101000 BegFinYear) leaves the field
+        unchanged, which this cannot see and the dirty net can.
+        """
+        targets = [s for s in sets or [] if s.get("view") and s.get("field")
+                   and not self._is_blank(s.get("value"))]
+        if not targets:
+            return []
+        live = await self.read_field_values(sorted({s["view"] for s in targets}))
+        out = []
+        for s in targets:
+            key = (s["view"], s["field"])
+            if key not in live:          # view/field not echoed — nothing to conclude
+                continue
+            if self._is_blank(live[key]):
+                out.append({
+                    "view": s["view"], "field": s["field"], "value": s["value"],
+                    "stored": live[key],
+                    "reason": "the value did NOT take — after the set, this field holds "
+                              "NOTHING. The screen accepted the write with a clean 200 and "
+                              "discarded it (an unparseable value for the field's type does "
+                              "this). If the field already had a value, it has been WIPED, "
+                              "and a Save would persist the blank over it.",
+                })
+        return out
+
     async def ui_resolve_selector(self, view: str, field: str, search: str,
                                    pick: dict | None = None) -> dict:
         """Resolve a lookup/selector FORM field to its `{id, text}` value — the modern
