@@ -437,6 +437,8 @@ class ScreenClient:
         self._active_grid_row: dict | None = None  # see ui_select_grid_row
         self._ui_meta: dict[tuple[str, str], dict] | None = None  # (view,field)->meta cache
         self._struct: dict | None = None  # per-client /structure memo (see _STRUCT_CACHE)
+        self._graph_dirty: bool | None = None   # last observed graphIsDirty (None = unknown)
+        self._rejected_sets: list[dict] = []    # sets the plane silently dropped
 
     @property
     def url(self) -> str:
@@ -781,12 +783,19 @@ class ScreenClient:
         """
         await self._ensure_login()
         vp = {v: {} for v in (views or [])}
-        await self._http.post(
+        resp = await self._http.post(
             self.ui_url,
             json={"isFirstRequest": True, "data": [], "controlsParams": {},
                   "activeRowContexts": [], "viewsParams": vp},
             headers=_UI_HEADERS,
         )
+        # Record the graph's dirty state from the LOAD (a load should leave it clean).
+        # ui_set_field's silent-rejection check needs a KNOWN-clean starting point —
+        # see there for why it can't just assume one.
+        try:
+            self._graph_dirty = (resp.json() or {}).get("graphIsDirty")
+        except Exception:  # noqa: BLE001 — non-JSON body; leave the state unknown
+            self._graph_dirty = None
         self._ui_booted = True
         self._classic_used = False
         self._active_tree_row = None  # a fresh graph has no node selected
@@ -1449,6 +1458,7 @@ class ScreenClient:
         (separate graph state).
         """
         v = value if isinstance(value, (dict, bool)) else str(value)
+        was_dirty = self._graph_dirty
         resp = await self._ui_post({
             "data": [{"viewName": view, "fieldName": field, "value": v,
                        "rowId": "", "changeType": 5}],
@@ -1457,6 +1467,32 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_set_field {view}.{field} on {self.screen_id}: {err}")
+        try:
+            now_dirty = (resp.json() or {}).get("graphIsDirty")
+        except Exception:  # noqa: BLE001 — non-JSON body; state unknown
+            now_dirty = None
+        self._graph_dirty = now_dirty if now_dirty is not None else was_dirty
+        # SILENT-REJECTION NET. This plane reports NOTHING when it refuses a value: no
+        # messages, no fieldStates, no error — just a clean 200 (probed live on GL101000,
+        # 2026-07-15). The one signal is graphIsDirty, and it is only readable in this
+        # one direction:
+        #   clean -> still clean  = the set was REFUSED (e.g. an unparseable date).
+        #   clean -> dirty        = the value landed. NOT proof it is valid: a write to a
+        #                           READ-ONLY field also returns dirty (hence the separate
+        #                           metadata guard in ui_coerce_validate, which catches the
+        #                           read-only/bad-enum class this cannot).
+        # "No change" is NOT a false positive: setting a field to its own current value
+        # still returns dirty=True (verified against the record's live value).
+        # LIMIT: once the graph is dirty it stays dirty, so a refusal AFTER the first
+        # successful set is invisible here. Only flag on a KNOWN-clean graph — was_dirty
+        # None means we never observed it, and guessing would cry wolf.
+        if was_dirty is False and now_dirty is False:
+            self._rejected_sets.append({
+                "view": view, "field": field, "value": v,
+                "reason": "the screen silently REFUSED this value — the graph stayed "
+                          "clean, so nothing was staged (typically an unparseable "
+                          "date/number for the field's type). The value was NOT written.",
+            })
 
     async def ui_resolve_selector(self, view: str, field: str, search: str,
                                    pick: dict | None = None) -> dict:

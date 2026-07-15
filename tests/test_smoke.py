@@ -394,6 +394,85 @@ def test_update_grid_rows_surfaces_per_chunk_notices():
     assert "note" in out  # updated counts rows SENT, not rows kept
 
 
+# ---- silent-rejection net (graphIsDirty) ------------------------------------
+#
+# Probed live on GL101000 (2026-07-15): the plane reports NOTHING when it refuses a
+# value -- no messages, no fieldStates, clean 200. graphIsDirty is the only signal,
+# and only in the clean->still-clean direction. These lock that reading, including
+# the control that makes it trustworthy and the limitation that bounds it.
+
+class _DirtyHTTP:
+    """Serves a scripted graphIsDirty per POST (bootstrap first, then each set)."""
+
+    def __init__(self, dirty_seq):
+        self.seq = list(dirty_seq)
+        self.calls = []
+
+    async def post(self, url, json=None, headers=None):  # noqa: A002
+        self.calls.append(json or {})
+        d = self.seq.pop(0) if self.seq else False
+        return _Resp(200, {"graphIsDirty": d, "messages": []})
+
+    async def aclose(self):
+        pass
+
+
+def _set_field(dirty_seq, value="x"):
+    s = _client("GL101000")
+    s._http = _DirtyHTTP(dirty_seq)
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", value))
+    return s
+
+
+def test_set_field_flags_silently_refused_value():
+    # bootstrap -> clean, set -> STILL clean = refused (the live invalid-date case)
+    s = _set_field([False, False], value="NOT-A-DATE")
+    assert len(s._rejected_sets) == 1
+    r = s._rejected_sets[0]
+    assert r["field"] == "BegFinYear" and r["value"] == "NOT-A-DATE"
+    assert "REFUSED" in r["reason"]
+
+
+def test_set_field_accepts_when_graph_goes_dirty():
+    # clean -> dirty = the value landed
+    assert _set_field([False, True])._rejected_sets == []
+
+
+def test_set_field_no_change_is_not_a_false_positive():
+    # THE control that makes this signal usable: setting a field to its own current
+    # value still returns dirty=True live, so clean->clean cannot be explained away as
+    # "nothing changed". If that ever regressed to dirty=False, this net would cry wolf
+    # on every no-op write -- so pin the accepted reading explicitly.
+    assert _set_field([False, True])._rejected_sets == []
+
+
+def test_set_field_does_not_guess_when_dirty_state_unknown():
+    # Never observed clean (non-JSON bootstrap) -> must NOT flag.
+    class _JunkHTTP(_DirtyHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            return _Resp(200, "not json")
+
+    s = _client("GL101000")
+    s._http = _JunkHTTP([])
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    assert s._graph_dirty is None
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", "x"))
+    assert s._rejected_sets == []
+
+
+def test_set_field_cannot_see_refusal_once_graph_is_dirty():
+    # Documented LIMIT: dirty stays dirty, so a refusal after a successful set is
+    # invisible. Pin it so nobody mistakes this net for a guarantee.
+    s = _client("GL101000")
+    s._http = _DirtyHTTP([False, True, True])
+    asyncio.run(s.ui_bootstrap(["FiscalYearSetup"]))
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "BegFinYear", "01/01/2027"))  # lands
+    asyncio.run(s.ui_set_field("FiscalYearSetup", "FinPeriods", "abc"))         # refused
+    assert s._rejected_sets == []  # not a bug: the signal genuinely cannot discriminate
+
+
 # ---- relocated tool notes ---------------------------------------------------
 #
 # Trimming a docstring only saves tokens if the text it dropped is still REACHABLE.

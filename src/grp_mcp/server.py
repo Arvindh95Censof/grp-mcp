@@ -1888,6 +1888,10 @@ async def ui_screen_action(
         # on a 200 by design (it raises, and a warning must not), so promote them to the
         # result rather than leaving them buried in `raw`.
         notices = list(s._notices(result))
+        # Values the plane silently refused (graph stayed clean). Captured before the
+        # action fired, but reported on the result — the action may well have "succeeded"
+        # on top of a field that never took.
+        rejected = list(s._rejected_sets)
         saved = None
         if save_after and action != "Save":
             save_res = await s.ui_command("Save", answer=dialog_answer)
@@ -1913,9 +1917,21 @@ async def ui_screen_action(
         out["saved"] = (saved is False)
     if dirty is not None:
         out["graph_is_dirty"] = dirty
+    # Both conditions below are silent-no-op reports and they can fire together, so
+    # collect the warnings rather than letting one overwrite the other.
+    warnings = []
     if not ok:
-        out["warning"] = ("Action 'Save' returned graphIsDirty=true — the change may NOT "
-                          "have persisted (silent no-op). Read the record back to confirm.")
+        warnings.append("Action 'Save' returned graphIsDirty=true — the change may NOT "
+                        "have persisted (silent no-op). Read the record back to confirm.")
+    if rejected:
+        out["rejected_fields"] = rejected
+        out["ok"] = False
+        warnings.append(
+            f"{len(rejected)} field value(s) were SILENTLY REFUSED by the screen and "
+            f"never written — see rejected_fields. The action still ran, so any result "
+            f"above reflects the record WITHOUT them. Fix the value(s) and re-run.")
+    if warnings:
+        out["warning"] = " ".join(warnings)
     if verified is not None:
         out["verified"] = verified
     return out
