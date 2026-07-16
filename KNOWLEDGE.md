@@ -140,6 +140,19 @@ Metadata guards (`ui_coerce_validate`) catch read-only fields and invalid enums 
 but **cannot** catch an unparseable date — right field, right type name, not read-only. The two
 mechanisms are complementary and neither is sufficient alone.
 
+**`/structure` exposes only ONE container per view name — fields on a "duplicate" tab are
+invisible to it, permanently.** A screen whose classic SOAP schema disambiguates several
+containers bound to the SAME view as `"ViewName"`, `"ViewName: 1"`, `"ViewName: 2"` (several
+tabs reading the same DAC) has those numbered duplicates' fields completely absent from
+`/structure` — proven live on PY309000: `PayMode` lives on `"Employments: 2"` per classic's
+schema, but modern's raw `/structure` JSON only ever has a plain `"Employments"` key, unaffected
+by `ui_bootstrap` or record navigation (there is nothing more to fetch — this is what Acumatica's
+endpoint actually returns). `ui_screen_action`'s unknown-field check used to be unconditional
+(not even `skip_validation` bypassed it); fixed in v0.62.0 — `skip_validation=true` now lets such
+a field through, reported in `unverifiable_fields`. That field is **not** verifiable via this
+plane's own read-back either (`verify_sets`/`read_field_values` share the exact same blind spot),
+so cross-check with `screen_get` (classic) or `run_dac_odata`/`get_entity` after saving.
+
 ### 4b. Warning/info toasts, and reading `messages[]` correctly
 
 The top-right toast **is** `messages[]`, typed by `messageType` (`error`/`warning`/`info`). Only

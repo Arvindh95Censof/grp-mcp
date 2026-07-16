@@ -3299,3 +3299,142 @@ def test_save_profile_new_profile_gets_defaults(tmp_path, monkeypatch):
     saved = cfg.instances["new"]
     assert saved.branch == ""
     assert saved.max_file_bytes == 50_000_000
+
+
+# ---- v0.62: ui_screen_action unknown-field escape hatch (2026-07-16 report) --
+#
+# grp-mcp's modern-plane /structure only ever exposes ONE container per view name.
+# A screen whose classic SOAP schema disambiguates several containers bound to the
+# SAME view as "ViewName", "ViewName: 1", "ViewName: 2" (multiple tabs reading the
+# same DAC — proven live on PY309000: PayMode lives on "Employments: 2") has those
+# numbered duplicates' fields completely absent from /structure. ui_screen_action's
+# unknown-field check was unconditional (not even skip_validation could bypass it),
+# so such a field could never be set through this tool. Fixed: skip_validation now
+# also lets an unknown-to-structure field through, reported in unverifiable_fields
+# (this plane's own read-back shares the same blind spot, so it's never silently
+# treated as verified).
+
+_PY_LIKE_STRUCT = {
+    "views": {
+        "Employments": [
+            {"field": "BasicPay", "label": "Basic Pay", "type": "Decimal",
+             "required": True, "readonly": False, "enabled": True,
+             "options": None, "selector": None, "lookup": None},
+        ],
+        "Employees": [
+            {"field": "EmployeeCD", "label": "Employee Code", "type": "String",
+             "required": True, "readonly": False, "enabled": True,
+             "options": None, "selector": None, "lookup": None},
+        ],
+    },
+    "actions": [{"name": "Save", "label": "Save", "enabled": True, "visible": True,
+                "confirm": None}],
+    "grids": {"EmpPayTransactions": {"key_fields": ["EmpPayTransactionID"],
+                                     "dac": "X", "columns": ["Amount"]}},
+}
+
+
+class _FakeUIScreenClient:
+    """Stands in for ScreenClient in ui_screen_action tests — real network/login
+    replaced with in-memory fakes for exactly the methods that function calls."""
+
+    def __init__(self, struct, dirty_after_action=False, set_field_errors=None):
+        self._struct = struct
+        self._rejected_sets: list[dict] = []
+        self._graph_dirty = None
+        self._dirty_after_action = dirty_after_action
+        self._set_field_errors = set_field_errors or {}
+        self.set_calls: list[tuple] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get_ui_structure(self):
+        return self._struct
+
+    async def ui_bootstrap(self, views):
+        pass
+
+    async def ui_navigate_record(self, view, key):
+        pass
+
+    async def ui_select_tree_node(self, view, key, parent_key):
+        pass
+
+    def ui_select_grid_row(self, view, key):
+        pass
+
+    async def ui_coerce_validate(self, sets):
+        return sets, [], []  # no read-only/enum issues — isolates the unknown-field path
+
+    async def ui_set_field(self, view, field, value):
+        self.set_calls.append((view, field, value))
+        if (view, field) in self._set_field_errors:
+            raise ScreenError(f"ui_set_field {view}.{field}: refused")
+
+    async def verify_sets(self, sets):
+        return []
+
+    async def ui_command(self, action, answer=None):
+        return {"graphIsDirty": self._dirty_after_action}
+
+    @staticmethod
+    def _notices(result):
+        return []
+
+
+def _patch_screen_client(monkeypatch, client):
+    monkeypatch.setattr(server, "ScreenClient", lambda inst, screen_id: client)
+
+
+def test_ui_screen_action_unknown_field_raises_by_default(cfg, monkeypatch):
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    with pytest.raises(ScreenError, match="unknown field"):
+        asyncio.run(server.ui_screen_action(
+            "PY309000", "Save",
+            set_fields=[{"view": "Employments", "field": "PayMode", "value": "C"}],
+            instance="rw"))
+
+
+def test_ui_screen_action_skip_validation_allows_unstructured_field(cfg, monkeypatch):
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    out = asyncio.run(server.ui_screen_action(
+        "PY309000", "Save",
+        set_fields=[{"view": "Employments", "field": "PayMode", "value": "C"}],
+        skip_validation=True, instance="rw"))
+    assert out["ok"] is True
+    assert ("Employments", "PayMode", "C") in client.set_calls  # actually attempted
+    assert len(out["unverifiable_fields"]) == 1
+    assert out["unverifiable_fields"][0]["view"] == "Employments"
+    assert out["unverifiable_fields"][0]["field"] == "PayMode"
+    assert "structure" in out["unverifiable_fields"][0]["reason"].lower()
+    assert "unverifiable_fields" in out["warning"]
+
+
+def test_ui_screen_action_skip_validation_still_blocks_grid_column(cfg, monkeypatch):
+    # a GRID column is a different mistake (wrong tool) — must still raise even
+    # with skip_validation=true, not silently downgraded like a genuinely-unknown field.
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    with pytest.raises(ScreenError, match="GRID column"):
+        asyncio.run(server.ui_screen_action(
+            "PY309000", "Save",
+            set_fields=[{"view": "EmpPayTransactions", "field": "Amount", "value": 5}],
+            skip_validation=True, instance="rw"))
+
+
+def test_ui_screen_action_known_field_has_no_unverifiable_fields(cfg, monkeypatch):
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    out = asyncio.run(server.ui_screen_action(
+        "PY309000", "Save",
+        set_fields=[{"view": "Employments", "field": "BasicPay", "value": 1000}],
+        instance="rw"))
+    assert out["ok"] is True
+    assert "unverifiable_fields" not in out
+    assert ("Employments", "BasicPay", 1000) in client.set_calls

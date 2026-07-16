@@ -558,6 +558,29 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.62.0 — **`ui_screen_action` can now reach fields /structure never exposes (external report, 2026-07-16, verified live on the reported screen before fixing).**
+`/structure` exposes only ONE container per view name — a screen whose classic SOAP
+schema disambiguates several containers bound to the SAME view as `"ViewName"`,
+`"ViewName: 1"`, `"ViewName: 2"` (multiple tabs reading the same DAC) has those
+numbered duplicates' fields completely absent from `/structure`, confirmed
+unaffected by `ui_bootstrap` or record navigation (nothing more to fetch — this is
+what Acumatica's own endpoint returns). Proven on the exact reported case: PY309000's
+`PayMode` lives on `"Employments: 2"` (classic schema) while modern's raw `/structure`
+JSON only ever has a plain `"Employments"` key. `ui_screen_action`'s unknown-field
+check was unconditional — `skip_validation` only ever bypassed the read-only/bad-enum
+check, never this one — so such a field could never be set through this tool, on any
+screen with this shape. Fixed: `skip_validation=true` now also lets an unknown-to-
+structure field through (a GRID-column misuse still raises unconditionally — that's a
+different mistake, not an invisible-to-structure field). These fields come back in a
+new `unverifiable_fields` list — never silently folded into a false-confidence
+`ok:true` — because this plane's own read-back (`verify_sets`/`read_field_values`)
+shares the exact same blind spot and genuinely cannot confirm they wrote correctly;
+cross-check with `screen_get` (classic) or `run_dac_odata`/`get_entity` after saving.
+238 tests green (4 new); the full fix — including the original unconditional refusal,
+the bypass, and the `unverifiable_fields` report — was verified live end-to-end on the
+real PY309000/AI MPM record from the bug report, discarding via `Cancel` so nothing
+persisted.
+
 v0.61.1 — **Fixed a misleading error message discovered live right after v0.61.0 shipped.**
 Live-tested the new session-only elevated-gate refusal (v0.61.0 #1) immediately post-restart:
 the error correctly refused, but its text — inherited unconditionally from the persist=true

@@ -1890,6 +1890,24 @@ async def ui_screen_action(
     dialog_answer: "ok"|"yes"|"no"|"cancel"|"none" ("none" returns the dialog unanswered).
     skip_validation / verify: bypass the write guard, or re-read after the action.
 
+    UNKNOWN-FIELD ESCAPE HATCH (skip_validation, fixed 2026-07-16): /structure only
+    ever exposes ONE container per view name — a screen whose SOAP schema disambiguates
+    several containers bound to the SAME view as "ViewName", "ViewName: 1", "ViewName: 2"
+    (multiple tabs/sections reading the same underlying DAC, e.g. PY309000's PayMode
+    lives on "Employments: 2") has those numbered duplicates' fields completely absent
+    from /structure — confirmed live: unaffected by ui_bootstrap or record navigation,
+    so there is nothing more to fetch. Previously `skip_validation` did NOT cover this
+    (it only bypassed the read-only/bad-enum check) — an unknown-to-structure field was
+    an unconditional hard raise with NO way around it, even though such a field can be
+    perfectly real and writable via classic (screen_submit/screen_get_schema DOES expose
+    "ViewName: N" containers). skip_validation=true now ALSO lets these through — but
+    `view` must be given explicitly (the friendly bare-field-name resolution lives in
+    the now-skipped coercion step). Such fields are echoed back in `unverifiable_fields`
+    (never silently merged into a false-confidence result): this plane's OWN read-back
+    (verify_sets/read_field_values) shares the exact same blind spot, so ui_screen_action
+    genuinely cannot confirm these fields wrote correctly — cross-check with screen_get
+    (classic plane) or run_dac_odata/get_entity after saving.
+
     Read-only fields and invalid enums are REFUSED up front (a clean 200 would otherwise
     drop them silently). Validation failures RETURN {ok:false, status:"validation_failed",
     flagged_fields, required_fields} rather than raising — that means the screen IS
@@ -1944,6 +1962,13 @@ async def ui_screen_action(
                 f"ui_screen_action: unknown view {record_key['view']!r} on "
                 f"{screen_id.upper()} (record_key). Views: {sorted(struct['views'])}"
             )
+        # Fields genuinely absent from /structure (e.g. bound only to a numbered-
+        # duplicate view container like "Employments: 2" that /structure never
+        # exposes — see docstring) are let through when skip_validation=true rather
+        # than an unconditional hard raise. Misusing this tool on a GRID column is a
+        # DIFFERENT mistake (wrong tool, not an invisible-to-structure field) and
+        # still raises unconditionally either way.
+        unverifiable_fields: list[dict] = []
         for f in (set_fields or []):
             if (f["view"], f["field"]) in valid_fields:
                 continue
@@ -1954,10 +1979,24 @@ async def ui_screen_action(
                     f"row use ui_update_grid_row (per-row addressing by key); to APPEND "
                     f"a row use screen_submit new_row."
                 )
+            if skip_validation:
+                unverifiable_fields.append({
+                    "view": f["view"], "field": f["field"],
+                    "reason": "not present in /structure (likely bound only to a "
+                              "numbered-duplicate view container /structure never "
+                              "exposes, e.g. 'ViewName: N') — set anyway because "
+                              "skip_validation=true, but this plane's own read-back "
+                              "shares the same blind spot and cannot confirm it wrote "
+                              "correctly. Cross-check with screen_get or run_dac_odata.",
+                })
+                continue
             avail = sorted(x["field"] for x in struct["views"].get(f["view"], []))
             raise ScreenError(
                 f"ui_screen_action: unknown field {f['view']}.{f['field']} on "
-                f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'}"
+                f"{screen_id.upper()}. Fields in view {f['view']!r}: {avail or '(view not found)'} "
+                f"(if this field is real but lives on a container /structure doesn't "
+                f"expose — e.g. a numbered-duplicate view like 'ViewName: 2' — retry with "
+                f"skip_validation=true; it will be set but reported as unverifiable)."
             )
         if grid_select and grid_select["view"] not in struct["grids"]:
             raise ScreenError(
@@ -2003,9 +2042,14 @@ async def ui_screen_action(
                 return _reframe_ui_validation(screen_id, action, msg, struct)
             raise
         if isinstance(result, dict) and result.get("dialog_open"):
-            # dialog_answer="none": surface the unanswered dialog instead of a result
-            return {"screen_id": screen_id.upper(), "action": action, "ok": None,
-                    **result}
+            # dialog_answer="none": surface the unanswered dialog instead of a result.
+            # set_fields already ran (above) even though the action hasn't committed —
+            # carry unverifiable_fields so that signal isn't lost on this path too.
+            dialog_out = {"screen_id": screen_id.upper(), "action": action,
+                         "ok": None, **result}
+            if unverifiable_fields:
+                dialog_out["unverifiable_fields"] = unverifiable_fields
+            return dialog_out
         # Honest persistence signal: the plane echoes graphIsDirty. After a Save it
         # should be False; still-True means the commit didn't take (a silent no-op the
         # HTTP 200 hides). Best-effort verify=true re-reads /structure to confirm the
@@ -2067,6 +2111,16 @@ async def ui_screen_action(
             f"{len(rejected)} field value(s) were SILENTLY REFUSED by the screen and "
             f"never written — see rejected_fields. The action still ran, so any result "
             f"above reflects the record WITHOUT them. Fix the value(s) and re-run.")
+    if unverifiable_fields:
+        # NOT a failure signal (unlike rejected_fields) — genuinely unknown, not
+        # confirmed-bad. Don't touch `ok`; just surface it so nobody mistakes silence
+        # here for a verified write.
+        out["unverifiable_fields"] = unverifiable_fields
+        warnings.append(
+            f"{len(unverifiable_fields)} field(s) aren't visible to /structure (see "
+            f"unverifiable_fields) — set via skip_validation=true, but this plane "
+            f"cannot confirm they wrote correctly. Cross-check with screen_get or "
+            f"run_dac_odata after saving.")
     if warnings:
         out["warning"] = " ".join(warnings)
     if verified is not None:
