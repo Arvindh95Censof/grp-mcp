@@ -2969,3 +2969,328 @@ def test_delete_verify_targets_pairs_nearest_preceding_set():
     # the NEAREST preceding set wins
     cmds2 = [{"set": "A", "to": "1"}, {"set": "B", "to": "2"}, {"delete_row": "X"}]
     assert f(cmds2) == [("X", "B", "2")]
+
+
+# ---- v0.61: external audit fixes (2026-07-15 report) ------------------------
+
+# --- #1: session-only add_instance must not bypass the admin gate when it
+# requests allow_write/allow_delete/allow_publish (the local-file-exfiltration
+# path via attach_file_to_provider to an attacker-controlled base_url). ------
+
+def test_add_instance_session_only_elevated_requires_admin(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    with pytest.raises(PermissionError):
+        server.add_instance(
+            "evil", "https://attacker.example", "cid", "sek", "u", "p",
+            allow_write=True, persist=False)
+
+
+def test_add_instance_session_only_elevated_delete_requires_admin(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    with pytest.raises(PermissionError):
+        server.add_instance(
+            "evil", "https://attacker.example", "cid", "sek", "u", "p",
+            allow_delete=True, persist=False)
+
+
+def test_add_instance_session_only_elevated_publish_requires_admin(cfg, monkeypatch):
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    with pytest.raises(PermissionError):
+        server.add_instance(
+            "evil", "https://attacker.example", "cid", "sek", "u", "p",
+            allow_publish=True, persist=False)
+
+
+def test_add_instance_session_only_elevated_allowed_with_admin_env(cfg, monkeypatch):
+    monkeypatch.setenv("GRP_MCP_ALLOW_ADMIN", "1")
+    out = server.add_instance(
+        "ok", "https://real.example", "cid", "sek", "u", "p",
+        allow_write=True, persist=False)
+    assert out["added"] == "ok" and out["session_only"] is True
+
+
+def test_add_instance_session_only_readonly_still_ungated(cfg, monkeypatch):
+    # the intended low-friction case must keep working without the admin env var
+    monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
+    out = server.add_instance(
+        "quicktest", "https://other.example", "cid", "sek", "u", "p", persist=False)
+    assert out["added"] == "quicktest" and out["session_only"] is True
+
+
+# --- #2: get_bytes now streams and aborts once it exceeds a byte cap, instead
+# of buffering the whole response first. -------------------------------------
+
+class _FakeStreamResp:
+    def __init__(self, status_code, chunks):
+        self.status_code = status_code
+        self._chunks = chunks
+
+    async def aiter_bytes(self):
+        for c in self._chunks:
+            yield c
+
+    async def aread(self):
+        return b"".join(self._chunks)
+
+
+class _FakeStreamCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def test_get_bytes_streams_ok_under_cap(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site"))
+
+    async def fake_auth():
+        return {}
+
+    monkeypatch.setattr(c, "_auth_header", fake_auth)
+    monkeypatch.setattr(
+        c._http, "stream",
+        lambda method, url, headers=None, **kw: _FakeStreamCtx(
+            _FakeStreamResp(200, [b"abcd", b"efgh"])))
+    data = asyncio.run(c.get_bytes("https://host/Site/files/x", max_bytes=100))
+    assert data == b"abcdefgh"
+
+
+def test_get_bytes_aborts_when_exceeding_explicit_cap(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site"))
+
+    async def fake_auth():
+        return {}
+
+    monkeypatch.setattr(c, "_auth_header", fake_auth)
+    monkeypatch.setattr(
+        c._http, "stream",
+        lambda method, url, headers=None, **kw: _FakeStreamCtx(
+            _FakeStreamResp(200, [b"x" * 10, b"y" * 10])))
+    with pytest.raises(AcumaticaError, match="max_file_bytes"):
+        asyncio.run(c.get_bytes("https://host/Site/files/x", max_bytes=15))
+
+
+def test_get_bytes_defaults_to_instance_max_file_bytes(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site", max_file_bytes=5))
+
+    async def fake_auth():
+        return {}
+
+    monkeypatch.setattr(c, "_auth_header", fake_auth)
+    monkeypatch.setattr(
+        c._http, "stream",
+        lambda method, url, headers=None, **kw: _FakeStreamCtx(
+            _FakeStreamResp(200, [b"123456789"])))
+    with pytest.raises(AcumaticaError, match="max_file_bytes"):
+        asyncio.run(c.get_bytes("https://host/Site/files/x"))  # no explicit max_bytes
+
+
+def test_get_bytes_zero_cap_means_uncapped(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site", max_file_bytes=0))
+
+    async def fake_auth():
+        return {}
+
+    monkeypatch.setattr(c, "_auth_header", fake_auth)
+    monkeypatch.setattr(
+        c._http, "stream",
+        lambda method, url, headers=None, **kw: _FakeStreamCtx(
+            _FakeStreamResp(200, [b"x" * 1000])))
+    data = asyncio.run(c.get_bytes("https://host/Site/files/x"))
+    assert len(data) == 1000
+
+
+def test_get_bytes_retries_once_on_401(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site"))
+    calls = {"auth": 0}
+
+    async def fake_auth():
+        calls["auth"] += 1
+        return {}
+
+    monkeypatch.setattr(c, "_auth_header", fake_auth)
+    responses = [_FakeStreamResp(401, []), _FakeStreamResp(200, [b"ok"])]
+
+    def fake_stream(method, url, headers=None, **kw):
+        return _FakeStreamCtx(responses.pop(0))
+
+    monkeypatch.setattr(c._http, "stream", fake_stream)
+    data = asyncio.run(c.get_bytes("https://host/Site/files/x", max_bytes=100))
+    assert data == b"ok"
+    assert calls["auth"] == 2
+
+
+# --- #3: run_report must resolve a site-absolute Location via _abs(), not a
+# naive base_url + location concat (which doubles the virtual directory). ---
+
+class _FakeRawResp:
+    def __init__(self, status_code, content=b"", headers=None):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+
+def test_run_report_resolves_site_absolute_location_without_doubling(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site"))
+    seen_urls = []
+    calls = {"n": 0}
+
+    async def fake_request_raw(method, url, **kw):
+        seen_urls.append(url)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeRawResp(202, b"", {"Location": "/Site/entity/job/1"})
+        return _FakeRawResp(200, b"PDFDATA")
+
+    monkeypatch.setattr(c, "_request_raw", fake_request_raw)
+    data = asyncio.run(
+        c.run_report("PrintInvoice", {"parameters": {}}, poll_interval=0.01, timeout=1))
+    assert data == b"PDFDATA"
+    # the polled URL must NOT double the '/Site' virtual directory
+    assert seen_urls[1] == "https://host/Site/entity/job/1"
+
+
+def test_run_report_enforces_max_file_bytes_after_fetch(monkeypatch):
+    c = AcumaticaClient(_inst(base_url="https://host/Site", max_file_bytes=5))
+
+    async def fake_request_raw(method, url, **kw):
+        return _FakeRawResp(200, b"way too long for the cap")
+
+    monkeypatch.setattr(c, "_request_raw", fake_request_raw)
+    with pytest.raises(AcumaticaError, match="max_file_bytes"):
+        asyncio.run(c.run_report("PrintInvoice", {"parameters": {}}))
+
+
+# --- #4: _drive_load caps stored per-row errors; _prune_load_jobs evicts the
+# oldest completed jobs once the retained count exceeds the cap. ------------
+
+def test_drive_load_caps_stored_errors_but_counts_every_failure(cfg, monkeypatch):
+    async def fake_put(self, entity, body):
+        raise AcumaticaError("always fails")
+
+    monkeypatch.setattr(AcumaticaClient, "put_entity", fake_put)
+    n = server._MAX_STORED_ROW_ERRORS + 10
+    state = {"job": "j", "entity": "E", "total": n, "processed": 0, "succeeded": 0,
+             "failed": 0, "next_offset": 0, "errors": [], "completed": False, "error": None}
+    client = server._client("rw")
+    mapped = [{"X": str(i)} for i in range(n)]
+    asyncio.run(server._drive_load(state, client, "E", mapped, 0, False))
+    assert state["failed"] == n            # every failure counted
+    assert state["completed"] is True
+    # capped at MAX + 1 sentinel row, not one entry per failure
+    assert len(state["errors"]) == server._MAX_STORED_ROW_ERRORS + 1
+    assert state["errors"][-1]["row"] is None
+    assert "cap" in state["errors"][-1]["error"].lower()
+
+
+def test_prune_load_jobs_evicts_oldest_completed_first():
+    server._load_jobs.clear()
+    try:
+        for i in range(server._MAX_RETAINED_LOAD_JOBS + 5):
+            server._load_jobs[f"job{i}"] = {"completed": True, "error": None}
+        server._prune_load_jobs()
+        assert len(server._load_jobs) == server._MAX_RETAINED_LOAD_JOBS
+        assert "job0" not in server._load_jobs
+        assert f"job{server._MAX_RETAINED_LOAD_JOBS + 4}" in server._load_jobs
+    finally:
+        server._load_jobs.clear()
+
+
+def test_prune_load_jobs_never_evicts_in_progress():
+    server._load_jobs.clear()
+    try:
+        server._load_jobs["running"] = {"completed": False, "error": None}
+        for i in range(server._MAX_RETAINED_LOAD_JOBS + 5):
+            server._load_jobs[f"done{i}"] = {"completed": True, "error": None}
+        server._prune_load_jobs()
+        assert "running" in server._load_jobs
+    finally:
+        server._load_jobs.clear()
+
+
+# --- #5: ui._load() must treat ONLY "no config at all" as a fresh install;
+# a malformed EXISTING connections.json must propagate, not silently vanish. -
+
+def test_ui_load_returns_empty_config_when_none_exists(monkeypatch):
+    # mock load_config directly rather than relying on filesystem discovery — this
+    # repo's OWN connections.json would otherwise leak in via the cwd/package-root
+    # fallback candidates load_config() tries after an unset/missing env path.
+    from grp_mcp import ui as ui_mod
+    from grp_mcp.config import ConfigNotFoundError
+
+    def fake_load_config():
+        raise ConfigNotFoundError("no configuration found")
+
+    monkeypatch.setattr(ui_mod, "load_config", fake_load_config)
+    cfg = ui_mod._load()
+    assert cfg.instances == {} and cfg.source_path is None
+
+
+def test_ui_load_propagates_malformed_json(tmp_path, monkeypatch):
+    from grp_mcp import ui as ui_mod
+
+    bad = tmp_path / "connections.json"
+    bad.write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setenv("GRP_MCP_CONNECTIONS", str(bad))
+    with pytest.raises(json.JSONDecodeError):
+        ui_mod._load()
+
+
+def test_ui_load_propagates_validation_error(tmp_path, monkeypatch):
+    from grp_mcp import ui as ui_mod
+
+    bad = tmp_path / "connections.json"
+    # 'instances' present but a profile is missing required fields -> pydantic error
+    bad.write_text(json.dumps({"default": "a", "instances": {"a": {"base_url": "x"}}}),
+                   encoding="utf-8")
+    monkeypatch.setenv("GRP_MCP_CONNECTIONS", str(bad))
+    with pytest.raises(Exception) as exc_info:
+        ui_mod._load()
+    assert not isinstance(exc_info.value, ui_mod.ConfigNotFoundError)
+
+
+# --- #6: editing a profile through the UI must preserve branch/max_file_bytes
+# (and any other field the form doesn't expose), not silently reset them. ---
+
+def test_save_profile_preserves_branch_and_max_file_bytes(tmp_path, monkeypatch):
+    from grp_mcp import ui as ui_mod
+
+    monkeypatch.setenv("GRP_MCP_CONNECTIONS", str(tmp_path / "connections.json"))
+    existing = _inst(base_url="https://h/S", branch="HQ", max_file_bytes=200_000_000)
+    cfg = Config(default="p", instances={"p": existing})
+    monkeypatch.setattr(ui_mod, "_load", lambda: cfg)
+    monkeypatch.setattr(ui_mod, "save_config", lambda c: None)
+
+    handler = ui_mod._Handler.__new__(ui_mod._Handler)  # bypass BaseHTTPRequestHandler.__init__
+    handler._json = lambda *a, **k: None
+    ui_mod._Handler._save_profile(handler, {
+        "name": "p", "base_url": "https://h/S2", "client_id": "cid",
+        "username": "u", "tenant": "NewTenant",
+    })
+    saved = cfg.instances["p"]
+    assert saved.branch == "HQ"                     # NOT reset to ""
+    assert saved.max_file_bytes == 200_000_000        # NOT reset to the 50MB default
+    assert saved.base_url == "https://h/S2"           # the field that WAS edited did change
+    assert saved.tenant == "NewTenant"
+
+
+def test_save_profile_new_profile_gets_defaults(tmp_path, monkeypatch):
+    from grp_mcp import ui as ui_mod
+
+    cfg = Config(default="", instances={})
+    monkeypatch.setattr(ui_mod, "_load", lambda: cfg)
+    monkeypatch.setattr(ui_mod, "save_config", lambda c: None)
+
+    handler = ui_mod._Handler.__new__(ui_mod._Handler)
+    handler._json = lambda *a, **k: None
+    ui_mod._Handler._save_profile(handler, {
+        "name": "new", "base_url": "https://h/S", "client_id": "cid",
+        "client_secret": "sek", "username": "u", "password": "p",
+    })
+    saved = cfg.instances["new"]
+    assert saved.branch == ""
+    assert saved.max_file_bytes == 50_000_000

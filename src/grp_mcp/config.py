@@ -20,6 +20,18 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 
+class ConfigNotFoundError(RuntimeError):
+    """Raised by load_config() ONLY for the genuine first-run case: no
+    connections.json at any candidate path AND no GRP_MCP_* env vars set. This is
+    the one condition ui._load() may treat as "start empty, let the user bootstrap
+    the first profile in the browser" — a malformed EXISTING config (bad JSON, a
+    field that fails Instance validation) raises plain json.JSONDecodeError /
+    pydantic.ValidationError instead, which must NOT be caught the same way (audit
+    finding 2026-07-15 #5: a bare `except Exception` conflated the two, silently
+    presenting an empty profile list for a corrupted file — and a subsequent UI save
+    would then overwrite it with that near-empty config)."""
+
+
 class Instance(BaseModel):
     """Connection details for one Acumatica tenant."""
 
@@ -186,7 +198,7 @@ def load_config() -> Config:
     if env_cfg:
         return env_cfg
 
-    raise RuntimeError(
+    raise ConfigNotFoundError(
         "No configuration found. Set GRP_MCP_* env vars (see .env.example) "
         "or create connections.json (see connections.example.json)."
     )

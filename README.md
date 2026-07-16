@@ -558,6 +558,49 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.61.0 — **Security + robustness audit fixes (2026-07-15 report, all six findings verified by code trace before fixing).**
+- **[P1] Session-only profile privilege escalation** — `add_instance(persist=False)`
+  skipped the admin gate entirely, so a caller could mint a throwaway profile pointed
+  at an attacker-controlled `base_url` with `allow_write=true` and an unrestricted
+  read sandbox, then use `attach_file_to_provider` to read any locally-accessible
+  file and upload it there — a local-file-exfiltration path that never touched disk,
+  so it bypassed `GRP_MCP_ALLOW_ADMIN` entirely. Fixed: a session-only add now needs
+  the SAME admin opt-in as a persisted one whenever it requests
+  `allow_write`/`allow_delete`/`allow_publish`; a pure read-only session profile
+  stays ungated (the intended low-friction "point at another instance" case).
+- **[P2] Download size cap was decorative** — `max_file_bytes` documented a cap on
+  reads/downloads, but `get_bytes`/`download_file`/`run_report`/customization
+  exports all fully buffered the response first. `get_bytes` now STREAMS and aborts
+  mid-transfer once the cap is exceeded (used by `download_file`); `run_report` and
+  `export_customization` get a check-after-fetch (their poll-retry / SOAP-envelope
+  plumbing made true streaming impractical without a larger rewrite — documented
+  honestly as a partial mitigation, not full streaming).
+- **[P2] `run_report` doubled the site virtual directory** — it string-concatenated
+  `base_url + Location` instead of reusing the already-correct `_abs()` resolver, so
+  polling 404'd on every virtual-directory-mounted instance (e.g. `/2025R1Setup`).
+- **[P2] Unbounded bulk-load job memory** — `_drive_load` appended one full-row error
+  dict per failure with no cap (a systemic failure across up to 1,000,000 rows grew
+  without bound; only the CLIENT-FACING view was sliced to 50), and completed jobs
+  were never evicted. Now capped at 200 stored errors per job (every failure still
+  counted) and 50 retained jobs total (oldest completed evicted first).
+- **[P2] Malformed config silently became "no config"** — `ui._load()` caught a bare
+  `Exception` around `load_config()`, so a corrupted `connections.json` (bad JSON, a
+  field failing validation) was indistinguishable from the genuine first-run case —
+  presenting an empty profile list, and a subsequent UI save could overwrite the
+  damaged-but-recoverable file. `load_config()` now raises a dedicated
+  `ConfigNotFoundError` for the real "nothing configured yet" case; anything else
+  propagates as a visible error instead of vanishing.
+- **[P2] Editing a profile through the UI reset hidden fields** — `_save_profile`
+  rebuilt a bare `Instance(...)` that silently defaulted `branch` and
+  `max_file_bytes` back to their class defaults on every edit (only
+  `read_roots`/`write_roots` were explicitly preserved). Now uses
+  `existing.model_copy(update=...)` so every field the UI doesn't expose survives
+  an edit, not just the two that happened to be handled.
+
+234 tests green (20 new); every fix traced through the current source and unit-tested
+before shipping (a live MCP session runs a stale in-memory build until restarted, so
+these were verified via the test suite rather than the running tool).
+
 v0.60.0 — **External bug-report fixes (2026-07-10 report, all findings validated live first).**
 Seven silent-failure/false-signal classes closed, each reproduced (or refuted) against a
 live instance before fixing:

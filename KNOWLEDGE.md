@@ -398,7 +398,12 @@ what's missing before driving a screen.
   `API Login Limit`. **`release_sessions`** frees cached REST clients; the engine also self-heals
   with one retry. Always release in long/standalone runs.
 - **Persisting a profile from within Claude needs `GRP_MCP_ALLOW_ADMIN=1`.** Without it, added
-  profiles are **session-only**.
+  profiles are **session-only** — and, as of v0.61.0, a session-only add ALSO needs that same
+  env var if it requests `allow_write`/`allow_delete`/`allow_publish` (a read-only session-only
+  add stays ungated). This closes a local-file-exfiltration path: a session-only profile with
+  write access pointed at an attacker-controlled `base_url` could otherwise read any file inside
+  its (unrestricted-by-default) read sandbox and upload it there via `attach_file_to_provider`,
+  without ever touching `connections.json` or needing the admin gate.
 - **Session-only profiles don't route on disk-backed tools.** `run_dac_odata`, `count_entity`, and
   others **re-read `connections.json` each call** and silently fall back to the persisted active
   profile — dangerous when two profiles share a tenant name (wrong site, no error). For real work:

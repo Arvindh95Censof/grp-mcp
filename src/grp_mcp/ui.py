@@ -21,7 +21,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .acumatica import AcumaticaClient
-from .config import Config, Instance, load_config, save_config
+from .config import Config, ConfigNotFoundError, Instance, load_config, save_config
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -31,12 +31,19 @@ def _load() -> Config:
     """Load the config, or return an empty one so a brand-new user can bootstrap.
 
     On a fresh machine there is no connections.json and no env vars, so
-    load_config() raises. The UI treats that as "no profiles yet" and lets the
-    user add the first profile in the browser (save_config writes a new file).
+    load_config() raises ConfigNotFoundError. The UI treats ONLY that specific
+    condition as "no profiles yet" and lets the user add the first profile in the
+    browser (save_config writes a new file). A malformed EXISTING connections.json
+    (bad JSON / a field that fails validation) raises a DIFFERENT exception and is
+    let through (audit finding 2026-07-15 #5: catching bare Exception here used to
+    treat a corrupted file identically to "no config yet", silently presenting an
+    empty profile list — and a later save from that empty state would overwrite the
+    damaged-but-possibly-recoverable file). The caller (do_GET/do_POST) surfaces
+    whatever propagates as a JSON error instead of a silent empty config.
     """
     try:
         return load_config()
-    except Exception:  # noqa: BLE001 - no config yet -> start empty
+    except ConfigNotFoundError:
         return Config(default="", instances={}, source_path=None)
 
 PAGE = """<!DOCTYPE html>
@@ -276,7 +283,13 @@ class _Handler(BaseHTTPRequestHandler):
                          "username": b.get("username")}.items():
             if not (val or (existing and getattr(existing, fld))):
                 raise ValueError(f"{fld} is required")
-        inst = Instance(
+        # Only the fields this form actually exposes. Anything NOT listed here (branch,
+        # max_file_bytes, read_roots, write_roots, and any future field) is preserved
+        # from `existing` via model_copy rather than reconstructed from scratch — audit
+        # finding 2026-07-15 #6: rebuilding a bare Instance(...) here silently reset
+        # branch and max_file_bytes to their class defaults on every edit, since they
+        # were never in this dict and Instance() has no way to know the OLD value.
+        updates = dict(
             base_url=b.get("base_url") or (existing.base_url if existing else ""),
             client_id=b.get("client_id") or (existing.client_id if existing else ""),
             client_secret=secret,
@@ -288,9 +301,8 @@ class _Handler(BaseHTTPRequestHandler):
             allow_write=bool(b.get("allow_write")),
             allow_delete=bool(b.get("allow_delete")),
             allow_publish=bool(b.get("allow_publish")),
-            read_roots=existing.read_roots if existing else [],
-            write_roots=existing.write_roots if existing else [],
         )
+        inst = existing.model_copy(update=updates) if existing else Instance(**updates)
         cfg.instances[name] = inst
         if b.get("set_active") or len(cfg.instances) == 1:
             cfg.default = name

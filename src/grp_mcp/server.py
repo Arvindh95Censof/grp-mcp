@@ -71,6 +71,25 @@ _publish_jobs: dict[str, dict] = {}
 # PUTs) outlasts the MCP request window, so it runs in a background task and reports
 # progress + a resume offset here, mirroring _publish_jobs.
 _load_jobs: dict[str, dict] = {}
+# Bounds for _load_jobs' memory growth (audit finding 2026-07-15 #4): a job's own
+# state["errors"] used to grow one full-row dict per failure with no cap (only the
+# CLIENT-FACING view in _load_job_view was sliced to 50), and completed jobs were
+# never evicted — a long-running server accumulated every historical job forever.
+_MAX_STORED_ROW_ERRORS = 200
+_MAX_RETAINED_LOAD_JOBS = 50
+
+
+def _prune_load_jobs() -> None:
+    """Evict the OLDEST completed/errored jobs once retained count exceeds the cap.
+    In-progress jobs are never evicted (still needed for polling). Dict insertion
+    order makes this a simple oldest-first sweep."""
+    if len(_load_jobs) <= _MAX_RETAINED_LOAD_JOBS:
+        return
+    for name, state in list(_load_jobs.items()):
+        if len(_load_jobs) <= _MAX_RETAINED_LOAD_JOBS:
+            break
+        if state.get("completed") or state.get("error") is not None:
+            del _load_jobs[name]
 
 
 def _load_job_view(state: dict) -> dict:
@@ -103,16 +122,31 @@ async def _drive_load(
     base_offset: int, stop_on_error: bool,
 ) -> None:
     """Sequential PUT loop shared by the sync + background load paths. Updates `state`
-    as it goes so load_status reflects live progress and a resume offset."""
+    as it goes so load_status reflects live progress and a resume offset.
+
+    state["errors"] is capped at _MAX_STORED_ROW_ERRORS (each entry carries the FULL
+    row's fields, so this bounds memory even when a systemic failure fails all of up
+    to 1,000,000 rows) — `failed` still counts every failure, only the detail list
+    stops growing past the cap.
+    """
     for i, fields in enumerate(mapped):
         try:
             await client.put_entity(entity, _wrap_fields(fields))
             state["succeeded"] += 1
         except Exception as e:  # noqa: BLE001 — record per-row, keep going
             state["failed"] += 1
+            errs = state["errors"]
             # spreadsheet row = header(1) + base_offset + (i+1)
-            state["errors"].append(
-                {"row": 1 + base_offset + i + 1, "error": str(e)[:300], "fields": fields})
+            if len(errs) < _MAX_STORED_ROW_ERRORS:
+                errs.append(
+                    {"row": 1 + base_offset + i + 1, "error": str(e)[:300], "fields": fields})
+            elif len(errs) == _MAX_STORED_ROW_ERRORS:
+                errs.append({
+                    "row": None, "fields": None,
+                    "error": f"... {_MAX_STORED_ROW_ERRORS} row errors already "
+                             "recorded; further failures are still counted in "
+                             "'failed' but no longer stored in detail (memory cap).",
+                })
             if stop_on_error:
                 # leave next_offset AT this row so a resume retries it
                 state["processed"] += 1
@@ -322,13 +356,22 @@ def _require_delete(instance: str | None) -> None:
 
 
 def _require_admin(op: str) -> None:
-    """Gate config-file MUTATIONS that PERSIST to connections.json (which stores
-    credentials) behind an explicit opt-in env var — a separate, higher-trust gate
-    than the per-instance write gates, since these edit the connector's own config
-    (add/remove a profile, change the persisted default) rather than ERP data.
+    """Gate config-file MUTATIONS behind an explicit opt-in env var — a separate,
+    higher-trust gate than the per-instance write gates, since these edit the
+    connector's own config (add/remove a profile, change the persisted default,
+    grant an instance ERP write/delete/publish access) rather than ERP data.
 
-    Session-only variants (persist=False) are NOT gated — they don't touch disk.
-    Set GRP_MCP_ALLOW_ADMIN=1 to permit persisting config changes.
+    Two things require it: (1) anything that PERSISTS to connections.json (which
+    stores credentials), and (2) as of the 2026-07-16 fix, a session-only
+    (persist=False) add_instance call that requests allow_write/allow_delete/
+    allow_publish — a session-only profile with an ERP-write gate can still read
+    any locally-accessible file and upload it to an attacker-controlled base_url
+    via attach_file/attach_file_to_provider, so granting that capability needs the
+    same opt-in even though nothing touches disk. A pure READ-ONLY session-only
+    profile is still ungated (the intended low-friction "point at another
+    instance for this session" case).
+
+    Set GRP_MCP_ALLOW_ADMIN=1 to permit either.
     """
     allowed = os.environ.get("GRP_MCP_ALLOW_ADMIN", "").strip().lower() in ("1", "true", "yes")
     if not allowed:
@@ -599,8 +642,18 @@ def add_instance(
     set_active=true makes it the default profile. persist=true writes connections.json
     (the file is gitignored) — and, because that file holds credentials, persisting
     requires the GRP_MCP_ALLOW_ADMIN=1 env var (an admin gate separate from the ERP
-    write gates); persist=false is a session-only add that needs no gate. Returns the
-    updated profile list (no secrets).
+    write gates).
+
+    persist=false is a session-only add (nothing touches disk) and needs no gate ONLY
+    when it stays read-only (allow_write/allow_delete/allow_publish all False) — that's
+    the intended "quickly point a tool at another instance for this session" case.
+    Requesting ANY of those three gates on a session-only add ALSO requires
+    GRP_MCP_ALLOW_ADMIN=1 (security fix 2026-07-16): without this, a caller could mint
+    a throwaway profile pointed at an attacker-controlled base_url with allow_write=true
+    and an unrestricted read sandbox, then use attach_file/attach_file_to_provider to
+    read any locally-accessible file and upload its bytes to that base_url — a local-
+    file-exfiltration path that bypassed the admin gate entirely because it never wrote
+    connections.json. A pure read-only session profile still needs no gate.
 
     Needs a registered Connected Application on the target instance (Integration ->
     Connected Applications, Resource Owner Password Credentials flow).
@@ -622,8 +675,12 @@ def add_instance(
         read_roots=read_roots or [],
         write_roots=write_roots or [],
     )
-    if persist:
-        _require_admin("add_instance persist")
+    elevated = allow_write or allow_delete or allow_publish
+    if persist or elevated:
+        _require_admin(
+            "add_instance persist" if persist else
+            "add_instance session-only with allow_write/allow_delete/allow_publish"
+        )
     existed = name in cfg.instances
     # same-tenant collision: another profile shares this tenant. A tool called WITHOUT
     # instance= routes to cfg.default, so if this add isn't made active the read/write
@@ -4568,6 +4625,7 @@ async def load_from_excel(
         out["background"] = False
         return out
 
+    _prune_load_jobs()
     _load_jobs[job] = state
 
     async def _run() -> None:
@@ -4597,7 +4655,9 @@ async def load_status(job: str | None = None) -> Any:
     shape (status completed | in_progress | error) with processed/succeeded/failed and
     next_offset. If it stopped early (stop_on_error or an interruption), resume with
     load_from_excel(..., offset=next_offset). State is per server session (a restart
-    clears it — verify loaded rows via count_entity / get_entity instead).
+    clears it — verify loaded rows via count_entity / get_entity instead). Detailed
+    per-row errors cap at 200 per job (failed still counts every row); at most 50
+    jobs total are retained, oldest COMPLETED ones evicted first as new jobs start.
     """
     if not _load_jobs:
         return {"status": "none",
@@ -7277,8 +7337,9 @@ async def download_file(
 
     entity/record_id: the record. filename: which attached file to pull (defaults
     to the record's first/only attachment). out_path: where to write the bytes.
-    Resolves the file's href from the record's `files` collection, then GETs the
-    raw bytes. (List a record's files first with list_attachments.)
+    Resolves the file's href from the record's `files` collection, then STREAMS the
+    bytes, aborting before anything hits disk if the download exceeds the instance's
+    max_file_bytes. (List a record's files first with list_attachments.)
 
     out_path must be within the instance's write_roots (if configured).
     """
@@ -7416,7 +7477,10 @@ async def export_customization(
     Pulls the project content via API and writes it to out_path. This closes the
     headless edit loop for endpoints: export_customization -> edit project.xml ->
     import_customization -> publish_customization (no browser export needed).
-    out_path must be within the instance's write_roots (if configured).
+    out_path must be within the instance's write_roots (if configured); the decoded
+    size is checked against max_file_bytes before anything is written to disk (this
+    is a check-after-buffer, not a stream-with-abort — the SOAP/JSON envelope this
+    comes wrapped in has to be parsed whole regardless).
     """
     import base64
 
@@ -7428,6 +7492,12 @@ async def export_customization(
         return {"error": "no projectContentBase64 in response", "project": project_name,
                 "raw": res}
     data = base64.b64decode(content)
+    inst = _cfg().get(instance or _cfg().default)
+    if inst.max_file_bytes and len(data) > inst.max_file_bytes:
+        raise AcumaticaError(
+            f"project {project_name!r} decoded to {len(data)} bytes, exceeding "
+            f"max_file_bytes ({inst.max_file_bytes}) — refusing to write to disk."
+        )
     dest.write_bytes(data)
     return {"project": project_name, "path": out_path, "bytes": len(data)}
 

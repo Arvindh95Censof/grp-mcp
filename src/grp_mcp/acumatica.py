@@ -541,10 +541,55 @@ class AcumaticaClient:
         """GET an absolute or instance-relative URL (e.g. an action's Location)."""
         return await self._request("GET", self._abs(url))
 
-    async def get_bytes(self, url: str) -> bytes:
-        """GET raw bytes from an absolute or instance-relative URL (file download)."""
-        resp = await self._request_raw("GET", self._abs(url))
-        return resp.content
+    async def _drain_capped(self, resp: httpx.Response, max_bytes: int | None,
+                            url: str) -> bytes:
+        """Read a streamed response body, aborting the moment it exceeds max_bytes —
+        instead of buffering an arbitrarily large body in memory first (audit finding
+        2026-07-15 #2: max_file_bytes was documented as a download cap but nothing in
+        this path ever checked size before/during the transfer). max_bytes<=0 means
+        no cap (mirrors the falsy-check convention _check_read_path/_check_write_path
+        already use for this same config field)."""
+        total = 0
+        chunks: list[bytes] = []
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if max_bytes and total > max_bytes:
+                raise AcumaticaError(
+                    f"GET {url} exceeded max_file_bytes ({max_bytes}) while "
+                    f"streaming — aborted before buffering the rest into memory."
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def get_bytes(self, url: str, max_bytes: int | None = None) -> bytes:
+        """GET raw bytes from an absolute or instance-relative URL (file download),
+        STREAMING the response and aborting as soon as it exceeds max_bytes rather
+        than buffering the whole body first. max_bytes defaults to the instance's
+        configured max_file_bytes (0/None on the instance = uncapped); pass an
+        explicit value to override for one call.
+        """
+        if max_bytes is None:
+            max_bytes = self.instance.max_file_bytes
+        abs_url = self._abs(url)
+        self._assert_allowed_url(abs_url)
+        headers = await self._auth_header()
+        async with self._http.stream("GET", abs_url, headers=headers) as resp:
+            if resp.status_code == 401:
+                self._access_token = None
+                headers = await self._auth_header()
+            else:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise AcumaticaError(
+                        f"GET {abs_url} -> {resp.status_code}: {body[:2000]!r}")
+                return await self._drain_capped(resp, max_bytes, abs_url)
+        # 401 above: the prior response is closed on context-exit; retry once fresh.
+        async with self._http.stream("GET", abs_url, headers=headers) as resp:
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                raise AcumaticaError(
+                    f"GET {abs_url} -> {resp.status_code}: {body[:2000]!r}")
+            return await self._drain_capped(resp, max_bytes, abs_url)
 
     async def get_all(
         self, entity: str, params: dict | None = None, page_size: int = 1000,
@@ -623,6 +668,19 @@ class AcumaticaClient:
 
     # ---- report entities (contract API, async) -------------------------
 
+    def _check_content_cap(self, content: bytes, url: str) -> bytes:
+        """Enforce max_file_bytes on an already-fetched body (best-effort — this is a
+        check-after-buffer, not a true stream-with-abort like get_bytes, because
+        run_report's poll loop reuses _request_raw's non-streaming retry/seat-limit
+        machinery). Still stops an oversized report from being written to disk."""
+        cap = self.instance.max_file_bytes
+        if cap and len(content) > cap:
+            raise AcumaticaError(
+                f"GET {url} returned {len(content)} bytes, exceeding max_file_bytes "
+                f"({cap})."
+            )
+        return content
+
     async def run_report(
         self, entity: str, body: dict, poll_interval: float = 2.0, timeout: float = 180.0
     ) -> bytes:
@@ -641,21 +699,25 @@ class AcumaticaClient:
             headers={"Accept": "application/pdf, application/json"},
         )
         if resp.status_code == 200 and resp.content:
-            return resp.content
+            return self._check_content_cap(resp.content, self._entity_url(entity))
         location = resp.headers.get("Location")
         if not location:
             raise AcumaticaError(
                 f"report '{entity}' returned {resp.status_code} with no Location to poll"
             )
-        if location.startswith("/"):
-            location = f"{self.instance.base_url.rstrip('/')}{location}"
+        # site-absolute Locations already carry the instance virtual directory (e.g.
+        # "/2025R1Setup/entity/..."); joining to base_url (which ALSO has it) doubles
+        # the segment and 404s (audit finding 2026-07-15 #3). _abs() already handles
+        # this correctly for get_bytes/put_file — reuse it here instead of the naive
+        # base_url + location concatenation this used to do.
+        location = self._abs(location)
         waited = 0.0
         while waited < timeout:
             r = await self._request_raw(
                 "GET", location, headers={"Accept": "application/pdf, application/json"}
             )
             if r.status_code == 200 and r.content:
-                return r.content
+                return self._check_content_cap(r.content, location)
             await asyncio.sleep(poll_interval)
             waited += poll_interval
         raise AcumaticaError(f"report '{entity}' did not finish within {timeout}s")
