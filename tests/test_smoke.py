@@ -2979,10 +2979,15 @@ def test_delete_verify_targets_pairs_nearest_preceding_set():
 
 def test_add_instance_session_only_elevated_requires_admin(cfg, monkeypatch):
     monkeypatch.delenv("GRP_MCP_ALLOW_ADMIN", raising=False)
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError) as e:
         server.add_instance(
             "evil", "https://attacker.example", "cid", "sek", "u", "p",
             allow_write=True, persist=False)
+    # the error must NOT tell the caller to retry with persist=false — that's
+    # exactly what was just tried and refused (a live-verified copy bug: the
+    # shared _require_admin message used to say this unconditionally).
+    assert "persist=false" not in str(e.value).lower()
+    assert "GRP_MCP_ALLOW_ADMIN" in str(e.value)
 
 
 def test_add_instance_session_only_elevated_delete_requires_admin(cfg, monkeypatch):

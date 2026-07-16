@@ -558,6 +558,16 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.61.1 — **Fixed a misleading error message discovered live right after v0.61.0 shipped.**
+Live-tested the new session-only elevated-gate refusal (v0.61.0 #1) immediately post-restart:
+the error correctly refused, but its text — inherited unconditionally from the persist=true
+path — told the caller to "call this with persist=false", which is exactly what had just been
+tried and blocked. `_require_admin` now gives the session-only-elevated case its own message
+(explains WHY read-only stays ungated instead of suggesting a retry that won't work); the
+persist=true message also now notes that persist=false ALSO needs the env var if elevated
+gates are requested. 234 tests green (+1 asserting the message no longer suggests the
+already-tried option). No behavior change — the refusal itself was already correct.
+
 v0.61.0 — **Security + robustness audit fixes (2026-07-15 report, all six findings verified by code trace before fixing).**
 - **[P1] Session-only profile privilege escalation** — `add_instance(persist=False)`
   skipped the admin gate entirely, so a caller could mint a throwaway profile pointed

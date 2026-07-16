@@ -374,14 +374,29 @@ def _require_admin(op: str) -> None:
     Set GRP_MCP_ALLOW_ADMIN=1 to permit either.
     """
     allowed = os.environ.get("GRP_MCP_ALLOW_ADMIN", "").strip().lower() in ("1", "true", "yes")
-    if not allowed:
+    if allowed:
+        return
+    if "session-only" in op:
+        # this IS the persist=False path — telling the caller to retry with
+        # persist=false (as the persist-path message below does) would be actively
+        # wrong here, since that's exactly what just got refused.
         raise PermissionError(
-            f"Refusing to persist a config change ({op}): writing connections.json "
-            f"(which holds credentials) requires the GRP_MCP_ALLOW_ADMIN=1 environment "
-            f"variable. Either set it to manage profiles, or call this with persist=false "
-            f"for a session-only change. (Guards against an agent silently rewriting your "
-            f"credential file.)"
+            f"Refusing ({op}): a session-only profile that requests allow_write/"
+            f"allow_delete/allow_publish needs the GRP_MCP_ALLOW_ADMIN=1 environment "
+            f"variable — same as a persisted change — because it can still read any "
+            f"locally-accessible file and upload it to this profile's base_url via "
+            f"attach_file/attach_file_to_provider. Either set GRP_MCP_ALLOW_ADMIN=1, "
+            f"or add the profile without allow_write/allow_delete/allow_publish "
+            f"(a read-only session-only profile needs no gate)."
         )
+    raise PermissionError(
+        f"Refusing to persist a config change ({op}): writing connections.json "
+        f"(which holds credentials) requires the GRP_MCP_ALLOW_ADMIN=1 environment "
+        f"variable. Either set it to manage profiles, or call this with persist=false "
+        f"for a session-only, read-only change (session-only ALSO needs this env var "
+        f"if it requests allow_write/allow_delete/allow_publish). (Guards against an "
+        f"agent silently rewriting your credential file.)"
+    )
 
 
 def _oq(v: Any) -> str:
