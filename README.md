@@ -558,6 +558,36 @@ python -m pytest tests/ -q
 
 ## Status
 
+v0.63.0 — **Fixed two grid-write footguns found verifying a second PY309000 report (EmployeeBankDetails "modern plane can't co-insert" claim, 2026-07-17, verified live).**
+The reported "deadlock" turned out not to be an inherent Acumatica conflict — it was two
+grp-mcp-side issues compounding:
+1. **`ui_grid_read`'s `clearSession` wiped prior staged edits.** The `ui_*_grid_row` write
+   wrappers (`ui_insert_grid_row`/`ui_update_grid_row`/`ui_update_grid_rows`/`ui_delete_grid_row`)
+   call `ui_grid_read` internally just to fetch the current row list/columns for building a
+   Save payload — but that call forced a `clearSession`, discarding any `ui_set_field` edits
+   staged earlier in the SAME session (e.g. header fields set before inserting a detail row).
+   Proven live: staging all header fields then calling `ui_insert_grid_row` normally still
+   failed with the originally-reported validator error, because the internal read wiped them
+   first. Fixed: `ui_grid_read` takes a new `preserve_session` flag; the write wrappers now
+   pass it so their internal read doesn't clear anything the caller already staged. The
+   standalone `ui_read_grid` tool is unaffected — it still forces a fresh DB reload by default.
+2. **`_grid_save` only echoed back `grid_view` + its direct `parent` view**, so a validator
+   error rooted in a THIRD, sibling view was invisible — the response carried only a useless
+   generic message ("record raised at least one error") with zero field detail. Proven live:
+   inserting an `EmployeeBankDetails` row failed because `Employments.Step`/`Employments.Level`
+   were required and unset, but `Employments` was in neither `grid_view` nor `parent` — that
+   detail was only recoverable by manually forcing the view into `viewsParams`. Fixed:
+   `ScreenClient` now tracks every view `ui_bootstrap`/`ui_navigate_record` has loaded
+   (`_bootstrapped_views`) and `_grid_save` re-lists all of them, so a sibling-view error comes
+   back in `fieldStates` and its detail (`_field_state_errors`) is appended to the raised
+   exception instead of staying invisible. Costs nothing on the success path — echoing back a
+   view the caller already loaded is free, the graph already holds its state.
+
+Neither fix makes every write succeed: a genuine selector/lookup failure on a grid CELL (no
+`fieldStates` entry to surface — confirmed live on this same investigation, PY309000's
+"Employee Bank" selector) still surfaces only the generic message, honestly, because there
+genuinely is no more detail available that way. 252 tests green (14 new).
+
 v0.62.0 — **`ui_screen_action` can now reach fields /structure never exposes (external report, 2026-07-16, verified live on the reported screen before fixing).**
 `/structure` exposes only ONE container per view name — a screen whose classic SOAP
 schema disambiguates several containers bound to the SAME view as `"ViewName"`,

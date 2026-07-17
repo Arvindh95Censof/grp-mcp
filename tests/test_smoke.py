@@ -394,6 +394,177 @@ def test_update_grid_rows_surfaces_per_chunk_notices():
     assert "note" in out  # updated counts rows SENT, not rows kept
 
 
+# ---- clearSession footgun + sibling-view error surfacing --------------------
+#
+# Two bugs found verifying an external PY309000 report: (1) ui_grid_read's
+# clearSession wipes ui_set_field edits staged earlier in the SAME session when
+# a write wrapper reads the grid before saving, producing misleading validator
+# errors on fields that WERE already set; (2) _grid_save only echoed back
+# grid_view + parent in viewsParams, so a validator error rooted in a THIRD,
+# sibling view (e.g. Employments.Step/Level while inserting a bank-details row
+# under Employees) came back as a useless generic "record raised at least one
+# error" with zero field-level detail.
+
+def test_ui_grid_read_default_clears_session():
+    s = _client("GL202500")
+    s._http = _FakeHTTP(_read_body("AccountRecords", [{"field": "AccountCD"}], [], ["AccountCD"]))
+    asyncio.run(s.ui_grid_read("AccountRecords"))
+    assert s._http.calls[0]["clearSession"] is True
+
+
+def test_ui_grid_read_preserve_session_skips_clear():
+    s = _client("GL202500")
+    s._http = _FakeHTTP(_read_body("AccountRecords", [{"field": "AccountCD"}], [], ["AccountCD"]))
+    asyncio.run(s.ui_grid_read("AccountRecords", preserve_session=True))
+    assert s._http.calls[0]["clearSession"] is False
+
+
+def test_ui_grid_read_preserve_session_skips_clear_with_parent():
+    s = _client("PY309000")
+    s._http = _FakeHTTP(_read_body("EmployeeBankDetails", [{"field": "EmployeeBankDetailID"}],
+                                   [], []))
+    asyncio.run(s.ui_grid_read("EmployeeBankDetails",
+                              parent={"view": "Employees", "key": {"EmployeeCD": "EMP001"}},
+                              preserve_session=True))
+    assert s._http.calls[0]["clearSession"] is False
+
+
+def test_ui_insert_grid_row_preserves_prior_session_state():
+    s = _client("GL202500")
+    s._http = _FakeHTTP(_read_body(
+        "AccountRecords", [{"field": "AccountCD"}, {"field": "Description"}],
+        [{"id": "g1", "cells": {"AccountCD": {"value": "10100"}}}], ["AccountCD"]))
+    asyncio.run(s.ui_insert_grid_row(
+        "AccountRecords", {"AccountCD": "40100", "Type": "I", "Description": "X"}))
+    assert s._http.calls[0].get("clearSession") is False
+
+
+def test_ui_update_grid_row_preserves_prior_session_state():
+    s = _client("GL202500")
+    s._http = _FakeHTTP(_read_body(
+        "AccountRecords", [{"field": "AccountCD"}, {"field": "Description"}],
+        [{"id": "g8", "cells": {"AccountCD": {"value": "40000"}}}], ["AccountCD"]))
+    asyncio.run(s.ui_update_grid_row("AccountRecords", {"AccountCD": "40000"},
+                                    {"Description": "New"}))
+    assert s._http.calls[0].get("clearSession") is False
+
+
+def test_ui_delete_grid_row_preserves_prior_session_state():
+    s = _client("GL202500")
+    s._http = _FakeHTTP(_read_body(
+        "AccountRecords", [{"field": "AccountCD"}],
+        [{"id": "g8", "cells": {"AccountCD": {"value": "40000"}}}], ["AccountCD"]))
+    asyncio.run(s.ui_delete_grid_row("AccountRecords", {"AccountCD": "40000"}))
+    assert s._http.calls[0].get("clearSession") is False
+
+
+def test_ui_update_grid_rows_preserves_prior_session_state():
+    out, http = _bulk(echo_rows=_rows(4))
+    assert http.calls[0].get("clearSession") is False
+
+
+def test_ui_bootstrap_tracks_and_replaces_bootstrapped_views():
+    s = _client("PY309000")
+    s._http = _FakeHTTP({"graphIsDirty": False})
+    asyncio.run(s.ui_bootstrap(["Employments", "CurrentEmployees"]))
+    assert s._bootstrapped_views == {"Employments", "CurrentEmployees"}
+    asyncio.run(s.ui_bootstrap(["Employees"]))
+    assert s._bootstrapped_views == {"Employees"}  # replaced, not unioned -- fresh graph
+
+
+def test_ui_navigate_record_adds_to_bootstrapped_views():
+    s = _client("PY309000")
+    s._http = _FakeHTTP({"messages": []})
+    s._ui_booted = True  # simulate: ui_bootstrap already ran this session
+    s._bootstrapped_views = {"Employments"}
+    asyncio.run(s.ui_navigate_record("Employees", {"EmployeeCD": "EMP001"}))
+    assert s._bootstrapped_views == {"Employments", "Employees"}
+
+
+def test_field_state_errors_extracts_all_flagged_fields():
+    j = {"fieldStates": {
+        "Employments": [
+            {"fieldName": "Step", "fieldState": {"error": "Step is required", "errorLevel": 4}},
+            {"fieldName": "Level", "fieldState": {"error": "Level is required", "errorLevel": 4}},
+            {"fieldName": "BranchID", "fieldState": {"value": "MAIN"}},  # no error -> excluded
+        ],
+        "Employees": [{"fieldName": "EmployeeCD", "fieldState": {"value": "EMP001"}}],
+    }}
+    assert ScreenClient._field_state_errors(j) == [
+        "Employments.Step: Step is required",
+        "Employments.Level: Level is required",
+    ]
+
+
+def test_field_state_errors_tolerates_junk():
+    assert ScreenClient._field_state_errors(None) == []
+    assert ScreenClient._field_state_errors({}) == []
+    assert ScreenClient._field_state_errors({"fieldStates": None}) == []
+
+
+def test_grid_save_includes_bootstrapped_views_in_viewsparams():
+    s = _client("PY309000")
+    s._bootstrapped_views = {"Employments", "CurrentEmployees"}
+    s._http = _FakeHTTP(_read_body(
+        "EmployeeBankDetails", [{"field": "EmployeeBankDetailID"}], [], []))
+    asyncio.run(s.ui_insert_grid_row(
+        "EmployeeBankDetails", {"EmployeeBankID": 1147, "AccountNo": "1", "Percent": 100}))
+    save = _save(s._http)
+    assert set(save["viewsParams"].keys()) >= {
+        "EmployeeBankDetails", "Employments", "CurrentEmployees"}
+
+
+def test_grid_save_surfaces_sibling_view_field_errors():
+    class _FaultHTTP(_FakeHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            if (json or {}).get("command"):
+                return _Resp(409, {
+                    "messages": [{"message": "Error: Inserting 'Employment' record "
+                                             "raised at least one error.",
+                                  "messageType": "error"}],
+                    "fieldStates": {"Employments": [
+                        {"fieldName": "Step", "fieldState": {"error": "Step is required"}},
+                        {"fieldName": "Level", "fieldState": {"error": "Level is required"}},
+                    ]},
+                })
+            return _Resp(200, self._read)
+
+    s = _client("PY309000")
+    s._bootstrapped_views = {"Employments"}
+    s._http = _FaultHTTP(_read_body(
+        "EmployeeBankDetails", [{"field": "EmployeeBankDetailID"}], [], []))
+    with pytest.raises(ScreenError) as exc:
+        asyncio.run(s.ui_insert_grid_row(
+            "EmployeeBankDetails", {"EmployeeBankID": 1147, "AccountNo": "1", "Percent": 100}))
+    msg = str(exc.value)
+    assert "Step is required" in msg and "Level is required" in msg
+
+
+def test_grid_save_no_extra_detail_when_fieldstates_empty():
+    # the selector/lookup-failure case (proven live: "Employee Bank ... cannot be
+    # found") has no per-field annotation anywhere -- the message must stay as-is,
+    # not grow a bogus "field detail: " suffix with nothing behind it.
+    s = _client("PY309000")
+    s._http = _FakeHTTP(_read_body(
+        "EmployeeBankDetails", [{"field": "EmployeeBankDetailID"}], [], []))
+
+    class _GenericFaultHTTP(_FakeHTTP):
+        async def post(self, url, json=None, headers=None):  # noqa: A002
+            self.calls.append(json or {})
+            if (json or {}).get("command"):
+                return _Resp(409, {"messages": [{"message": "generic failure",
+                                                 "messageType": "error"}]})
+            return _Resp(200, self._read)
+
+    s._http = _GenericFaultHTTP(_read_body(
+        "EmployeeBankDetails", [{"field": "EmployeeBankDetailID"}], [], []))
+    with pytest.raises(ScreenError) as exc:
+        asyncio.run(s.ui_insert_grid_row(
+            "EmployeeBankDetails", {"EmployeeBankID": 1147, "AccountNo": "1", "Percent": 100}))
+    assert str(exc.value).endswith("generic failure")
+
+
 # ---- read-back guard --------------------------------------------------------
 #
 # The plane discards an unparseable value and WIPES the field (proven live on

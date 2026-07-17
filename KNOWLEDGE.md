@@ -193,6 +193,28 @@ your first.
   the API: SM206025 **Insert-From** (sets dirty, copies no rows), **Copy/Paste document** (pastes
   empty). When a "clone the whole record" action is needed and both planes no-op, reproduce the
   *data* another way rather than chasing the action.
+- **A grid write's own internal read used to re-clear the session** (fixed v0.63.0):
+  `ui_insert_grid_row`/`ui_update_grid_row`/`ui_update_grid_rows`/`ui_delete_grid_row` all call
+  `ui_grid_read` first, purely to fetch the current row list/columns for the Save payload — but
+  that call forced `clearSession`, wiping any `ui_set_field` edits staged earlier in the same
+  session (header fields set before inserting a detail row). Proven on PY309000: staging all
+  header/employment fields then calling `ui_insert_grid_row` normally still failed with a
+  required-header-field error, because the internal read wiped them first. `ui_grid_read` now
+  takes `preserve_session=True` for exactly this internal use; the standalone `ui_read_grid` tool
+  keeps the default fresh-reload behavior.
+- **A grid Save's error response only ever echoed `grid_view` + its `parent` view** (fixed
+  v0.63.0), so a validator error rooted in a THIRD, sibling view came back as a bare, undetailed
+  "record raised at least one error" — proven on PY309000: inserting an `EmployeeBankDetails` row
+  failed on `Employments.Step`/`Employments.Level` being required, but `Employments` was in
+  neither `grid_view` nor `parent`, so that detail was invisible unless you manually forced the
+  view into `viewsParams`. `_grid_save` now re-lists every view the session has bootstrapped
+  (`ScreenClient._bootstrapped_views`, populated by `ui_bootstrap`/`ui_navigate_record`) and
+  surfaces any of their per-field errors in the raised exception. This has a real floor, though: a
+  selector/lookup failure on a grid CELL doesn't attach to any view's `fieldStates` at all (proven
+  on the same investigation — PY309000's "Employee Bank" selector rejected both a real record's
+  raw ID and its own code with an identical, generic "cannot be found in the system" fault on
+  BOTH planes) — there the message stays generic because there genuinely is nothing more to
+  surface that way.
 
 ---
 

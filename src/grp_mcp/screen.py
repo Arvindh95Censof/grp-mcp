@@ -452,6 +452,7 @@ class ScreenClient:
         self._struct: dict | None = None  # per-client /structure memo (see _STRUCT_CACHE)
         self._graph_dirty: bool | None = None   # last observed graphIsDirty (None = unknown)
         self._rejected_sets: list[dict] = []    # sets the plane silently dropped
+        self._bootstrapped_views: set[str] = set()  # see ui_bootstrap / _grid_save
 
     @property
     def url(self) -> str:
@@ -815,6 +816,9 @@ class ScreenClient:
         self._active_tree_controls: dict | None = None
         self._active_tree_context_views: dict | None = None
         self._active_grid_row = None  # a fresh graph has no grid row selected
+        # A fresh bootstrap replaces the graph — old views' loaded state no longer
+        # applies, so this REPLACES (not unions) the tracked set. See _grid_save.
+        self._bootstrapped_views = set(v for v in (views or []) if v)
 
     async def ui_navigate_record(self, view: str, key: dict) -> None:
         """Select a SPECIFIC EXISTING record on `view` by its key field(s) — the
@@ -859,6 +863,7 @@ class ScreenClient:
         err = self._ui_error(resp)
         if err:
             raise ScreenError(f"ui_navigate_record {view} on {self.screen_id}: {err}")
+        self._bootstrapped_views.add(view)  # see _grid_save
 
     def ui_select_grid_row(self, grid_view: str, key: dict) -> None:
         """Mark an EXISTING data-grid row as the graph's CURRENT row for `grid_view`,
@@ -1945,12 +1950,24 @@ class ScreenClient:
     # empty"). The `columns` list + pager fields must be echoed back or the Save
     # returns a clean 200 that persists NOTHING (proven: minimal payload no-ops).
 
-    async def ui_grid_read(self, grid_view: str, parent: dict | None = None) -> dict:
+    async def ui_grid_read(self, grid_view: str, parent: dict | None = None,
+                           preserve_session: bool = False) -> dict:
         """Fresh grid read via the modern plane (clearSession → live DB rows).
 
         Returns {columns, rows, key_names, quick_filter_fields}. `rows` items are
         {id, cells:{Field:{value,...}}}. clearSession forces a DB reload so stale
         graph-session state isn't returned.
+
+        preserve_session=True skips clearSession. Used internally by the
+        ui_*_grid_row write wrappers, which call this purely to fetch the current
+        row list/columns needed to build a Save payload — not because a fresh DB
+        reload is wanted. clearSession discards ANY unsaved ui_set_field edits
+        staged earlier in the SAME session (e.g. header fields set before
+        inserting a detail row) — proven live on PY309000's EmployeeBankDetails:
+        it wiped already-set Employments/CurrentEmployees fields and produced
+        misleading validator errors on fields that WERE already set. The
+        master-key navigation below re-affirms the parent context regardless of
+        this flag, so skipping clearSession costs nothing when called that way.
 
         parent (MASTER-DETAIL): {"view": <primaryView>, "key": {keyField: value}}.
         A detail grid only populates under its selected header, so when `parent` is
@@ -1961,11 +1978,12 @@ class ScreenClient:
         parent=None → a top-level grid. (Proven: CA202000 CashAccount→ETDetails.)
         """
         await self._ensure_login()
+        clear = not preserve_session
         if parent:
             pv = parent["view"]
             await self._http.post(self.ui_url, json={
                 "isFirstRequest": True, "data": [], "controlsParams": {},
-                "activeRowContexts": [], "viewsParams": {pv: {}}, "clearSession": True,
+                "activeRowContexts": [], "viewsParams": {pv: {}}, "clearSession": clear,
             }, headers=_UI_HEADERS)
             # composite header keys (e.g. SM207060 InterfaceName+GateVersion) are
             # navigated field-by-field, like the browser commits them; the child
@@ -1983,7 +2001,7 @@ class ScreenClient:
         else:
             resp = await self._http.post(self.ui_url, json={
                 "isFirstRequest": True, "data": [], "controlsParams": {},
-                "activeRowContexts": [], "viewsParams": {grid_view: {}}, "clearSession": True,
+                "activeRowContexts": [], "viewsParams": {grid_view: {}}, "clearSession": clear,
             }, headers=_UI_HEADERS)
         err = self._ui_error(resp)
         if err:
@@ -2128,11 +2146,24 @@ class ScreenClient:
         activeRowContexts entry for a top-level grid); None (insert) → no dataKey.
         parent (master-detail) → the master view is re-listed in viewsParams so the
         Save keeps the header context; activeRowContexts stays empty (the loaded
-        master, not a row-context, anchors the child)."""
+        master, not a row-context, anchors the child).
+
+        Also re-lists every OTHER view this session has bootstrapped. A Save can
+        fail on a validator rooted in a THIRD, sibling view the caller loaded but
+        didn't otherwise mention here — proven live on PY309000: inserting an
+        EmployeeBankDetails row failed on Employments.Step/Level being required,
+        but Employments was in neither grid_view nor parent, so the response
+        carried only the useless generic "record raised at least one error" with
+        the real per-field detail nowhere the caller could see it. Echoing back a
+        view the caller already loaded is free — the graph already holds its
+        state — so this costs nothing on the success path and pays off exactly
+        when a sibling-view error would otherwise be silent."""
         ctrl = self._grid_ctrl(grid_view, g, changes, dataKey)
         views = {grid_view: {}}
         if parent:
             views[parent["view"]] = {}
+        for v in self._bootstrapped_views:
+            views.setdefault(v, {})
         payload = {
             "command": [{"name": "Save"}], "data": [],
             "controlsParams": {grid_view: ctrl},
@@ -2144,10 +2175,36 @@ class ScreenClient:
         resp = await self._http.post(self.ui_url, json=payload, headers=_UI_HEADERS)
         err = self._ui_error(resp)
         if err:
+            try:
+                body = resp.json()
+            except Exception:  # noqa: BLE001 — non-JSON body; no extra detail available
+                body = None
+            detail = self._field_state_errors(body)
+            if detail:
+                err = f"{err} — field detail: {'; '.join(detail)}"
             raise ScreenError(f"{op} {grid_view}{dataKey or ''} on {self.screen_id}: {err}")
         # Grid Saves are the classic silent-no-op surface: a clean 200 whose warning
         # toast is the only clue the rows didn't take. Carry it on the result.
         return self._annotate_notices(resp.json())
+
+    @staticmethod
+    def _field_state_errors(j: dict | None) -> list[str]:
+        """Every per-field error annotation across all views in a modern-plane
+        response's fieldStates — the concrete detail a generic "record raised at
+        least one error" message never carries on its own. Empty if the response
+        has no JSON body, or the failing validator didn't attach to any field
+        fieldStates can name (e.g. a selector/lookup failure on a grid cell) —
+        that case genuinely has no more detail available this way."""
+        out: list[str] = []
+        if not isinstance(j, dict):
+            return out
+        for view, fields in (j.get("fieldStates") or {}).items():
+            for entry in (fields or []):
+                st = entry.get("fieldState") if isinstance(entry, dict) else None
+                fname = entry.get("fieldName") if isinstance(entry, dict) else None
+                if isinstance(st, dict) and st.get("error"):
+                    out.append(f"{view}.{fname}: {st['error']}")
+        return out
 
     @staticmethod
     def _parse_grid_cols(columns: list | None) -> dict[str, dict]:
@@ -2256,7 +2313,7 @@ class ScreenClient:
         parent: {"view", "key"} to target a detail grid under a header (see
                 ui_grid_read). None = top-level grid.
         """
-        g = await self.ui_grid_read(grid_view, parent)
+        g = await self.ui_grid_read(grid_view, parent, preserve_session=True)
         values, refusal = await self._grid_write_guard(grid_view, g, values,
                                                        "ui_update_grid_row", skip_validation)
         if refusal:
@@ -2309,7 +2366,7 @@ class ScreenClient:
         notices: list[dict] = []
         updated = chunks = 0
         step = max(int(chunk_size), 1)
-        g = await self.ui_grid_read(grid_view, parent)
+        g = await self.ui_grid_read(grid_view, parent, preserve_session=True)
         # column meta is per-grid, not per-row (and not per-chunk) — resolve once.
         cmeta = {} if skip_validation else await self._grid_col_meta(grid_view, g)
         for start in range(0, len(updates), step):
@@ -2371,7 +2428,7 @@ class ScreenClient:
             echoed = (((save_resp.get("controlsData") or {}).get(grid_view)) or {}).get("rows")
         if echoed and len(echoed) >= len(g.get("rows") or []):
             return {**g, "rows": echoed}
-        return await self.ui_grid_read(grid_view, parent)
+        return await self.ui_grid_read(grid_view, parent, preserve_session=True)
 
     async def ui_insert_grid_row(self, grid_view: str, values: dict,
                                  parent: dict | None = None,
@@ -2384,7 +2441,7 @@ class ScreenClient:
         Cell writes are validated/coerced like form fields (read-only + invalid-enum
         refused, enum label->value coerced) when the grid's column meta is available;
         skip_validation=true bypasses."""
-        g = await self.ui_grid_read(grid_view, parent)
+        g = await self.ui_grid_read(grid_view, parent, preserve_session=True)
         values, refusal = await self._grid_write_guard(grid_view, g, values,
                                                        "ui_insert_grid_row", skip_validation)
         if refusal:
@@ -2407,7 +2464,7 @@ class ScreenClient:
         """Delete an existing grid row matched by its key field(s). The full key (incl.
         the parent-linkage id for a detail row) is sent inside the deleted row's
         `values` — required, else the delete no-ops. parent targets a detail grid."""
-        g = await self.ui_grid_read(grid_view, parent)
+        g = await self.ui_grid_read(grid_view, parent, preserve_session=True)
         idx, row = self._locate_row(g["rows"], key)
         if row is None:
             raise ScreenError(f"ui_delete_grid_row: no row in {grid_view} matches key {key}")
