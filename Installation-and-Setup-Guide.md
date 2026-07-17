@@ -22,7 +22,8 @@ automatically.
 
 grp-mcp is a Model Context Protocol (MCP) server that exposes an **Acumatica ERP** instance
 as tools an AI agent (Claude) can call. It connects to any Acumatica site given a base URL
-plus credentials, and reaches Acumatica through **four client planes**:
+plus credentials, and reaches Acumatica through **five client planes** (four for driving,
+one diagnostic-only):
 
 - **Contract-based REST** — CRUD entities, bulk-load from Excel/CSV, invoke actions, run
   reports, attach files, manage customization projects.
@@ -32,8 +33,11 @@ plus credentials, and reaches Acumatica through **four client planes**:
   wizard screens) by replaying their UI commands. No browser required.
 - **Modern UI-screen plane** — the JSON protocol the real browser UI uses, for actions the
   classic plane can't reach and full grid CRUD.
+- **Classic ASPX callback plane** *(diagnostic-only)* — recovers the REAL validation message
+  behind a failed grid save when both API planes report only the generic "record raised at
+  least one error" (`diagnose_save_error`).
 
-Across the four planes it exposes **~95 tools** (v0.52.1). Beyond entity CRUD and screen
+Across the five planes it exposes **~95 tools**. Beyond entity CRUD and screen
 driving these include: **setup discovery** on a blind instance (`screen_prereqs`,
 `screen_discover_prereqs`, `module_setup_plan`, `screen_autofill` — infer prerequisites and
 build order with no source in hand), **bulk execution** (`screen_bulk_load` — N master

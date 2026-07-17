@@ -19,6 +19,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .acumatica import AcumaticaClient, AcumaticaError
+from .aspx import AspxDiagnostic
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
@@ -26,8 +27,9 @@ from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
                      clear_struct_cache, close_http_pool, logout_session_cache)
 
 _KB_FIRST_POLICY = (
-    "TOOL SELECTION: this server has ~95 tools across FOUR Acumatica planes (contract "
-    "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON). If you're unsure which "
+    "TOOL SELECTION: this server has ~95 tools across FIVE Acumatica planes (contract "
+    "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON, plus a diagnostic-only "
+    "classic-ASPX callback plane). If you're unsure which "
     "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
     "screen call screen_capabilities(screen_id); for financial-foundation setup call "
     "get_setup_guidance. Don't guess a plane.\n\n"
@@ -38,7 +40,7 @@ _KB_FIRST_POLICY = (
     "set_segment_value, create_segmented_key, create_ledger, chart_of_accounts, "
     "create_financial_calendar, enable_features, run_import_scenario, "
     "ui_screen_action, ui_insert_grid_row, ui_update_grid_row, ui_update_grid_rows, "
-    "ui_delete_grid_row, "
+    "ui_delete_grid_row, diagnose_save_error (replays a real Save), "
     "or any other write — FIRST consult the Acumatica knowledge base (the kb-mcp-dual "
     "server: search_kb, then read_kb_file) for that screen/entity and the specific action. "
     "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
@@ -2762,6 +2764,76 @@ async def ui_delete_grid_row(
         await s.ui_delete_grid_row(grid_view, key, parent)
     return {"screen_id": screen_id.upper(), "grid_view": grid_view,
             "key": key, "parent": parent, "ok": True}
+
+
+@mcp.tool()
+async def diagnose_save_error(
+    screen_id: str,
+    record_key: dict,
+    grid_view: str,
+    values: dict,
+    row_key: dict | None = None,
+    old_values: dict | None = None,
+    operation: str = "update",
+    page_url: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """DIAGNOSTIC: recover the REAL error text behind a failed grid save.
+
+    When ui_insert_grid_row / ui_update_grid_row / screen_submit fail with only
+    the generic "record raised at least one error" (or a save silently no-ops),
+    the concrete validation message often exists ONLY on the screen's classic
+    ASPX rendering path — proven on PY309000, where "Percent should be 100 for
+    sum of all banks" is invisible to both API planes. This tool replays the
+    failing change over that classic WebForms callback protocol and returns the
+    detailed error: the screen's alert text plus any per-row / per-cell errors.
+
+    record_key: {keyField: value} loading the header record (e.g.
+        {"EmployeeCD": "EMP001"}). Key field names as in the modern plane.
+    grid_view:  the failing grid's data view (e.g. "EmployeeBankDetails").
+    values:     the cell values of the FAILING change ({field: value}).
+    row_key:    operation="update": {keyField: value} of the EXISTING row being
+        changed (e.g. {"EmployeeBankDetailID": 14542} — get it from ui_read_grid
+        or run_dac_odata). Unused for insert.
+    old_values: optional {field: previousValue} (browser parity; not required).
+    operation:  "update" (default) or "insert" — which kind of change failed.
+    page_url:   override the classic page path (auto-resolved via SiteMap).
+
+    Returns {alert, rows_error_text, row_errors, cell_errors, graph_dirty,
+    possibly_saved, ...}. `alert` is the headline message.
+
+    CAVEATS: requires allow_write — this POSTS a real Save, so if the replayed
+    change is actually VALID it PERSISTS (`possibly_saved: true` flags that);
+    only replay changes that already failed. Only works for screens that still
+    have a classic ASPX page (custom-module screens like PY/CS usually do;
+    `alert: null` + empty errors on a failure you can reproduce elsewhere means
+    the detail genuinely isn't on this plane either).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    url = page_url
+    if not url:
+        sm = await run_dac_odata("SiteMap", filter=f"ScreenID eq '{_oq(sid)}'",
+                                 select="ScreenID,Url", top=1, instance=instance)
+        smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+        raw = smv[0].get("Url") if smv else None
+        if not raw or ".aspx" not in raw:
+            return {"ok": False, "screen_id": sid,
+                    "error": f"no classic ASPX page found for {sid} in the site map "
+                             f"(Url={raw!r}) — this screen has no classic plane; "
+                             f"pass page_url explicitly if the site map is wrong."}
+        url = inst.base_url.rstrip("/") + raw.lstrip("~")
+    async with ScreenClient(inst, sid) as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        dk = await d.navigate(record_key)
+        result = await d.replay_grid_save(grid_view, values, row_key=row_key,
+                                          old_values=old_values, operation=operation)
+    return {"screen_id": sid, "page_url": url, "record_key": record_key,
+            "record_loaded": bool(dk), "grid_view": grid_view,
+            "operation": operation, **result}
 
 
 @mcp.tool()
@@ -6941,7 +7013,10 @@ _GUIDE = {
             "key-addressed, cell-validated)",
             "ui_update_grid_rows (edit MANY rows: one read + one Save per chunk; "
             "ui_update_grid_row re-reads the whole grid per row and does not scale)",
-            "ui_grid_row_action (select row + fire action)"],
+            "ui_grid_row_action (select row + fire action)",
+            "diagnose_save_error (a grid save failed with only the generic 'record "
+            "raised at least one error'? — replay it on the classic ASPX plane to "
+            "recover the REAL validation message)"],
         "run a process / mass-action": ["ui_run_process (Process/ProcessAll to completion)",
             "manage_financial_periods, generate_master_calendar (GL recipes)"],
         "financial-foundation / GL setup": ["get_setup_guidance FIRST (per-screen prereqs, "
@@ -7005,11 +7080,12 @@ _GUIDE = {
         "screen_capabilities": "probes one screen's /structure and recommends the plane/tool "
             "per operation shape.",
         "knowledge": "the operational KNOWLEDGE base (KNOWLEDGE.md) — distilled, sanitized "
-            "Acumatica-driving lessons: the four planes, classic screen-SOAP command "
+            "Acumatica-driving lessons: the five planes, classic screen-SOAP command "
             "mechanics + the no-bind signal, the modern UI-screen protocol, the "
             "data-migration recipe + silent-failure traps, GL setup order, segment values, "
-            "and connection/seat gotchas. Call knowledge() for the table of contents, "
-            "knowledge('migration') or knowledge(5) for one section.",
+            "connection/seat gotchas, and the classic-ASPX diagnostic plane (§11). Call "
+            "knowledge() for the table of contents, knowledge('migration') or knowledge(5) "
+            "for one section.",
     },
 }
 
@@ -7113,11 +7189,12 @@ def knowledge(section: str | None = None) -> Any:
     served straight from the package (read-only, no API call, instant).
 
     This is the hard-won "how Acumatica actually behaves" knowledge that turns "the screen
-    won't write" into "here's the exact command shape": the four planes and which to reach
+    won't write" into "here's the exact command shape": the five planes and which to reach
     for, the classic screen-SOAP command mechanics (descriptor `set` vs flat `key`, the
     ~335-byte no-bind signal, mass-update safety), the modern UI-screen JSON protocol, the
     DATA-MIGRATION recipe + every silent-failure trap, the GL/foundation setup order,
-    segment values, company tree, and connection/seat gotchas. Complements `guide` (which
+    segment values, company tree, connection/seat gotchas, and the classic-ASPX diagnostic
+    plane behind diagnose_save_error. Complements `guide` (which
     routes you to a TOOL); this explains the MECHANICS. Instance-specific state is excluded.
 
     section:

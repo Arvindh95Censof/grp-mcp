@@ -3,8 +3,8 @@
 MCP server that exposes **Acumatica ERP** as tools for AI agents. Multi-instance,
 OAuth2 — point it at any Acumatica site with a base URL + credentials.
 
-It reaches Acumatica through **four client planes**, so an agent can read and
-write almost anything:
+It reaches Acumatica through **five client planes** (four for driving, one
+diagnostic-only), so an agent can read and write almost anything:
 
 - **Contract-based REST** — CRUD entities, bulk-load from Excel/CSV, invoke
   actions, run reports, attach files, manage customization projects.
@@ -31,6 +31,12 @@ write almost anything:
   rows; editing one in place silently corrupts data there — see below), on both
   top-level grids and **master-detail** child grids under a header record. Works
   on any Modern-UI screen.
+- **Classic ASPX callback plane** *(diagnostic-only)* — the legacy WebForms
+  protocol behind `/Pages/XX/.../SCREENID.aspx`. When a grid save fails and both
+  API planes report only the generic *"record raised at least one error"*, the
+  concrete validation message often exists **only** here — `diagnose_save_error`
+  replays the failing change on this plane and returns the screen's real alert
+  plus per-row/cell errors. Same login session; not a write path.
 
 ## Tools
 
@@ -92,6 +98,7 @@ write almost anything:
 | `ui_update_grid_row` | Edit ONE **existing** GRID row in place on the modern UI-screen plane (`changes.modified`) — the capability classic screen SOAP lacks (its positional row selector is inert, see Known limitations). Matched by key; `parent` targets a CHILD grid under a header. Requires allow_write. |
 | `ui_delete_grid_row` | Delete an existing GRID row (matched by key) on the modern UI-screen plane (`changes.deleted`). `parent` targets a CHILD grid under a header. **Requires allow_delete.** |
 | `ui_grid_row_action` | Select an EXISTING grid row by key, then fire a screen-level ACTION on it (the "click a row → hit a toolbar button" flow) — closes the one thing classic SOAP structurally can't do (it can't address an existing grid row by key; proven: SM203520 Restore Snapshot faults "A snapshot is not selected" via SOAP). Auto-answers the confirmation dialog; `confirm=False` arms without committing; `parent` scopes a tenant/master. Returns an honest `status` (committed / dialog_open / redirected). Requires allow_write. |
+| `diagnose_save_error` | **Diagnostic**: recover the REAL error behind a failed grid save. When a save fails with only the generic "record raised at least one error" (the classic SOAP plane truncates the reason; the modern plane never serializes a hidden tab's grid errors at all), this replays the failing change over the screen's **classic ASPX WebForms callback protocol** — a 5th plane, diagnostic-only — and returns the screen's actual alert text plus per-row/cell errors (e.g. PY309000's cross-row "Percent should be 100 for sum of all banks", invisible to both API planes). Page path auto-resolves from the site map. CAVEAT: it POSTS a real Save, so a change that is actually *valid* persists (`possibly_saved` flags it) — only replay changes that already failed. Requires allow_write. |
 | `release_sessions` | Log out cached API sessions to free Web Service API license seats (trial = 2). |
 | `list_screens` | Find a screen's ID by title (searches the site map) — feeds screen_get_schema/get/submit. |
 | `whoami` | Active connection identity (user/tenant/endpoint), reachability, and cached sessions holding seats. |

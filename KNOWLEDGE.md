@@ -9,10 +9,11 @@ file is the human-readable companion.
 
 ---
 
-## 1. The four client planes — and which one to reach for
+## 1. The five client planes — and which one to reach for
 
-grp-mcp talks to Acumatica through four independent planes. Picking the wrong one is the single
-biggest time-sink. When unsure, call **`guide`** or **`screen_capabilities(screen_id)`** first.
+grp-mcp talks to Acumatica through five independent planes (four for driving, one diagnostic-only).
+Picking the wrong one is the single biggest time-sink. When unsure, call **`guide`** or
+**`screen_capabilities(screen_id)`** first.
 
 | Plane | Tool surface | Best for | Blind spots |
 |-------|--------------|----------|-------------|
@@ -20,6 +21,7 @@ biggest time-sink. When unsure, call **`guide`** or **`screen_capabilities(scree
 | **DAC OData** | `run_dac_odata`, `get_dac_metadata`, `count_entity` | Reading any table/DAC (incl. config singletons) + mandatory-field metadata | Read-only; needs the OData v4 role or returns 403 |
 | **Classic screen SOAP** | `screen_submit`, `screen_get`, `screen_record`, `screen_insert_rows`, recipes | Context/wizard/master-detail screens; "as-a-user" command replay | No random-access to a non-first grid row; some action tags are silently no-ops |
 | **Modern UI-screen** | `ui_screen_action`, `ui_set_field`, `ui_read_grid`, `ui_update_grid_row`, `ui_get_structure` | Actions the classic plane can't reach; grid-row identity; enum allowed-values; structured errors | Some codebehind-only toolbar actions (Copy/Paste, Insert-From) are shimmed to no-ops |
+| **Classic ASPX callbacks** *(diagnostic-only)* | `diagnose_save_error` | Recovering the REAL validation message behind a failed grid save — both API planes above truncate it to "record raised at least one error" | Screens with no classic `.aspx` page; it replays a real Save (§11) |
 
 **Rule of thumb:** REST for plain entities → classic SOAP for context screens → modern UI plane for
 what classic can't do. The modern plane is materially *more* capable than classic SOAP (schema
@@ -481,6 +483,47 @@ working tree by default, which is wider than what you think you wrote:
 
 After upload, PyPI's `info.version` ("latest") can lag the `releases` list by a minute — a version
 is installable as soon as it appears in `releases`.
+
+---
+
+## 11. Classic ASPX diagnostic plane — recovering the REAL error behind a failed save
+
+**The problem it solves (proven raw, 2026-07-17):** when a grid save fails validation, the classic
+SOAP plane truncates the reason and the modern JSON plane returns only the generic
+`"...record raised at least one error. Please review the errors."` — its `fieldStates` never
+serializes a hidden tab's grid, so the concrete message (e.g. a cross-row rule like
+*"Percent should be 100 for sum of all banks"*, or *"'Employee Bank' cannot be empty. Account No
+is required"*) is **absent from the entire response**, not merely unparsed. The detail exists only
+on the screen's legacy ASP.NET WebForms page (`/Pages/XX/.../SCREENID.aspx`), spoken through the
+classic `ICallbackEventHandler` callback protocol.
+
+**The tool:** `diagnose_save_error(screen_id, record_key, grid_view, values, row_key?, operation?)`
+replays the failing change on that plane and returns `alert` (the headline message) plus any
+per-row/per-cell error attributes. Page path auto-resolves from the SiteMap. Diagnostic-only by
+design — the other planes remain the write path.
+
+**Protocol facts (for maintainers extending it):**
+- Shares the existing cookie login; no separate auth, and `__DataSourceSessionID` rides **empty**
+  (no session bootstrap exists — graph context lives in the `ctl00_*_state` fields, which are
+  plain single-URL-encoded XML, not opaque ViewState).
+- The server is **stateless between callbacks**: fold each response block's `dataKey` back into
+  its `_state` field (`<PXBoundPanel PageCount=".." PageIndex="0" DataKey="view,/wEW.."/>`) or
+  the next call sees an empty graph.
+- `__CALLBACKPARAM` is `Command|<envelope XML>` — the envelope is required (a bare command
+  no-ops). Record load-by-key = `Cancel` + the key field's discrete edit param (same semantics
+  as the classic SOAP plane). Saves always target the datasource (`__CALLBACKID=ctl00$phDS$ds`)
+  with `<RowChanges><Modified|Inserted>` CDATA addressed at the grid control.
+- Grid data never needs to load: the Save validates RowChanges against DB rows rebuilt from the
+  header dataKey. Activate the grid's tab via its `_state` `SelectedIndex` or errors don't render.
+- Control discovery: each control's config is emitted as `var _<control_id> = {json}` — the id is
+  in the **var name with a leading underscore** (invisible to `\b`-anchored scans; matching the
+  "nearest preceding id" picks the WRONG control and the Save no-ops with a clean ~54-char ack).
+  Map the `"dataMember"` occurrence to its owning var declaration and prefer bodies with the
+  grid-specific `"levels":` key.
+- **A replayed change that is actually VALID persists** — the tool requires `allow_write` and
+  flags `possibly_saved: true`; only replay changes that already failed.
+- One-shot scripts against this plane must `await logout_session_cache()` on exit or each process
+  orphans a "Max Web Services API Users" seat until idle-timeout.
 
 ---
 
