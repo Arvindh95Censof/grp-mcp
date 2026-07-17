@@ -6943,7 +6943,8 @@ Example:
 
 _GUIDE = {
     "start_here": (
-        "grp-mcp exposes Acumatica over FOUR planes. Don't guess — pick by task shape "
+        "grp-mcp exposes Acumatica over FIVE planes (four for driving, one "
+        "diagnostic-only). Don't guess — pick by task shape "
         "below, or call screen_capabilities(screen_id) for one screen, or "
         "get_setup_guidance for financial-foundation setup. Golden rules: (a) KB-FIRST "
         "before any write (search_kb/read_kb_file for the screen's prerequisites); "
@@ -7093,7 +7094,7 @@ _GUIDE = {
 @mcp.tool()
 def guide(topic: str | None = None) -> Any:
     """START HERE — pick the right grp-mcp tool for your task (this server has ~95 tools
-    across four Acumatica planes, so guessing wastes calls).
+    across five Acumatica planes, so guessing wastes calls).
 
     Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,
     instant (static, no API call).
