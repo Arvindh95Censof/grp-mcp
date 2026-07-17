@@ -311,7 +311,7 @@ the screen's KB form reference for those.
 ### KB-first CRUD policy
 
 Before **any** create/update/delete (on a screen or an entity), consult the Acumatica
-knowledge base (the **kb-mcp** server: `search_kb`, then `read_kb_file`) for that
+knowledge base (the **kb-mcp-dual** server: `search_kb`, then `read_kb_file`) for that
 screen/entity and the specific action — read its prerequisites, dependent screens,
 required fields, validation rules, and ordering constraints, then verify each
 prerequisite exists in the instance before writing. Pure reads are exempt.
@@ -557,6 +557,15 @@ python -m pytest tests/ -q
 ```
 
 ## Status
+
+v0.63.1 — **KB-first policy references updated to `kb-mcp-dual`.** The docstrings/instructions
+that name the knowledge-base server (main server instructions, `run_import_scenario`,
+`ui_run_process`, `ui_grid_row_action`, `ui_tree_dialog_insert`, `screen_submit`,
+`ui_screen_action`'s prereq-failure guidance, `screen.py`'s `ui_grid_row_action`) all said
+`kb-mcp`; the KB server was replaced by `kb-mcp-dual` (dual-model semantic search — a
+multilingual model for the Bahasa Malaysia GRP manuals, alongside the existing English-tuned
+one for everything else), same `search_kb`/`read_kb_file` contract. Docs-only, no behavior
+change; 252 tests still green.
 
 v0.63.0 — **Fixed two grid-write footguns found verifying a second PY309000 report (EmployeeBankDetails "modern plane can't co-insert" claim, 2026-07-17, verified live).**
 The reported "deadlock" turned out not to be an inherent Acumatica conflict — it was two

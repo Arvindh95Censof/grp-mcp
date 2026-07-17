@@ -35,7 +35,7 @@ in a *different* session is fine and encouraged.
 ## 2. KB-first policy (mandatory before any write)
 
 Before ANY create/update/delete on a screen or entity, consult the Acumatica knowledge base
-(`kb-mcp`: `search_kb` → `read_kb_file`) for that screen **and** the specific action. Read its
+(`kb-mcp-dual`: `search_kb` → `read_kb_file`) for that screen **and** the specific action. Read its
 prerequisites, dependent screens, required fields, validation rules, and ordering constraints;
 verify each prerequisite exists (`run_dac_odata` / `screen_get` / `setup_readiness`) and set up any
 missing one first, recursively.

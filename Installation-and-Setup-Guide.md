@@ -427,10 +427,10 @@ python -m pytest tests/ -q     # run the test suite
 Register the local checkout with Claude by pointing the launch command at the editable install's
 `grp-mcp` entry point. Editing source requires **restarting the MCP server** to take effect.
 
-### 13.3 Knowledge base (kb-mcp)
+### 13.3 Knowledge base (kb-mcp-dual)
 
 grp-mcp follows a **KB-first policy** for writes: before mutating a screen it expects an Acumatica
-knowledge base (served by a separate `kb-mcp` server) to be available for prerequisite lookups.
+knowledge base (served by a separate `kb-mcp-dual` server) to be available for prerequisite lookups.
 This is optional for read-only use and for basic connectivity, but recommended before driving
 setup screens. It is configured and installed separately.
 

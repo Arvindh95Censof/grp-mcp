@@ -1868,7 +1868,7 @@ class ScreenClient:
         downstream effect). Raises ScreenError on an explicit business/validation
         error. Requires allow_write for a committing action.
 
-        PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+        PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen first.
         """
         # 1. load the header (and the grid) so the row is addressable.
         if parent:

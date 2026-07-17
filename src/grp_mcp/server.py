@@ -39,8 +39,8 @@ _KB_FIRST_POLICY = (
     "create_financial_calendar, enable_features, run_import_scenario, "
     "ui_screen_action, ui_insert_grid_row, ui_update_grid_row, ui_update_grid_rows, "
     "ui_delete_grid_row, "
-    "or any other write — FIRST consult the Acumatica knowledge base (the kb-mcp server: "
-    "search_kb, then read_kb_file) for that screen/entity and the specific action. "
+    "or any other write — FIRST consult the Acumatica knowledge base (the kb-mcp-dual "
+    "server: search_kb, then read_kb_file) for that screen/entity and the specific action. "
     "Read its PREREQUISITES, dependent screens, required fields, validation rules, "
     "and ordering constraints; verify each prerequisite exists in the instance "
     "(run_dac_odata / screen_get / get_entity / setup_readiness) and set up any "
@@ -464,8 +464,8 @@ def _reframe_ui_validation(screen_id: str, action: str, msg: str, struct: dict) 
             "WAS accepted and evaluated by Acumatica's own business rules — a required value "
             "is missing/invalid (or a module prerequisite isn't met). Supply the flagged "
             "field(s), plus any required_fields still empty, in set_fields and retry the SAME "
-            "action. Read current values with screen_get/run_dac_odata; consult kb-mcp for the "
-            "correct value if unsure. Do NOT conclude the screen is un-drivable."
+            "action. Read current values with screen_get/run_dac_odata; consult kb-mcp-dual for "
+            "the correct value if unsure. Do NOT conclude the screen is un-drivable."
         ),
     }
 
@@ -2180,7 +2180,7 @@ async def ui_run_process(
     live: GL503000 ProcessAll). A large batch opens a progress dialog that this polls
     up to `poll_seconds` (kept under the MCP request limit; if it returns
     still_processing=true the process is still running server-side — re-call or check
-    the downstream effect). PRECONDITION (KB-first): consult kb-mcp for the screen's
+    the downstream effect). PRECONDITION (KB-first): consult kb-mcp-dual for the screen's
     prerequisites. Requires allow_write; a destructive process action additionally
     requires allow_delete.
 
@@ -2241,7 +2241,7 @@ async def ui_grid_row_action(
     Validates grid_view + action against /structure first (both silently no-op if
     wrong on this protocol). Requires allow_write for a committing action.
 
-    PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+    PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen first.
 
     Live proof of the SOAP gap + a worked example: guide(topic="ui_grid_row_action").
     """
@@ -2311,7 +2311,7 @@ async def ui_tree_dialog_insert(
     Requires allow_write. Verify the result with get_entity_schema/list_entities
     (contract) — not just the tool's own response.
 
-    PRECONDITION (KB-first policy): consult kb-mcp for the screen first.
+    PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen first.
 
     Capture provenance, the 5 phases + a worked SM207060 example:
     guide(topic="ui_tree_dialog_insert").
@@ -2775,7 +2775,7 @@ async def screen_submit(
 ) -> Any:
     """Drive a screen via the screen-based SOAP API — writes screens REST can't.
 
-    PRECONDITION (KB-first policy): before this write, consult kb-mcp (search_kb /
+    PRECONDITION (KB-first policy): before this write, consult kb-mcp-dual (search_kb /
     read_kb_file) for this screen's prerequisites, dependent screens, and validation
     rules, and verify each prerequisite exists — Acumatica screens have hard
     dependencies they won't surface until a write fails. See the server instructions.
@@ -4394,8 +4394,8 @@ async def screen_discover_prereqs(
                     "These are the screen's OWN business-rule prerequisites — the write was "
                     "reached and evaluated, then rolled back (nothing persisted). Satisfy the "
                     "flagged field(s) / add the needed detail row, add them to seed_fields, and "
-                    "re-run to reveal the NEXT blocker (or drive the real write). Consult kb-mcp "
-                    "for correct values. This is NOT a 'cannot set up' condition."
+                    "re-run to reveal the NEXT blocker (or drive the real write). Consult "
+                    "kb-mcp-dual for correct values. This is NOT a 'cannot set up' condition."
                 ),
             }
     # No rule blocked the save — it went through. A record likely persisted.
