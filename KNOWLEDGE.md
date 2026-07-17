@@ -532,6 +532,13 @@ design — the other planes remain the write path.
   change you replay may actually be VALID — it will PERSIST (Acumatica auto-clears the opposite
   amount column rather than erroring). `possibly_saved: true` is the tool's honest signal; verify
   via OData and revert (ui_update_grid_row restored it cleanly).
+- **Headerless LIST screens (the grid IS the primary view, e.g. GL202500)**: pass `record_key={}`
+  — navigation is skipped (there is no header record to load; forcing it fails "record did not
+  load"). LIMITATION (proven live, insert AND update): RowChanges against the PRIMARY grid never
+  bind — the Save answers clean with `isDirty:1` and zero error text, because the browser drives
+  such grids through a per-cell commit flow this plane client does not emulate. The result carries
+  an explicit `note` saying validation never fired (an empty error list must not read as "no
+  problem found"). Detail/child grids under a loaded header remain the fully supported shape.
 - **A replayed change that is actually VALID persists** — the tool requires `allow_write` and
   flags `possibly_saved: true`; only replay changes that already failed.
 - One-shot scripts against this plane must `await logout_session_cache()` on exit or each process

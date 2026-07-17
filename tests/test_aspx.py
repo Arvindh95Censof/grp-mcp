@@ -244,6 +244,35 @@ def test_replay_grid_save_normal_error_has_no_server_error_key():
     assert result["possibly_saved"] is False
 
 
+def test_replay_grid_save_dirty_without_error_gets_honest_note():
+    # Proven live on GL202500 (headerless list screen): RowChanges against the
+    # PRIMARY grid never bind — the Save answers clean with isDirty=1 and ZERO
+    # error text. An empty error list must not read as "no problem found"; the
+    # result carries an explicit note that validation never fired.
+    dirty_body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;popupMessage&quot;:'
+        'null,&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>'
+    )
+    d = _diag_stub(_GL301000_GRID_JS, dirty_body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50},
+        row_key={"LineNbr": 1}))
+    assert result["possibly_saved"] is False
+    assert "did not commit" in result["note"]
+    assert result["alert"] is None
+
+
+def test_replay_grid_save_no_note_when_error_present():
+    body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+    d = _diag_stub(_GL301000_GRID_JS, body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50}))
+    assert result["alert"] == "Boom"
+    assert "note" not in result
+
+
 def test_replay_grid_save_skips_validation_when_refresh_fails():
     # If the Refresh itself errors, diagnosis proceeds without column
     # validation (best-effort) rather than blocking.

@@ -2790,6 +2790,11 @@ async def diagnose_save_error(
 
     record_key: {keyField: value} loading the header record (e.g.
         {"EmployeeCD": "EMP001"}). Key field names as in the modern plane.
+        Pass {} for a HEADERLESS list screen (the grid IS the primary view,
+        e.g. GL202500) — navigation is skipped. NOTE: on such screens the
+        replay currently cannot bind RowChanges to the primary grid (the
+        result says so via `note`); detail/child grids under a loaded header
+        are the fully supported shape.
     grid_view:  the failing grid's data view (e.g. "EmployeeBankDetails").
     values:     the cell values of the FAILING change ({field: value}).
     row_key:    operation="update": {keyField: value} of the EXISTING row being
@@ -2840,11 +2845,16 @@ async def diagnose_save_error(
         await s._ensure_login()
         d = AspxDiagnostic(s, url)
         await d.open()
-        dk = await d.navigate(record_key)
+        # Headerless LIST screens (e.g. GL202500 Chart of Accounts: the grid IS
+        # the primary view, no header record) have nothing to navigate to — an
+        # empty record_key skips the step instead of failing "record did not
+        # load" on a screen that has no record to load.
+        dk = await d.navigate(record_key) if record_key else None
         result = await d.replay_grid_save(grid_view, values, row_key=row_key,
                                           old_values=old_values, operation=operation)
     return {"screen_id": sid, "page_url": url, "record_key": record_key,
-            "record_loaded": bool(dk), "grid_view": grid_view,
+            "record_loaded": bool(dk) if record_key else "skipped (headerless)",
+            "grid_view": grid_view,
             "operation": operation, **result}
 
 

@@ -379,10 +379,25 @@ class AspxDiagnostic:
         errs = _grid_errors(body)
         alert = ds.get("alert")
         saved = not alert and not any(errs.values()) and not ds.get("isDirty")
-        return {
+        out = {
             "alert": alert,
             **errs,
             "graph_dirty": bool(ds.get("isDirty")),
             "possibly_saved": saved,
             "response_len": len(body),
         }
+        if not alert and not any(errs.values()) and ds.get("isDirty"):
+            # Dirty graph + zero error text = the RowChanges never BOUND, so
+            # validation never fired (proven live on GL202500: both insert and
+            # update against the PRIMARY grid of a headerless list screen land
+            # here — child grids under a loaded header bind fine). Say so,
+            # or the empty error list reads as "no problem found".
+            out["note"] = (
+                "no error text returned but the graph was left dirty — the "
+                "change did not commit and validation never fired. Known "
+                "cause: RowChanges against the PRIMARY grid of a headerless "
+                "list screen (e.g. GL202500) do not bind on this plane (the "
+                "browser uses a per-cell commit flow this tool does not "
+                "emulate). The real error is not recoverable this way for "
+                "this screen shape.")
+        return out
