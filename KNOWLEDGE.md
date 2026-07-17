@@ -520,6 +520,18 @@ design — the other planes remain the write path.
   "nearest preceding id" picks the WRONG control and the Save no-ops with a clean ~54-char ack).
   Map the `"dataMember"` occurrence to its owning var declaration and prefer bodies with the
   grid-specific `"levels":` key.
+- **Column names are the CLASSIC grid's dataFields, not the modern plane's field names** (proven
+  live, GL301000: modern `CreditAmt` vs classic column `CuryCreditAmt`). A RowChanges `Key` the
+  grid doesn't know either CRASHES the callback (raw `e`-prefixed exception text instead of the
+  `0|` envelope — the ICallbackEventHandler error channel) or silently no-ops with a clean full
+  response. Harvest the authoritative list from a targeted grid `Refresh` first (its response's
+  `"dataField"` entries; present even at zero rows) and validate keys against it. The Refresh
+  also PRIMES the server-side graph — a Save without one can silently no-op even with correct keys.
+- A screen-specific caveat class exists: on a screen whose validation is deferred (e.g. GL301000's
+  batch balance only checks at Release, and an On-Hold batch saves drafts freely), the "failing"
+  change you replay may actually be VALID — it will PERSIST (Acumatica auto-clears the opposite
+  amount column rather than erroring). `possibly_saved: true` is the tool's honest signal; verify
+  via OData and revert (ui_update_grid_row restored it cleanly).
 - **A replayed change that is actually VALID persists** — the tool requires `allow_write` and
   flags `possibly_saved: true`; only replay changes that already failed.
 - One-shot scripts against this plane must `await logout_session_cache()` on exit or each process

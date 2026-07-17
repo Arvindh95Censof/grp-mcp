@@ -269,6 +269,28 @@ class AspxDiagnostic:
             f'<PXBoundPanel PageCount="0" PageIndex="0" SelectedIndex="{index}">'
             f'<Items/></PXBoundPanel>', safe="")
 
+    async def _grid_columns(self, grid_ctl: str) -> list[str]:
+        """The grid's authoritative column dataFields, from a targeted Refresh
+        callback. This is load-bearing twice over (both proven live, GL301000):
+        (1) the Refresh primes the server-side graph — a Save sent without one
+        can silently no-op; (2) the response's `"dataField"` list is the ONLY
+        reliable source of the classic grid's column names, which can differ
+        from the modern plane's field names (GLTran exposes `CreditAmt` on the
+        modern plane but the classic grid column is `CuryCreditAmt` — sending
+        the former crashes the callback with a NullReferenceException or
+        silently no-ops). Present even when the grid returns ZERO rows
+        (PY309000). Empty list if the Refresh itself fails — caller then skips
+        validation rather than blocking the diagnosis."""
+        cb_target = grid_ctl.replace("_", "$")
+        try:
+            body = await self._callback(
+                cb_target,
+                f'Refresh|<{grid_ctl} LoadedLevel="-1"><![CDATA[]]></{grid_ctl}>')
+        except ScreenError:
+            return []
+        return list(dict.fromkeys(
+            re.findall(r'"dataField":"([A-Za-z0-9_]+)"', unescape(body))))
+
     async def replay_grid_save(self, grid_view: str, cells: dict[str, Any],
                                row_key: dict[str, Any] | None = None,
                                old_values: dict[str, Any] | None = None,
@@ -281,12 +303,43 @@ class AspxDiagnostic:
         old_values: optional {field: previousValue} — included as OldValue attrs
         (browser parity; not required for validation to fire).
 
+        Cell keys are validated against the grid's REAL column dataFields
+        (harvested via a Refresh first — see _grid_columns): an unknown key is
+        REFUSED with the column list and a best-guess suggestion instead of
+        being sent (an unknown key crashes some screens' callbacks and silently
+        no-ops others — both proven live on GL301000).
+
         WARNING: this POSTS a real Save. If the change is actually VALID the
         server PERSISTS it. Use only to diagnose a change that already failed.
         """
         grid_ctl, tab_ctl, tab_idx = self.find_grid_control(grid_view)
         if tab_ctl is not None:
             self._activate_tab(tab_ctl, tab_idx)
+
+        columns = await self._grid_columns(grid_ctl)
+        if columns:
+            colset = set(columns)
+            unknown = [f for f in list(cells) + list(row_key or {})
+                       if f not in colset]
+            if unknown:
+                # best-guess mapping: modern-plane name -> Cury-prefixed column
+                suggestions = {f: f"Cury{f}" for f in unknown
+                               if f"Cury{f}" in colset}
+                return {
+                    "refused": (
+                        f"field(s) {unknown} are not columns of this grid on the "
+                        f"classic page — sending them would crash or silently "
+                        f"no-op the callback. Use the exact column names from "
+                        f"grid_columns" + (f"; likely mapping: {suggestions}"
+                                            if suggestions else "") + "."),
+                    "unknown_fields": unknown,
+                    "suggestions": suggestions,
+                    "grid_columns": columns,
+                    "alert": None,
+                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
+                    "graph_dirty": False,
+                    "possibly_saved": False,
+                }
 
         cell_xml = []
         for f, v in cells.items():
@@ -303,6 +356,25 @@ class AspxDiagnostic:
         body = await self._callback(
             _DS_CTL, _DS_ENVELOPE.format(cmd="Save", inner=inner))
         blocks = _parse_control_blocks(body)
+        # A well-formed callback response ALWAYS starts with "0|" (the ASP.NET
+        # ICallbackEventHandler success/argument-count prefix) — observed on
+        # every captured response, success or business-validation error alike.
+        # A callback that CRASHES server-side (e.g. a NullReferenceException in
+        # the screen's codebehind — proven live: GL301000's Transactions grid)
+        # instead returns raw, unwrapped exception text with no "0|" prefix and
+        # no parseable control blocks. Silently falling through to the "clean"
+        # heuristic below would report `possibly_saved: true` on a request that
+        # never even reached validation — exactly the false confidence this
+        # tool exists to prevent. Surface the raw text and refuse to guess.
+        if not body.startswith("0|") and not blocks:
+            return {
+                "alert": None,
+                "rows_error_text": [], "row_errors": [], "cell_errors": [],
+                "server_error": body.strip()[:500],
+                "graph_dirty": False,
+                "possibly_saved": False,
+                "response_len": len(body),
+            }
         ds = blocks.get(_DS_BLOCK) or {}
         errs = _grid_errors(body)
         alert = ds.get("alert")

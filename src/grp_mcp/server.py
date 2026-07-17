@@ -2799,8 +2799,20 @@ async def diagnose_save_error(
     operation:  "update" (default) or "insert" — which kind of change failed.
     page_url:   override the classic page path (auto-resolved via SiteMap).
 
+    FIELD NAMES: values/row_key keys must be the CLASSIC grid's column
+    dataFields, which can differ from the modern plane's names (GLTran exposes
+    `CreditAmt` on the modern plane but the classic grid column is
+    `CuryCreditAmt`). Unknown keys are REFUSED up front — the result carries
+    `refused` + `grid_columns` (the real column list) + `suggestions` (e.g.
+    {"CreditAmt": "CuryCreditAmt"}); resend with the suggested names.
+
     Returns {alert, rows_error_text, row_errors, cell_errors, graph_dirty,
-    possibly_saved, ...}. `alert` is the headline message.
+    possibly_saved, ...}. `alert` is the headline message. A `server_error` key
+    (with `possibly_saved` forced false) means the classic page's callback
+    CRASHED server-side before producing a normal response — a real server-side
+    fault (e.g. a codebehind NullReferenceException on that grid/screen), not a
+    validation message; the raw text is included but there is no structured
+    detail to extract.
 
     CAVEATS: requires allow_write — this POSTS a real Save, so if the replayed
     change is actually VALID it PERSISTS (`possibly_saved: true` flags that);

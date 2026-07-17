@@ -1,9 +1,13 @@
 """Unit tests for the classic-ASPX diagnostic plane (aspx.py) — pure logic,
 no live instance. Fixtures mirror payloads captured live on csmdev PY309000
 (2026-07-17), including the exact discovery bug that made the first Save
-silently no-op (RowChanges addressed to the wrong grid control)."""
+silently no-op (RowChanges addressed to the wrong grid control), and on
+GL301000 (2026-07-18), where the classic page's Save callback ITSELF crashes
+server-side (a raw, unwrapped NullReferenceException, not a validation error)."""
 
 from __future__ import annotations
+
+import asyncio
 
 from grp_mcp.aspx import (AspxDiagnostic, _grid_errors, _parse_control_blocks,
                           _parse_hidden_inputs, _xml_attr_escape)
@@ -161,3 +165,103 @@ def test_xml_attr_escape():
     assert _xml_attr_escape('a<b>&"c') == "a&lt;b&gt;&amp;&quot;c"
     assert _xml_attr_escape(None) == ""
     assert _xml_attr_escape(50) == "50"
+
+
+# ---- replay_grid_save: server-side crash + column validation (GL301000) ----
+
+_GL301000_GRID_JS = (
+    'var _ctl00_phG_tab_t0_grid = {"dataMember":"GLTranModuleBatNbr",'
+    '"levels":[{"columns":[]}]};\n')
+
+# a grid-Refresh response carrying the AUTHORITATIVE column dataFields (the
+# classic grid speaks CuryCreditAmt, not the modern plane's CreditAmt)
+_GL_REFRESH_BODY = (
+    '0|<ctl00_phG_tab_t0_grid><![CDATA[<ctl00_phG_tab_t0_grid Props="'
+    '{&quot;levels&quot;:[{&quot;columns&quot;:[{&quot;dataField&quot;:&quot;LineNbr&quot;},'
+    '{&quot;dataField&quot;:&quot;CuryDebitAmt&quot;},'
+    '{&quot;dataField&quot;:&quot;CuryCreditAmt&quot;},'
+    '{&quot;dataField&quot;:&quot;Module&quot;},'
+    '{&quot;dataField&quot;:&quot;BatchNbr&quot;}]}]}"/>]]></ctl00_phG_tab_t0_grid>')
+
+
+def _diag_stub(html: str, save_body: str,
+               refresh_body: str = _GL_REFRESH_BODY) -> AspxDiagnostic:
+    """AspxDiagnostic working off `html`, with _callback stubbed: a Refresh
+    command gets `refresh_body`, everything else gets `save_body` — no network."""
+    d = _diag_with_html(html)
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        return refresh_body if cbparam.startswith("Refresh|") else save_body
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    return d
+
+
+def test_replay_grid_save_refuses_unknown_column_with_suggestion():
+    # THE GL301000 root cause: the modern plane's field name (CreditAmt) is not
+    # a column of the classic grid (CuryCreditAmt) — sending it crashed the
+    # callback (NullReferenceException) or silently no-op'd. Must be REFUSED
+    # up front with the real column list and the Cury-prefix suggestion.
+    d = _diag_stub(_GL301000_GRID_JS, "should-never-be-sent")
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CreditAmt": 50},
+        row_key={"Module": "GL", "BatchNbr": "GL21000001", "LineNbr": 1}))
+    assert result["unknown_fields"] == ["CreditAmt"]
+    assert result["suggestions"] == {"CreditAmt": "CuryCreditAmt"}
+    assert "CuryCreditAmt" in result["grid_columns"]
+    assert result["possibly_saved"] is False
+
+
+def test_replay_grid_save_surfaces_raw_server_crash_not_false_success():
+    # Captured live: a callback that CRASHES server-side returns raw, unwrapped
+    # exception text (no "0|" envelope, no Props blocks). Before the fix, the
+    # "clean save" heuristic misread this as success (possibly_saved=True) —
+    # exactly backwards, since the callback never even reached validation.
+    crash_body = "eObject reference not set to an instance of an object."
+    d = _diag_stub(_GL301000_GRID_JS, crash_body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50},
+        row_key={"Module": "GL", "BatchNbr": "GL21000001", "LineNbr": 1}))
+    assert result["possibly_saved"] is False
+    assert result["server_error"] == crash_body
+    assert result["alert"] is None
+
+
+def test_replay_grid_save_normal_error_has_no_server_error_key():
+    # A well-formed "0|"-prefixed response with a real business-rule alert
+    # must NOT be misclassified as a server crash.
+    normal_body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;Percent should be 100 for sum of all banks&quot;,'
+        '&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>'
+    )
+    d = _diag_stub(_GL301000_GRID_JS, normal_body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50},
+        row_key={"Module": "GL", "BatchNbr": "GL21000001", "LineNbr": 1}))
+    assert "server_error" not in result
+    assert result["alert"] == "Percent should be 100 for sum of all banks"
+    assert result["possibly_saved"] is False
+
+
+def test_replay_grid_save_skips_validation_when_refresh_fails():
+    # If the Refresh itself errors, diagnosis proceeds without column
+    # validation (best-effort) rather than blocking.
+    from grp_mcp.aspx import AspxDiagnostic as _AD  # noqa: F401 (clarity)
+    d = _diag_with_html(_GL301000_GRID_JS)
+    normal_body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+
+    from grp_mcp.screen import ScreenError
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        if cbparam.startswith("Refresh|"):
+            raise ScreenError("refresh broke")
+        return normal_body
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"AnythingGoes": 1}))
+    assert result["alert"] == "Boom"
+    assert "refused" not in result
