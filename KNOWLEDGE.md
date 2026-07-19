@@ -231,6 +231,33 @@ your first.
   instead of propagating the exception, since its whole job is answering "which plane do I use" —
   crashing there is exactly backwards. `diagnose_save_error` is unaffected either way (it never
   calls `/structure`, discovering everything from the classic page's own HTML).
+  Confirmed server-side 4 independent ways (grp-mcp's own client, raw httpx bypassing grp-mcp
+  entirely, and — twice — the real user's own authenticated browser session), each with a fresh
+  `traceId` (proves live reproduction, not a cached replay). A full sweep of csmdev's entire
+  SiteMap (2921 distinct ScreenIDs, 8-way concurrency, one shared login, ~34min) found **12
+  screens affected total, not just EP203000**: `AP201000` (Vendor Classes), `AP303000` (Vendors),
+  `AP305000` (Batch Payments), `AR201000` (Customer Classes), `CS101500` (Companies), `DS1C3000`
+  (Manage Signature), `EP203000` (Employees), `EP301020` (Expense Receipt), `IN202000`
+  (Non-Stock Items), `IN202500` (Stock Items), `PM301000` (Projects), `SM204570` (Source Code) —
+  spanning 8 modules, which argues against a single tenant-customization cause and for a generic
+  metadata-builder flaw. The fix needed no update for this: `_ui_error` matches on error TEXT, not
+  a screen_id list, so all 12 (and any future screen that hits this) are already covered.
+  **Root-cause hypothesis, tested against 11 of the 12** (pulled each screen's classic-SOAP schema
+  via `screen_get_schema` — a different, unaffected metadata source — and checked whether any
+  friendly field name repeats across more than one container): `/structure`'s serializer appears
+  to build ONE Dictionary keyed by friendly field name across the WHOLE screen instead of scoping
+  it per-container, so any screen where two containers happen to reuse the same friendly name for
+  different underlying fields throws this exact `Dictionary.Add()` duplicate-key exception.
+  **9/11 have ≥1 such cross-container collision; 2/11 (DS1C3000, SM204570) show none** — a real
+  gap, not proof against the hypothesis (their schemas are tiny/all-distinct, or `/structure`'s
+  dictionary may draw on hidden/system fields the classic-SOAP schema call doesn't expose). Of the
+  9, 4 reproduce the identical EP203000 shape: a primary-key field's friendly name collides with
+  the screen's own "Change ID" dialog (`SpecifyNewID` container → `ChangeIDDialog.CD`) — `VendorID`
+  on AP303000, `InventoryID` on IN202000/IN202500, `ProjectID` on PM301000 — so any screen with a
+  Change-ID action AND a key field whose label matches the dialog's own label is a structural hit.
+  The remaining 5 collide on unrelated shared labels (`Description`/`Active`/`NoteText`/`Format`/
+  `Status` etc.) repeated across contact-card, address, or notification-mapping containers. Treat
+  this as "explains 9/11, unresolved for 2/11" — not a proven mechanism.
 
 ---
 
