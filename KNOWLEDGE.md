@@ -217,6 +217,20 @@ your first.
   raw ID and its own code with an identical, generic "cannot be found in the system" fault on
   BOTH planes) — there the message stays generic because there genuinely is nothing more to
   surface that way.
+- **`/structure` can itself return a bare HTTP 500 from a genuine Acumatica server bug, not a
+  caller/grp-mcp issue** — proven live on EP203000 (Employees): the endpoint's own metadata-builder
+  throws an unhandled .NET Dictionary duplicate-key exception (`"An item with the same key has
+  already been added."`, likely two fields/views colliding under an internal key) and returns
+  `{"title": "...", "status": 500}` with no further detail. `ui_get_structure`/`ui_screen_action`/
+  `screen_capabilities` cannot work on such a screen — there is nothing to retry or fix client-side.
+  `_ui_error` detects this specific message and labels it a SERVER-SIDE bug rather
+  than leaking a bare ".NET exception text" as if the caller did something wrong; `screen_get_schema`
+  (classic SOAP, a different metadata source, unaffected by this bug) is the proven-working
+  fallback — verified live to return EP203000's full schema. `screen_capabilities` degrades
+  gracefully on this specific error (returns SOAP-only recommendations + `modern_plane_unavailable`)
+  instead of propagating the exception, since its whole job is answering "which plane do I use" —
+  crashing there is exactly backwards. `diagnose_save_error` is unaffected either way (it never
+  calls `/structure`, discovering everything from the classic page's own HTML).
 
 ---
 
@@ -567,6 +581,7 @@ real record, DB state confirmed unchanged after every case):
 | GL202500 | General Ledger | headerless list (grid = primary view) | `record_key={}`; RowChanges can't bind to a primary grid |
 | AP301000 | Accounts Payable | detail grid under header | read-only-cell no-op (`AccountID` locked on an existing line) |
 | AR301000 | Accounts Receivable | detail grid under header | clean pass — column guard + real range-validation error, no new fix needed |
+| CA202000 | Cash Management | master-detail SETUP screen (not a transaction doc) | a grid can have NO classic equivalent at all; escalate to modern-plane writes (below) |
 
 AR301000 is the first of five where nothing broke: the general mechanisms (column guard, error
 extraction, honest-uncertainty labeling) held with zero code changes, recovering a genuine
@@ -574,6 +589,30 @@ field-range error (*"The value must be less than or equal to 100"* on `DiscPct`)
 fixes above are screen-specific code (`if screen_id == ...` doesn't exist anywhere in `aspx.py`) —
 each screen exposed a different GENERAL failure class, fixed once at the mechanism level, not
 patched per screen.
+
+**When `diagnose_save_error` can't reach the grid at all — escalate to the modern plane directly.**
+Proven live on CA202000: the `ETDetails` grid (Entry Types tab) has **no classic ASPX markup** —
+it's a newer grid the classic page was never given, so `diagnose_save_error` correctly refuses
+with `"no control bound to view 'ETDetails'"` rather than lying about it. That refusal is the
+END of what the classic-only tool can do, but NOT the end of what's diagnosable — the modern
+plane's own write tools should be tried directly as the next step, and they can succeed even when
+`diagnose_save_error` can't:
+- `ui_read_grid` / `ui_update_grid_row` hit the SAME wall for this specific grid (0 rows, "no row
+  matches key") — a plain read/update genuinely can't see this grid's data through either plane
+  without some activation step neither's simple call path triggers.
+- `ui_insert_grid_row`, however, **worked** and returned a real, specific, useful error:
+  `"Another process has added the 'CashAccountETDetail' record. Your changes will be lost."` —
+  Acumatica correctly caught the attempted duplicate-key insert. Insert doesn't need to FIND an
+  existing row first (update/read do), so it can reach real server-side validation that update
+  and read cannot on a grid whose rows aren't otherwise visible.
+
+**Escalation order for a failed grid save with only a generic error**: (1) `diagnose_save_error`
+first — usually the richest per-field/per-row detail when the classic plane can reach the grid;
+(2) if it refuses because the grid has no classic dataMember, try `ui_insert_grid_row` /
+`ui_update_grid_row` directly on the modern plane — don't stop at a `ui_read_grid` 0-row result,
+since insert in particular can still reach validation a read/update can't. Verify with
+`run_dac_odata` either way; revert any accidental real persist immediately (this was tested live,
+reverted, and re-verified — see the ASPX protocol memory for the exact repro/revert).
 
 ---
 

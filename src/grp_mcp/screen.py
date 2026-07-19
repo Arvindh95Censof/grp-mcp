@@ -728,6 +728,25 @@ class ScreenClient:
             if j.get("type") == "SetupNotEntered":
                 return ("PREREQUISITE NOT MET — this screen's module is not configured "
                         "yet (SetupNotEntered). Configure its Preferences/Setup form first.")
+            title_detail = f"{j.get('title') or ''} {j.get('detail') or ''}"
+            if failed and "same key has already been added" in title_detail.lower():
+                # A genuine ACUMATICA SERVER BUG, not a caller mistake or a grp-mcp parsing
+                # issue — proven live on EP203000: /structure's own metadata-builder throws
+                # an unhandled .NET Dictionary duplicate-key exception (two fields/views
+                # collide under whatever key it serializes by) and returns a bare HTTP 500
+                # with no further detail. There is nothing to retry or fix client-side; the
+                # modern-plane schema is simply unavailable for this screen. screen_get_schema
+                # (classic SOAP) is a DIFFERENT metadata source unaffected by this bug and
+                # returns the full schema (verified live on EP203000) — point callers there
+                # instead of a bare, unhelpful ".NET exception leaked through" message.
+                return ("SERVER-SIDE BUG in Acumatica's /structure endpoint for this screen "
+                        "(not a grp-mcp or caller issue) — its own metadata-builder throws "
+                        "\"An item with the same key has already been added\" (an unhandled "
+                        "duplicate-key exception, likely two fields/views colliding under an "
+                        "internal key) and returns a bare HTTP 500. ui_get_structure/"
+                        "ui_screen_action cannot work on this screen. Use screen_get_schema "
+                        "(classic SOAP) instead for metadata discovery — a different endpoint, "
+                        "unaffected by this bug, verified to return this screen's full schema.")
             msgs = j.get("messages") or []
             # on a 200, only explicit error-type messages count; on a failure, surface all.
             picked = [m["message"] for m in msgs if m.get("message") and (

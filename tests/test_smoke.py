@@ -184,6 +184,25 @@ def test_ui_error_500_title_detail():
     assert ScreenClient._ui_error(_Resp(500, {"title": "x", "detail": "y"})) == "Error: y"
 
 
+def test_ui_error_structure_duplicate_key_server_bug():
+    # Proven live on EP203000: Acumatica's OWN /structure metadata-builder throws
+    # an unhandled .NET Dictionary duplicate-key exception and returns a bare 500
+    # with no further detail. Must be labeled as a SERVER-side bug (not a caller
+    # mistake or a grp-mcp parsing issue) and point at the proven-working fallback.
+    r = _Resp(500, {"title": "An item with the same key has already been added.",
+                    "status": 500, "traceId": "00-abc"})
+    msg = ScreenClient._ui_error(r)
+    assert "SERVER-SIDE BUG" in msg
+    assert "screen_get_schema" in msg
+
+
+def test_ui_error_duplicate_key_message_only_matches_when_failed():
+    # The same text on a 200 (not that this happens in practice) must not
+    # falsely trip the server-bug branch — only >=400 responses are failures.
+    r = _Resp(200, {"title": "An item with the same key has already been added."})
+    assert ScreenClient._ui_error(r) is None
+
+
 def test_ui_error_login_redirect_200_is_auth_error():
     # an unauthenticated/expired modern-plane session answers 200 with a Login
     # redirect body — must surface as a clear auth error, not silent None.
@@ -3609,3 +3628,56 @@ def test_ui_screen_action_known_field_has_no_unverifiable_fields(cfg, monkeypatc
     assert out["ok"] is True
     assert "unverifiable_fields" not in out
     assert ("Employments", "BasicPay", 1000) in client.set_calls
+
+
+# ---- screen_capabilities: graceful degrade on a /structure server bug ------
+#
+# Proven live on EP203000: Acumatica's own /structure metadata-builder throws an
+# unhandled .NET Dictionary duplicate-key exception (two fields/views collide
+# under an internal key) and returns a bare HTTP 500. screen_capabilities exists
+# to tell the caller which plane to use -- crashing here instead of answering
+# that question is exactly backwards, so it must degrade to classic-SOAP-only
+# guidance rather than propagate the exception.
+
+class _RaisingUIScreenClient:
+    """Stands in for ScreenClient (real network/login bypassed) — get_ui_structure
+    raises whatever error the test hands it, to exercise screen_capabilities'
+    error-handling branch without touching a real instance."""
+
+    def __init__(self, error: ScreenError):
+        self._error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get_ui_structure(self, refresh=False):
+        raise self._error
+
+
+def test_screen_capabilities_degrades_on_structure_server_bug(cfg, monkeypatch):
+    err = ScreenError(
+        "get_ui_structure EP203000: SERVER-SIDE BUG in Acumatica's /structure "
+        "endpoint for this screen (not a grp-mcp or caller issue) — its own "
+        "metadata-builder throws \"An item with the same key has already been "
+        "added\" ... Use screen_get_schema (classic SOAP) instead.")
+    _patch_screen_client(monkeypatch, _RaisingUIScreenClient(err))
+    out = asyncio.run(server.screen_capabilities("EP203000", instance="ro"))
+    assert out["screen_id"] == "EP203000"
+    assert out["grids"] == {} and out["actions"] == [] and out["selector_fields"] == []
+    assert "SERVER-SIDE BUG" in out["modern_plane_unavailable"]
+    tools = {r["tool"] for r in out["recommendations"]}
+    assert any("screen_get_schema" in t for t in tools)
+    assert any("diagnose_save_error" in t for t in tools)
+
+
+def test_screen_capabilities_reraises_other_screen_errors(cfg, monkeypatch):
+    # Only the specific "structure server bug" message is swallowed into a
+    # graceful degrade -- any OTHER ScreenError (auth failure, real caller
+    # mistake, etc.) must still propagate normally, not be silently hidden.
+    err = ScreenError("get_ui_structure X: NOT AUTHENTICATED — session expired.")
+    _patch_screen_client(monkeypatch, _RaisingUIScreenClient(err))
+    with pytest.raises(ScreenError, match="NOT AUTHENTICATED"):
+        asyncio.run(server.screen_capabilities("X", instance="ro"))

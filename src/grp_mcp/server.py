@@ -1591,7 +1591,32 @@ async def screen_capabilities(screen_id: str, instance: str | None = None) -> An
     """
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        struct = await s.get_ui_structure()
+        try:
+            struct = await s.get_ui_structure()
+        except ScreenError as e:
+            if "SERVER-SIDE BUG" not in str(e):
+                raise
+            # The modern plane's /structure is broken for THIS screen (proven live,
+            # EP203000: an Acumatica server bug, not a grp-mcp issue — see _ui_error).
+            # screen_capabilities exists to tell the caller which plane to use; crashing
+            # here instead of answering that question is exactly backwards. Degrade to
+            # classic-SOAP-only guidance rather than failing outright.
+            return {"screen_id": screen_id.upper(), "primary_dac": None,
+                    "grids": {}, "actions": [], "selector_fields": [],
+                    "modern_plane_unavailable": str(e),
+                    "recommendations": [
+                        {"operation": "any read/write on this screen",
+                         "plane": "SOAP", "tool": "screen_get_schema, screen_record, "
+                                  "screen_submit, screen_insert_rows",
+                         "why": "the modern plane's /structure endpoint has a SERVER-SIDE "
+                                "bug on this screen (see modern_plane_unavailable) — "
+                                "ui_* tools cannot discover or drive it. Classic SOAP is "
+                                "unaffected; use screen_get_schema for field discovery."},
+                        {"operation": "recover the real error behind a failed grid save",
+                         "plane": "classic ASPX (diagnostic-only)", "tool": "diagnose_save_error",
+                         "why": "does not depend on /structure — works independently via "
+                                "the classic page's own HTML (verified live on EP203000)."},
+                    ]}
     grids = struct.get("grids") or {}
     actions = [a["name"] for a in struct.get("actions") or []]
     selectors = sorted({f["field"] for v in (struct.get("views") or {}).values()
