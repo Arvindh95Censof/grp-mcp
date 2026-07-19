@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 
 from grp_mcp.aspx import (AspxDiagnostic, _grid_errors, _parse_control_blocks,
-                          _parse_hidden_inputs, _xml_attr_escape)
+                          _parse_hidden_inputs, _row0_readonly_fields,
+                          _xml_attr_escape)
 
 
 def _diag_with_html(html: str) -> AspxDiagnostic:
@@ -271,6 +272,75 @@ def test_replay_grid_save_no_note_when_error_present():
         "GLTranModuleBatNbr", {"CuryCreditAmt": 50}))
     assert result["alert"] == "Boom"
     assert "note" not in result
+
+
+# ---- replay_grid_save: unconfirmed "clean" no-op (GL301000, live re-probe) --
+#
+# 2026-07-19: re-verifying with a fresh session found the earlier "GL301000
+# Save persists cleanly" result did NOT reproduce — 5/5 repeat attempts of the
+# IDENTICAL request shape left the graph un-dirtied with every target field
+# echoed ReadOnly="False" (so read-only is A cause, proven on AP301000, but
+# NOT the only one — the full mechanism isn't understood). The tool must not
+# claim confirmed success on isDirty=false + no error; it's genuinely
+# ambiguous and must say so, surfacing a readonly hit as a lead when present.
+
+def test_row0_readonly_fields_detects_locked_cell():
+    body = (
+        '0|<ctl00_phG_tab_t0_grid><![CDATA[<ctl00_phG_tab_t0_grid Props="{}">'
+        '<Rows Level="0"><Row i="0"><Cells>'
+        '<Cell Value="0" Text="control@RowFileEmpty" />'
+        '<Cell Value="1" Key="LineNbr" ReadOnly="False" />'
+        '<Cell Value="999999999" Key="AccountID" ReadOnly="True" />'
+        '<Cell Value="100.00" Key="CuryDebitAmt" ReadOnly="False" />'
+        '</Cells></Row></Rows>]]></ctl00_phG_tab_t0_grid>')
+    ro = _row0_readonly_fields(
+        body, "ctl00_phG_tab_t0_grid", ["LineNbr", "AccountID", "CuryDebitAmt"])
+    assert ro == ["AccountID"]
+
+
+def test_replay_grid_save_ambiguous_noop_names_readonly_target():
+    # AP301000 shape: AccountID IS read-only on this row -> confirmed cause.
+    body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{}"/>]]></ctl00_phDS_ds>'
+        '<ctl00_phG_tab_t0_grid><![CDATA[<ctl00_phG_tab_t0_grid Props="{}">'
+        '<Rows Level="0"><Row i="0"><Cells>'
+        '<Cell Value="0" Text="x" />'
+        '<Cell Value="1" Key="LineNbr" ReadOnly="False" />'
+        '<Cell Value="999999999" Key="AccountID" ReadOnly="True" />'
+        '</Cells></Row></Rows>]]></ctl00_phG_tab_t0_grid>')
+    d = _diag_stub(_GL301000_GRID_JS, body,
+                   refresh_body=(
+                       '0|<ctl00_phG_tab_t0_grid><![CDATA[<ctl00_phG_tab_t0_grid '
+                       'Props="{&quot;levels&quot;:[{&quot;columns&quot;:['
+                       '{&quot;dataField&quot;:&quot;LineNbr&quot;},'
+                       '{&quot;dataField&quot;:&quot;AccountID&quot;}]}]}"/>'
+                       ']]></ctl00_phG_tab_t0_grid>'))
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"AccountID": 999999999}, row_key={"LineNbr": 1}))
+    assert result["possibly_saved"] is True  # the honest label, not a lie
+    assert "UNCONFIRMED" in result["note"]
+    assert "AccountID" in result["note"]
+    assert "ARE read-only" in result["note"]
+
+
+def test_replay_grid_save_ambiguous_noop_no_readonly_explanation():
+    # No column metadata available (Refresh failed) -> can't check readonly;
+    # note must still flag the ambiguity, without fabricating a cause.
+    body = '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{}"/>]]></ctl00_phDS_ds>'
+    d = _diag_with_html(_GL301000_GRID_JS)
+
+    from grp_mcp.screen import ScreenError
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        if cbparam.startswith("Refresh|"):
+            raise ScreenError("refresh broke")
+        return body
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50}, row_key={"LineNbr": 1}))
+    assert "UNCONFIRMED" in result["note"]
+    assert "No target field was read-only" in result["note"]
 
 
 def test_replay_grid_save_skips_validation_when_refresh_fails():

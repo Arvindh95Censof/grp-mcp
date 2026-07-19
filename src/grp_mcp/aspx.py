@@ -91,6 +91,34 @@ def _parse_control_blocks(body: str) -> dict[str, dict]:
     return out
 
 
+def _row0_readonly_fields(body: str, grid_ctl: str, columns: list[str]) -> list[str]:
+    """Which of `columns` are ReadOnly="True" on row 0's OWN echo in a Save
+    response — a REAL, confirmed cause of a silent no-op (an existing line's
+    field can be locked from direct grid edit; the server drops such an edit
+    instead of erroring). Best-effort, NOT exhaustive: many no-ops have no
+    readonly field at all (proven live, GL301000 — CuryDebitAmt/CuryCreditAmt/
+    TranDesc all echoed ReadOnly="False" yet the edit still didn't apply), so
+    an empty result here does NOT mean the change is safe to trust.
+
+    Cell order has 1 leading framework cell (file/note indicator) before the
+    dataField-mapped cells — align from the END, not the start, since the
+    leading offset is fixed but its exact count isn't guaranteed stable."""
+    m = re.search(rf'<{re.escape(grid_ctl)}><!\[CDATA\[(.*?)\]\]></{re.escape(grid_ctl)}>',
+                  body, re.S)
+    if not m:
+        return []
+    g = unescape(m.group(1))
+    rm = re.search(r'<Row i="0"[^>]*>(.*?)</Row>', g, re.S)
+    if not rm:
+        return []
+    cells = re.findall(r'<Cell ([^/>]*)/>', rm.group(1))
+    if len(cells) < len(columns):
+        return []
+    aligned = cells[len(cells) - len(columns):]
+    return [col for col, attrs in zip(columns, aligned)
+            if 'ReadOnly="True"' in attrs]
+
+
 def _grid_errors(body: str) -> dict[str, Any]:
     """Per-grid error detail from a callback response: <Rows ErrorText=…>,
     <Row Error=…>, <Cell … Error=…>. Handles both raw and entity-escaped
@@ -400,4 +428,30 @@ class AspxDiagnostic:
                 "browser uses a per-cell commit flow this tool does not "
                 "emulate). The real error is not recoverable this way for "
                 "this screen shape.")
+        elif saved:
+            # possibly_saved=True (no alert, no errors, graph not dirty) is
+            # GENUINELY AMBIGUOUS, not a confirmed success — proven live on
+            # GL301000: the IDENTICAL request shape that once persisted a
+            # change did NOT persist on repeat attempts in a fresh session (5
+            # for 5), with every target field echoed ReadOnly="False" — so a
+            # readonly cell is not the only cause of a silent no-op here; the
+            # mechanism is not fully understood. Flag readonly target fields
+            # when present (a REAL, confirmed cause — AP301000: an existing
+            # line's Account was locked from grid edit) as a lead, but never
+            # claim confirmed success on this signal alone.
+            ro = _row0_readonly_fields(body, grid_ctl, columns) if columns else []
+            ro_targets = [f for f in list(cells) if f in ro]
+            out["note"] = (
+                "possibly_saved is UNCONFIRMED, not a guarantee — no error was "
+                "returned but the graph was also never marked dirty, which is "
+                "AT LEAST AS LIKELY to mean the change never applied at all as "
+                "it is to mean a clean silent success (reproduced live: an "
+                "identical request that once persisted failed to persist on "
+                "repeat, with no read-only or other visible cause). "
+                + (f"Target field(s) {ro_targets} ARE read-only on this row — "
+                   f"a confirmed cause of a silent no-op." if ro_targets else
+                   "No target field was read-only here, so that's not the "
+                   "explanation this time.")
+                + " ALWAYS verify the real database state via run_dac_odata "
+                "before trusting this result either way.")
         return out

@@ -2819,12 +2819,19 @@ async def diagnose_save_error(
     validation message; the raw text is included but there is no structured
     detail to extract.
 
-    CAVEATS: requires allow_write — this POSTS a real Save, so if the replayed
-    change is actually VALID it PERSISTS (`possibly_saved: true` flags that);
-    only replay changes that already failed. Only works for screens that still
-    have a classic ASPX page (custom-module screens like PY/CS usually do;
-    `alert: null` + empty errors on a failure you can reproduce elsewhere means
-    the detail genuinely isn't on this plane either).
+    `possibly_saved: true` is NOT a confirmation — it means no alert/errors
+    came back, which can mean a genuine clean persist OR a silent no-op (e.g.
+    the target field is read-only for this row and the server just drops the
+    edit). A `note` explains what's known (a read-only field is named when
+    detected) and always says to verify via run_dac_odata either way.
+
+    CAVEATS: requires allow_write — this POSTS a real Save, so a replayed
+    change that IS actually valid can persist; only replay changes that
+    already failed, and verify the real result afterward regardless of what
+    this returns. Only works for screens that still have a classic ASPX page
+    (custom-module screens like PY/CS usually do; `alert: null` + empty
+    errors on a failure you can reproduce elsewhere means the detail
+    genuinely isn't on this plane either).
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)

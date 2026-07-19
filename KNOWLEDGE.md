@@ -532,6 +532,19 @@ design — the other planes remain the write path.
   change you replay may actually be VALID — it will PERSIST (Acumatica auto-clears the opposite
   amount column rather than erroring). `possibly_saved: true` is the tool's honest signal; verify
   via OData and revert (ui_update_grid_row restored it cleanly).
+- **`possibly_saved: true` (no alert, no grid errors, graph not marked dirty) is UNCONFIRMED, not
+  a guarantee — CORRECTED (2026-07-19) after this exact shape stopped reproducing.** The original
+  GL301000 persist above was real and OData-verified at the time, but the IDENTICAL request shape
+  failed to persist on repeat in a fresh session — 5/5 attempts, every target field echoed
+  `ReadOnly="False"` (so a locked cell is *a* confirmed cause — proven separately on AP301000,
+  where an existing line's `AccountID` was `ReadOnly="True"` and the edit silently dropped — but
+  not the *only* one; the full mechanism behind the flip is still not understood). The tool now
+  checks each target field's `ReadOnly` on the row's own Save-response echo (`_row0_readonly_fields`,
+  aligned from the END of the cell list — a fixed leading file/note-icon cell offsets the position)
+  and names it when found; otherwise it says plainly that no explanation was found. Either way the
+  result carries a `note` telling the caller to verify via `run_dac_odata` before trusting
+  `possibly_saved` in **either** direction — do not read a missing note as "definitely saved" or a
+  present one as "definitely not."
 - **Headerless LIST screens (the grid IS the primary view, e.g. GL202500)**: pass `record_key={}`
   — navigation is skipped (there is no header record to load; forcing it fails "record did not
   load"). LIMITATION (proven live, insert AND update): RowChanges against the PRIMARY grid never
