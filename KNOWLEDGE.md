@@ -557,6 +557,24 @@ design — the other planes remain the write path.
 - One-shot scripts against this plane must `await logout_session_cache()` on exit or each process
   orphans a "Max Web Services API Users" seat until idle-timeout.
 
+**Cross-module validation matrix** (each screen is a different module/codebehind, run against a
+real record, DB state confirmed unchanged after every case):
+
+| Screen | Module | Shape | What it confirmed / broke |
+|---|---|---|---|
+| PY309000 | Payroll (custom) | detail grid under header | baseline protocol; real cross-row error recovered |
+| GL301000 | General Ledger | detail grid under header | column-name mismatch (`CreditAmt`→`CuryCreditAmt`); server crash channel |
+| GL202500 | General Ledger | headerless list (grid = primary view) | `record_key={}`; RowChanges can't bind to a primary grid |
+| AP301000 | Accounts Payable | detail grid under header | read-only-cell no-op (`AccountID` locked on an existing line) |
+| AR301000 | Accounts Receivable | detail grid under header | clean pass — column guard + real range-validation error, no new fix needed |
+
+AR301000 is the first of five where nothing broke: the general mechanisms (column guard, error
+extraction, honest-uncertainty labeling) held with zero code changes, recovering a genuine
+field-range error (*"The value must be less than or equal to 100"* on `DiscPct`). None of the
+fixes above are screen-specific code (`if screen_id == ...` doesn't exist anywhere in `aspx.py`) —
+each screen exposed a different GENERAL failure class, fixed once at the mechanism level, not
+patched per screen.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
