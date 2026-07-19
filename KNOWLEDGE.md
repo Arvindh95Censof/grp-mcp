@@ -238,26 +238,23 @@ your first.
   screens affected total, not just EP203000**: `AP201000` (Vendor Classes), `AP303000` (Vendors),
   `AP305000` (Batch Payments), `AR201000` (Customer Classes), `CS101500` (Companies), `DS1C3000`
   (Manage Signature), `EP203000` (Employees), `EP301020` (Expense Receipt), `IN202000`
-  (Non-Stock Items), `IN202500` (Stock Items), `PM301000` (Projects), `SM204570` (Source Code) —
-  spanning 8 modules, which argues against a single tenant-customization cause and for a generic
-  metadata-builder flaw. The fix needed no update for this: `_ui_error` matches on error TEXT, not
-  a screen_id list, so all 12 (and any future screen that hits this) are already covered.
-  **Root-cause hypothesis, tested against 11 of the 12** (pulled each screen's classic-SOAP schema
-  via `screen_get_schema` — a different, unaffected metadata source — and checked whether any
-  friendly field name repeats across more than one container): `/structure`'s serializer appears
-  to build ONE Dictionary keyed by friendly field name across the WHOLE screen instead of scoping
-  it per-container, so any screen where two containers happen to reuse the same friendly name for
-  different underlying fields throws this exact `Dictionary.Add()` duplicate-key exception.
-  **9/11 have ≥1 such cross-container collision; 2/11 (DS1C3000, SM204570) show none** — a real
-  gap, not proof against the hypothesis (their schemas are tiny/all-distinct, or `/structure`'s
-  dictionary may draw on hidden/system fields the classic-SOAP schema call doesn't expose). Of the
-  9, 4 reproduce the identical EP203000 shape: a primary-key field's friendly name collides with
-  the screen's own "Change ID" dialog (`SpecifyNewID` container → `ChangeIDDialog.CD`) — `VendorID`
-  on AP303000, `InventoryID` on IN202000/IN202500, `ProjectID` on PM301000 — so any screen with a
-  Change-ID action AND a key field whose label matches the dialog's own label is a structural hit.
-  The remaining 5 collide on unrelated shared labels (`Description`/`Active`/`NoteText`/`Format`/
-  `Status` etc.) repeated across contact-card, address, or notification-mapping containers. Treat
-  this as "explains 9/11, unresolved for 2/11" — not a proven mechanism.
+  (Non-Stock Items), `IN202500` (Stock Items), `PM301000` (Projects), `SM204570` (Source Code).
+  The modern DATA protocol (POST `/ui/screen/<ID>` bootstrap) fails with the IDENTICAL error on
+  these screens — the crash lives in a shared screen-descriptor builder, so the whole modern
+  plane is dead there, not just `/structure`.
+  **Root cause — verified vs. open (2026-07-19):** the bug does NOT reproduce on stock
+  instances — local 2025R2 SalesDemo and 2026R1 return clean `/structure` for every affected
+  screen — so it is INSTANCE-SPECIFIC, triggered by csmdev's published customization stack, not
+  a stock Acumatica flaw. An earlier hypothesis (cross-container friendly-field-name collision in
+  the serializer) was REFUTED by controlled comparison: stock AP303000 carries 93 such label
+  collisions and works fine — label collisions are ubiquitous on large screens and harmless. The
+  affected list matches GRP customization footprints (the `GRP.EInvoicing` DLL extends exactly
+  these master/document screens; `DS1C3000` is a DigiSign custom screen whose same-CP siblings
+  `DS1C1000`/`DS1C2000` do NOT crash). The exact colliding element inside the customization
+  layer was not isolated — no server stack trace is externally reachable (Request Profiler off,
+  Error.aspx and every Accept-header variant return the same bare RFC7807 envelope). None of
+  this changes the fix: `_ui_error` matches on error TEXT, not a screen_id list, so any screen
+  that hits this — whatever the trigger — is covered.
 
 ---
 
