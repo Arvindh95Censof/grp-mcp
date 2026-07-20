@@ -90,19 +90,27 @@ instructions; honor it. Pure reads are exempt.
      had* — still overwrote **row 0** and left those lines untouched. So `set` does not locate a
      matching row even when an exact match exists; a preceding `set` never selects a row
      (despite reading like navigation), it edits the current one.
-  2. **`delete_row` appears to always delete ROW 0**, whatever you set before it — so a
-     `set`+`delete_row` pair meant to "select then delete" instead *edits row 0, then deletes
-     row 0*.
-  3. **Sets issued AFTER a `delete_row` appear to start a NEW row** rather than editing the
-     surviving row.
+  2. **`delete_row` deletes ROW 0**, whatever you set before it — so a `set`+`delete_row` pair
+     meant to "select then delete" instead *edits row 0, then deletes row 0*. **DIRECTLY
+     OBSERVED** on CS205000 `AttributeDetails` (a throwaway 3-row attribute: `delete_row` with no
+     preceding set removed `AAA`, leaving `BBB`+`CCC`).
+  3. ~~Sets issued after a `delete_row` start a NEW row.~~ **REFUTED — they EDIT THE SURVIVING
+     ROW.** Directly observed on CS205000: with rows `BBB`,`CCC`, a `delete_row` + `set
+     Description` left exactly ONE row — `CCC`, carrying the new description. No new row was
+     created. An earlier version of this section asserted the opposite, inferred from a PY309000
+     save rejection; that inference was **wrong**.
 
-  **Caveat on 2–3:** these are *inferences from save outcomes on PY309000 only*, not direct
-  observations, and not yet cross-screen tested. Each rejected save ruled out the alternative
-  (e.g. had `delete_row` removed the *targeted* row instead of row 0, the sum would have been
-  100 and the save would have COMMITTED — it didn't), which makes them well-evidenced but not
-  proven the way rule 1 is. Testing them directly needs a grid where a delete can persist and be
-  read back; on GL301000 a delete unbalances the batch, so the balance rule rejects it and the
-  outcome reveals nothing about which row was hit.
+  **Why the PY309000 inference misled, and what's still open.** Rules 2–3 were originally deduced
+  from *which saves got rejected* on PY309000's `EmployeeBankDetails`, never from watching a
+  delete land. With rule 3 corrected, that screen's attempt-2 rejection is no longer explained:
+  delete row 0 (CIMB) → edit the survivor to CIMB/100% should have summed to 100 and COMMITTED,
+  but it was rejected on the sum rule. The likeliest reading is the **known per-grid silent-no-op
+  delete** (`_verify_deletes` exists precisely because classic `DeleteRow` can return ok while the
+  row survives — reproduced on GL202500, fine on CA203000): if the delete no-op'd, the sets edited
+  CIMB and MBB stayed, giving 150 → rejected. **So `delete_row` is NOT uniform across grids** —
+  it deleted row 0 reliably on CS205000 but may silently no-op elsewhere. Always read back.
+  Lesson: a rule inferred from failure *outcomes* can fit several mechanisms; only a grid where
+  the operation can PERSIST and be read back actually distinguishes them.
 
   **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
   **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is
