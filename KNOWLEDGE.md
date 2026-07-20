@@ -81,15 +81,28 @@ instructions; honor it. Pure reads are exempt.
 - **No random-access to a non-first grid row via classic SOAP.** `{"row":N}` / `{"key":field}` all
   leave the cursor on row 1 on config master-detail grids. The **modern plane** has per-row GUID
   identity and is the way to edit an arbitrary existing row.
-- **Classic grid-write semantics, proven live on PY309000's `EmployeeBankDetails` (2026-07-20).**
-  Three rules, each confirmed by a real Save and a `run_dac_odata` read-back:
-  1. **`set` on a grid field MODIFIES THE CURRENT ROW — it never navigates/locates.** Setting
-     `Percent` to a value no row had changed row 0 in place rather than finding a match. So a
-     preceding `set` does NOT select a row (despite reading like navigation); it edits.
-  2. **`delete_row` always deletes ROW 0**, whatever you set before it. A `set`+`delete_row`
-     pair intended to "select then delete" instead *edits row 0, then deletes row 0*.
-  3. **Sets issued AFTER a `delete_row` start a NEW row**, they do not edit the surviving row.
-     (Observed: delete + set bank/acct/percent produced survivor + a new row → sum 150 → rejected.)
+- **Classic grid-write semantics (2026-07-20).** Three rules — note the differing evidence
+  strength, rule 1 is far better established than 2–3:
+  1. **`set` on a grid field MODIFIES THE CURRENT ROW — it never navigates/locates.**
+     **Directly observed, cross-module: PY309000 `EmployeeBankDetails` (custom Payroll) AND
+     GL301000 `GLTranModuleBatNbr` (stock GL).** On GL301000 the sharp version of the test was
+     run: setting `TransactionDescription` to `"Credit line"` — a value lines 2 and 4 *already
+     had* — still overwrote **row 0** and left those lines untouched. So `set` does not locate a
+     matching row even when an exact match exists; a preceding `set` never selects a row
+     (despite reading like navigation), it edits the current one.
+  2. **`delete_row` appears to always delete ROW 0**, whatever you set before it — so a
+     `set`+`delete_row` pair meant to "select then delete" instead *edits row 0, then deletes
+     row 0*.
+  3. **Sets issued AFTER a `delete_row` appear to start a NEW row** rather than editing the
+     surviving row.
+
+  **Caveat on 2–3:** these are *inferences from save outcomes on PY309000 only*, not direct
+  observations, and not yet cross-screen tested. Each rejected save ruled out the alternative
+  (e.g. had `delete_row` removed the *targeted* row instead of row 0, the sum would have been
+  100 and the save would have COMMITTED — it didn't), which makes them well-evidenced but not
+  proven the way rule 1 is. Testing them directly needs a grid where a delete can persist and be
+  read back; on GL301000 a delete unbalances the batch, so the balance rule rejects it and the
+  outcome reveals nothing about which row was hit.
 
   **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
   **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is
