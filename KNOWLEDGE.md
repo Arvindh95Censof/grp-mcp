@@ -135,8 +135,8 @@ instructions; honor it. Pure reads are exempt.
   this thread: each rule survived until it was tried on a *different* screen, and four separate
   claims were overturned that way (the selector hint's cause, rule 3, rule 3's generality, and
   finally the blanket "no row targeting" limit).
-- **`_verify_deletes` false-positived on every successful targeted delete (found + FIXED
-  2026-07-20, v0.64.11).** The read-back guard flagged a silent no-op whenever the verification
+- **`_verify_deletes` false-positived on every successful targeted delete (found + FIXED +
+  LIVE-VERIFIED 2026-07-20, v0.64.11).** The read-back guard flagged a silent no-op whenever the verification
   Export returned ANY rows — never checking that a returned row actually *carried* the searched
   value. On CS205000 the classic Export's filter does not discriminate at all: filtering
   `AttributeDetails.ValueID` for an **existing** value and for a **deleted** one both return the
@@ -144,19 +144,34 @@ instructions; honor it. Pure reads are exempt.
   back `ok:false` + "STILL EXISTS". The guard now (a) flags a real no-op only when a returned row
   carries the value, (b) reports `delete_verified: "unverified"` + a note when rows come back that
   do NOT carry it (the filter isn't discriminating, so absence proves nothing either) instead of
-  failing the call, and (c) passes only on a genuinely empty read-back. **Lesson: a verification
-  step is itself code that needs verifying — this one had been silently mis-reporting since
-  2026-07-15**, and it only surfaced because a delete that was *known* to have worked was
-  reported as failed.
+  failing the call, and (c) passes only on a genuinely empty read-back. Verified live after the
+  fix shipped: the identical command that returned `ok:false` + "STILL EXISTS" now returns
+  `ok:true` + `delete_verified:"unverified"` + the note, with `run_dac_odata` confirming the
+  targeted row really was gone and row 0 untouched. **Lesson: a verification step is itself code
+  that needs verifying — this one had been silently mis-reporting since 2026-07-15**, and it only
+  surfaced because a delete that was *known* to have worked was reported as failed. The design
+  point is the **third state**: pass/fail alone forced a screen where verification is *impossible*
+  to be reported as failure; "I can't tell, here's why, confirm with X" is a legitimate verifier
+  outcome.
 
-  **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
-  **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is
-  an identity that the container schema doesn't expose as a settable field (`EmployeeBankDetailID`
-  is absent from `BankDetails`), there is nothing to address it with at all. Fallback order:
-  modern plane (`ui_delete_grid_row`) → but that needs `/structure` column metadata, which some
-  grids omit (§11) → then the **browser UI is the only path**. Workaround when identity doesn't
-  matter: delete every row and re-insert, which is what finally worked here — but it **burns new
-  identity values**, so the restored row came back with a different surrogate key (14542 → 14547).
+  **OPEN DOUBT this fix raises about its own origin.** `_verify_deletes` was written 2026-07-15 on
+  the strength of a "silent no-op delete reproduced on GL202500". That observation was made with
+  the SAME non-empty-rows logic now proven to false-positive — so **it may itself have been a
+  false positive**, and the silent-no-op phenomenon may be rarer than assumed (or not real on
+  GL202500). Not re-tested: GL202500 is the Chart of Accounts and deleting an account there is not
+  a safe probe. This also weakens candidate (a) in the PY309000 undetermined-mechanism analysis
+  above, which cites that GL202500 precedent. Treat "classic DeleteRow silently no-ops" as
+  **plausible but no longer well-evidenced** until re-confirmed with a value-carrying read-back.
+
+  **Reliable patterns:** INSERT = `new_row` + sets. TARGETED UPDATE/DELETE = `set <KEY field>` to
+  select the row, then edit or `delete_row` (see the row-targeting bullet above — this works).
+  **You are only stuck on row 0 when the key is NOT exposed** as a settable field in that
+  container (`EmployeeBankDetailID` is absent from `BankDetails`), and then there is nothing to
+  address a row with at all. Fallback order there: modern plane (`ui_delete_grid_row`) → but that
+  needs `/structure` column metadata, which some grids omit (§11) → then the **browser UI is the
+  only path**. Last-resort workaround when the surrogate key isn't referenced by anything: delete
+  every row and re-insert — it **burns identity values every time** (EMP001's bank row went
+  14542 → 14547 → 14550 across two restores).
 - **Order destructive multi-step submits so a mis-fire VIOLATES a business rule.** The three failed
   revert attempts above each tripped `ValidateBankPercentSum` ("Percent should be 100 for sum of
   all banks") and were rejected atomically with the data verified untouched between tries. That was
