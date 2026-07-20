@@ -181,6 +181,16 @@ instructions; honor it. Pure reads are exempt.
   only path**. Last-resort workaround when the surrogate key isn't referenced by anything: delete
   every row and re-insert — it **burns identity values every time** (EMP001's bank row went
   14542 → 14547 → 14550 across two restores).
+- **A delete of a REFERENCED row is refused SILENTLY — `ok:true`, no error, row survives.** This
+  is the real "silent no-op delete" (re-confirmed 2026-07-20, see the `_verify_deletes` entry
+  above): Acumatica blocks the delete because something else points at the row, but the classic
+  Submit reports success rather than faulting. Per the KB, *"an account that has transactions
+  posted cannot be deleted"* — deactivate instead (clear **Active**). Expect the same shape
+  wherever a row is referenced (a posted GL account, a bank row used by payroll, …). A fresh,
+  unreferenced row on the SAME grid deletes cleanly — proven by creating and deleting a
+  zero-transaction account on GL202500 — so a failed delete says the row is referenced, NOT that
+  the grid can't be deleted from. **Always read back with `run_dac_odata`; `ok:true` proves
+  nothing here.**
 - **Order destructive multi-step submits so a mis-fire VIOLATES a business rule.** The three failed
   revert attempts above each tripped `ValidateBankPercentSum` ("Percent should be 100 for sum of
   all banks") and were rejected atomically with the data verified untouched between tries. That was
