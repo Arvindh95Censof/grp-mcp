@@ -19,7 +19,7 @@ Picking the wrong one is the single biggest time-sink. When unsure, call **`guid
 |-------|--------------|----------|-------------|
 | **Contract REST** | `create_or_update_entity`, `load_from_excel`, `get_entity`, `invoke_action` | Standalone entities exposed on the web-service endpoint; bulk CRUD | Context/master-detail screens the endpoint can't model; many import paths crash |
 | **DAC OData** | `run_dac_odata`, `get_dac_metadata`, `count_entity` | Reading any table/DAC (incl. config singletons) + mandatory-field metadata | Read-only; needs the OData v4 role or returns 403 |
-| **Classic screen SOAP** | `screen_submit`, `screen_get`, `screen_record`, `screen_insert_rows`, recipes | Context/wizard/master-detail screens; "as-a-user" command replay | No random-access to a non-first grid row; some action tags are silently no-ops |
+| **Classic screen SOAP** | `screen_submit`, `screen_get`, `screen_record`, `screen_insert_rows`, recipes | Context/wizard/master-detail screens; "as-a-user" command replay | No random-access to a non-first grid row (`set` edits the current row, `delete_row` always hits row 0 — §3); some action tags are silently no-ops |
 | **Modern UI-screen** | `ui_screen_action`, `ui_set_field`, `ui_read_grid`, `ui_update_grid_row`, `ui_get_structure` | Actions the classic plane can't reach; grid-row identity; enum allowed-values; structured errors | Some codebehind-only toolbar actions (Copy/Paste, Insert-From) are shimmed to no-ops |
 | **Classic ASPX callbacks** *(diagnostic-only)* | `diagnose_save_error` | Recovering the REAL validation message behind a failed grid save — both API planes above truncate it to "record raised at least one error" | Screens with no classic `.aspx` page; it replays a real Save (§11) |
 
@@ -81,6 +81,30 @@ instructions; honor it. Pure reads are exempt.
 - **No random-access to a non-first grid row via classic SOAP.** `{"row":N}` / `{"key":field}` all
   leave the cursor on row 1 on config master-detail grids. The **modern plane** has per-row GUID
   identity and is the way to edit an arbitrary existing row.
+- **Classic grid-write semantics, proven live on PY309000's `EmployeeBankDetails` (2026-07-20).**
+  Three rules, each confirmed by a real Save and a `run_dac_odata` read-back:
+  1. **`set` on a grid field MODIFIES THE CURRENT ROW — it never navigates/locates.** Setting
+     `Percent` to a value no row had changed row 0 in place rather than finding a match. So a
+     preceding `set` does NOT select a row (despite reading like navigation); it edits.
+  2. **`delete_row` always deletes ROW 0**, whatever you set before it. A `set`+`delete_row`
+     pair intended to "select then delete" instead *edits row 0, then deletes row 0*.
+  3. **Sets issued AFTER a `delete_row` start a NEW row**, they do not edit the surviving row.
+     (Observed: delete + set bank/acct/percent produced survivor + a new row → sum 150 → rejected.)
+
+  **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
+  **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is
+  an identity that the container schema doesn't expose as a settable field (`EmployeeBankDetailID`
+  is absent from `BankDetails`), there is nothing to address it with at all. Fallback order:
+  modern plane (`ui_delete_grid_row`) → but that needs `/structure` column metadata, which some
+  grids omit (§11) → then the **browser UI is the only path**. Workaround when identity doesn't
+  matter: delete every row and re-insert, which is what finally worked here — but it **burns new
+  identity values**, so the restored row came back with a different surrogate key (14542 → 14547).
+- **Order destructive multi-step submits so a mis-fire VIOLATES a business rule.** The three failed
+  revert attempts above each tripped `ValidateBankPercentSum` ("Percent should be 100 for sum of
+  all banks") and were rejected atomically with the data verified untouched between tries. That was
+  by design: the commands were sequenced so any wrong row-targeting would leave the sum ≠ 100 and
+  fail, rather than silently persisting corrupted data. On a grid with a cross-row invariant, let
+  that invariant be your safety net — and always read back, since `ok:true` alone proves nothing.
 - **Some action tags are exposed in `GetSchema` but no-op server-side** (the real implementation
   moved to the modern UI plane). "Clean success, zero effect, confirmed empty across multiple read
   channels" after exhausting client-side hypotheses → capture the real browser's Network tab; if it
