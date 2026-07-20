@@ -181,6 +181,76 @@ def _row_matches(row: dict[str, str], key: dict[str, Any]) -> bool:
 
 # RowChanges section per operation. `Modified`/`Inserted`/`Deleted` are the
 # classic grid's own section names; a Save envelope may carry several siblings.
+# ---- classic PXTreeView (tree-node select + node-scoped actions) -------------
+#
+# REFUTES the long-standing "a tree node can only be picked by clicking it in the
+# browser" verdict (build_company_tree's docstring still calls it "exhaustively
+# proven" impossible via the API — that was true of the SOAP/modern planes only).
+# Reverse-engineered + proven live on EP204061 (Company Tree), 2026-07-20:
+#
+#   1. selection lives in the tree control's own hidden _state field:
+#        <PXTreeView SelectedNodeID="<domId>" SelectedValue="<key>" ParentValue="<parentKey>"/>
+#   2. fire the DATASOURCE reload; the form + child grids re-render for that node:
+#        __CALLBACKID=ctl00$phDS$ds
+#        __CALLBACKPARAM=ReloadPage|<ctl00_phDS_ds LoadedLevel="-1"><![CDATA[]]></ctl00_phDS_ds>
+#   3. a node-scoped ACTION (Up/Down/AddWorkGroup/DeleteWorkGroup/…) is then just
+#      another ds command on the still-selected node, followed by Save.
+#
+# MEASURED addressing rules (all four combinations tested live):
+#   SelectedNodeID + SelectedValue            -> WORKS
+#   SelectedNodeID + SelectedValue + Parent   -> WORKS
+#   SelectedValue alone / wrong SelectedNodeID-> FAILS (form never loads the node)
+# So **SelectedNodeID is load-bearing and must be exact**; ParentValue is optional.
+# A COLLAPSED (lazy) child selects fine — no expansion needed — but it is never
+# present in the rendered HTML, so the dom id cannot be scraped and MUST be derived.
+_TREE_STATE_RE = re.compile(r'name="(ctl00_[A-Za-z0-9_]*?tree)_state"')
+
+# The tree path uses the BARE datasource envelope that was actually proven live
+# here — NOT _DS_ENVELOPE (which nests an extra OwnerData block for the grid
+# path). They are not known to be interchangeable, so don't "simplify" this into
+# _DS_ENVELOPE without re-proving tree select + action against a live screen.
+_TREE_ENVELOPE = '{cmd}|<ctl00_phDS_ds LoadedLevel="-1"><![CDATA[]]></ctl00_phDS_ds>'
+
+
+def _tree_node_dom_id(target_key: Any, rows: list[dict[str, Any]], tree_ctl: str,
+                      key_field: str = "WorkGroupID",
+                      parent_field: str = "ParentWGID",
+                      sort_field: str = "SortOrder") -> str | None:
+    """Derive a PXTreeView node's DOM id from the tree's ROWS (not the page).
+
+    The id encodes the node's position: `<tree>_node_0` is the root, then one
+    0-based SIBLING INDEX per level down — `_node_0_1_0` is "root's 2nd child's
+    1st child". Siblings are ordered by `sort_field` (EPCompanyTree.SortOrder),
+    tie-broken by key so the mapping is deterministic.
+
+    Deriving beats scraping because the rendered page only ever contains the
+    EXPANDED nodes — a collapsed child has no markup at all, yet selects
+    perfectly once addressed. Returns None if the key isn't in `rows`.
+    """
+    by_parent: dict[Any, list[dict]] = {}
+    for r in rows:
+        p = r.get(parent_field) or 0
+        by_parent.setdefault(int(p), []).append(r)
+    for kids in by_parent.values():
+        kids.sort(key=lambda r: (int(r.get(sort_field) or 0), int(r.get(key_field) or 0)))
+
+    path: list[int] = []
+
+    def walk(parent: int, acc: list[int]) -> bool:
+        for i, r in enumerate(by_parent.get(parent, [])):
+            k = int(r.get(key_field) or 0)
+            if k == int(target_key):
+                path.extend(acc + [i])
+                return True
+            if walk(k, acc + [i]):
+                return True
+        return False
+
+    if not walk(0, []):
+        return None
+    return f"{tree_ctl}_node_0" + "".join(f"_{i}" for i in path)
+
+
 _SECTION = {"insert": "Inserted", "update": "Modified", "delete": "Deleted"}
 
 # The "nothing was sent" tail a refusal carries so its shape matches a real
@@ -782,6 +852,99 @@ class AspxDiagnostic:
         v.setdefault("rows_before", len(rows_before))
         v.setdefault("rows_after", len(rows_after))
         return v
+
+    def find_tree_control(self) -> str:
+        """The page's PXTreeView control id, from its `<ctl>_state` hidden field
+        (e.g. `ctl00_phF_sp1_tree` on EP204061). Raises if the screen has no
+        classic tree — the caller should then use another plane."""
+        m = _TREE_STATE_RE.search(self._html)
+        if not m:
+            raise ScreenError(
+                "aspx: this page has no classic PXTreeView (no <ctl>_tree_state "
+                "hidden field) — it has no tree to address on this plane.")
+        return m.group(1)
+
+    async def select_tree_node(self, tree_ctl: str, dom_id: str, value: Any,
+                               parent_value: Any | None = None) -> dict[str, Any]:
+        """SELECT a tree node — the operation long believed to need a browser click.
+
+        Writes the selection into the tree's hidden `_state` and fires the
+        datasource reload, so the detail form/grids re-bind to that node. Returns
+        the datasource echo plus `selected_name` — the value the detail form now
+        shows, which is the PROOF the select landed (two different nodes give two
+        different names; that is how this was validated live).
+
+        `dom_id` MUST be exact — derive it with _tree_node_dom_id; a wrong or
+        missing one silently fails to select (measured). `parent_value` is
+        optional (works with or without it).
+        """
+        attrs = f'SelectedNodeID="{dom_id}" SelectedValue="{_xml_attr_escape(value)}"'
+        if parent_value is not None:
+            attrs += f' ParentValue="{_xml_attr_escape(parent_value)}"'
+        self._state[f"{tree_ctl}_state"] = quote(f"<PXTreeView {attrs}/>", safe="")
+        body = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd="ReloadPage"))
+        ds = _parse_control_blocks(body).get(_DS_BLOCK) or {}
+        # The detail form echoes the selected record's descriptor field. Read it
+        # from the RAW body: that Props JSON is entity-escaped while the tree
+        # markup beside it is literal — the same two-level escaping as the grids.
+        m = re.search(r'_form_ed[A-Za-z0-9_]*" Props="\{&quot;value&quot;:&quot;([^&]*)',
+                      body)
+        return {"selected_name": m.group(1) if m else None,
+                "alert": ds.get("alert"),
+                "graph_dirty": bool(ds.get("isDirty")),
+                "response_len": len(body),
+                "select_verified": bool(m),
+                "note": None if m else (
+                    "the detail form did not echo a record — the select did NOT "
+                    "land. Almost always a wrong SelectedNodeID (it must be the "
+                    "exact sibling-index path); re-derive it from the tree rows.")}
+
+    async def tree_node_action(self, action: str, save: bool = True) -> dict[str, Any]:
+        """Fire a NODE-SCOPED action (Up/Down/AddWorkGroup/DeleteWorkGroup/…) on
+        the node last selected by select_tree_node, then Save.
+
+        Proven live (EP204061): select ZZTREEA then `Up` flipped its SortOrder
+        against its sibling and the Save COMMITTED it (verified in EPCompanyTree).
+        The action goes to the datasource like any other command — the selection
+        rides in the tree `_state` this client already holds.
+
+        DESTRUCTIVE for actions that delete/restructure. `graph_dirty` after the
+        action means it staged something; the Save then commits. As everywhere on
+        this plane, confirm the real outcome with run_dac_odata.
+        """
+        out: dict[str, Any] = {"action": action}
+        body = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd=action))
+        ds = _parse_control_blocks(body).get(_DS_BLOCK) or {}
+        out["alert"] = ds.get("alert")
+        out["staged"] = bool(ds.get("isDirty"))
+        errs = _grid_errors(body)
+        out.update({k: v for k, v in errs.items() if v})
+        if not out["staged"]:
+            # STAGED NOTHING = the action did nothing. Saving now would return a
+            # clean "success" for a no-op, which is exactly the false positive
+            # this plane keeps producing — so report it and do NOT Save.
+            # MEASURED live on EP204061: `Up` stages (isDirty=1) and commits, but
+            # `DeleteWorkGroup`/`Delete` stage nothing and change no rows.
+            out["saved"] = False
+            out["note"] = (
+                "the action staged NOTHING (the graph never went dirty), so it was "
+                "a SILENT NO-OP and no Save was sent. Known causes: the action "
+                "needs a confirmation dialog this client does not answer (EP204061 "
+                "DeleteWorkGroup behaves this way), the action name is wrong for "
+                "this screen, or the server refused it silently. An action that "
+                "really fires reports staged:true — Up/Down do.")
+            return out
+        if out["alert"] or not save:
+            out["saved"] = False
+            return out
+        sbody = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd="Save"))
+        sds = _parse_control_blocks(sbody).get(_DS_BLOCK) or {}
+        out["save_alert"] = sds.get("alert")
+        out["graph_dirty_after_save"] = bool(sds.get("isDirty"))
+        out["saved"] = not sds.get("alert") and not sds.get("isDirty")
+        out["note"] = ("staged + saved without error — but this plane's 'clean' is "
+                       "not proof; confirm with run_dac_odata.")
+        return out
 
     async def replay_grid_batch(self, grid_view: str,
                                 operations: list[dict[str, Any]]) -> dict[str, Any]:

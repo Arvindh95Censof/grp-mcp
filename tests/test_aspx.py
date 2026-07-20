@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from grp_mcp.aspx import (AspxDiagnostic, _grid_column_slots, _grid_errors,
+                          _tree_node_dom_id,
                           _grid_rows, _parse_control_blocks,
                           _parse_hidden_inputs, _row_matches,
                           _row0_readonly_fields, _xml_attr_escape)
@@ -890,3 +891,108 @@ def test_batch_flags_guards_inert_when_rows_unreadable():
     assert "pre-flight was SKIPPED" in r["guard_note"]
     assert r["all_verified"] is False
     assert all(v["save_verified"] == "unverified" for v in r["verifications"])
+
+
+# ---- PXTreeView: node dom-id derivation + tree discovery ---------------------
+#
+# Live-captured shape (EP204061 / EPCompanyTree, 2026-07-20):
+#   16782 ZZTREEROOT parent 0     SortOrder 1  -> ctl00_phF_sp1_tree_node_0_0
+#   16783 ZZTREEA    parent 0     SortOrder 2  -> ctl00_phF_sp1_tree_node_0_1
+#   16784 ZZTREEB    parent 16783 SortOrder 1  -> ctl00_phF_sp1_tree_node_0_1_0
+# The dom id MUST be exact — a wrong one silently fails to select (measured), and
+# a COLLAPSED child never appears in the HTML, so it can only ever be derived.
+
+_TREE_CTL = "ctl00_phF_sp1_tree"
+_TREE_ROWS = [
+    {"WorkGroupID": 16782, "Description": "ZZTREEROOT", "ParentWGID": 0, "SortOrder": 1},
+    {"WorkGroupID": 16783, "Description": "ZZTREEA", "ParentWGID": 0, "SortOrder": 2},
+    {"WorkGroupID": 16784, "Description": "ZZTREEB", "ParentWGID": 16783, "SortOrder": 1},
+]
+
+
+def test_tree_dom_id_matches_live_capture():
+    f = lambda k: _tree_node_dom_id(k, _TREE_ROWS, _TREE_CTL)  # noqa: E731
+    assert f(16782) == "ctl00_phF_sp1_tree_node_0_0"
+    assert f(16783) == "ctl00_phF_sp1_tree_node_0_1"
+    assert f(16784) == "ctl00_phF_sp1_tree_node_0_1_0"   # collapsed child
+
+
+def test_tree_dom_id_follows_sort_order_not_key():
+    # THE live case: after firing `Up` on ZZTREEA its SortOrder became 1 and
+    # ZZTREEROOT's became 2 — so the dom ids SWAP even though the WGIDs didn't.
+    # Ordering by key instead of SortOrder would address the wrong node.
+    rows = [dict(r) for r in _TREE_ROWS]
+    rows[0]["SortOrder"], rows[1]["SortOrder"] = 2, 1
+    assert _tree_node_dom_id(16783, rows, _TREE_CTL) == "ctl00_phF_sp1_tree_node_0_0"
+    assert _tree_node_dom_id(16782, rows, _TREE_CTL) == "ctl00_phF_sp1_tree_node_0_1"
+    # the child rides with its reordered parent
+    assert _tree_node_dom_id(16784, rows, _TREE_CTL) == "ctl00_phF_sp1_tree_node_0_0_0"
+
+
+def test_tree_dom_id_unknown_key_is_none():
+    assert _tree_node_dom_id(99999, _TREE_ROWS, _TREE_CTL) is None
+
+
+def test_tree_dom_id_handles_deep_nesting():
+    rows = [
+        {"WorkGroupID": 1, "ParentWGID": 0, "SortOrder": 1},
+        {"WorkGroupID": 2, "ParentWGID": 1, "SortOrder": 1},
+        {"WorkGroupID": 3, "ParentWGID": 2, "SortOrder": 2},
+        {"WorkGroupID": 4, "ParentWGID": 2, "SortOrder": 1},
+    ]
+    assert _tree_node_dom_id(3, rows, _TREE_CTL) == "ctl00_phF_sp1_tree_node_0_0_0_1"
+    assert _tree_node_dom_id(4, rows, _TREE_CTL) == "ctl00_phF_sp1_tree_node_0_0_0_0"
+
+
+def test_find_tree_control_from_state_field():
+    d = _diag_with_html(
+        '<input type="hidden" name="ctl00_phF_sp1_tree_state" value="" />'
+        '<input type="hidden" name="ctl00_phF_sp1_form_state" value="" />')
+    assert d.find_tree_control() == "ctl00_phF_sp1_tree"
+
+
+def test_find_tree_control_raises_when_no_tree():
+    d = _diag_with_html('<input type="hidden" name="ctl00_phG_grid_state" value="" />')
+    with pytest.raises(Exception):
+        d.find_tree_control()
+
+
+def test_tree_action_reports_noop_instead_of_fake_success():
+    """A node action that stages NOTHING must NOT be reported as saved.
+
+    MEASURED live on EP204061: `Up` stages (isDirty=1) and commits, but
+    `DeleteWorkGroup` fires clean and stages nothing — the row survives. An
+    earlier cut of this code returned saved:true there, reinventing exactly the
+    false positive the rest of this plane's guards exist to kill.
+    """
+    clean = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+             '{&quot;isDirty&quot;:0}"/>]]></ctl00_phDS_ds>')
+    d = _diag_with_html("<html></html>")
+    calls = []
+
+    async def fake_callback(cbid, cbparam, **kw):
+        calls.append(cbparam)
+        return clean
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    r = asyncio.run(d.tree_node_action("DeleteWorkGroup"))
+    assert r["staged"] is False
+    assert r["saved"] is False
+    assert "SILENT NO-OP" in r["note"]
+    assert len(calls) == 1          # and crucially: no Save was sent
+
+
+def test_tree_action_saves_when_it_stages():
+    dirty = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+             '{&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+    clean = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+             '{&quot;isDirty&quot;:0}"/>]]></ctl00_phDS_ds>')
+    d = _diag_with_html("<html></html>")
+    bodies = iter([dirty, clean])
+
+    async def fake_callback(cbid, cbparam, **kw):
+        return next(bodies)
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    r = asyncio.run(d.tree_node_action("Up"))
+    assert r["staged"] is True and r["saved"] is True

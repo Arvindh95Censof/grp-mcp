@@ -3856,3 +3856,69 @@ def test_classic_grid_missing_routing():
                                 ScreenError("no control bound to view 'ETDetails'"))
     assert r["no_classic_grid"] is True and r["ok"] is False
     assert "ui_delete_grid_row" in r["recommend"]
+
+
+# ---- build_company_tree indent sequence (EP204060) ---------------------------
+#
+# The indent is off-by-one AND absolute: the Right presses issued after inserting
+# node N set node N+1's level, and the level resets each step. Measured live
+# 2026-07-20 with a 4-node probe (0/1/0/1 presses -> ROOT / ROOT / child-of-#2 /
+# ROOT). The old code fired Right `depth` times on the row it had just inserted,
+# which mis-nested every tree deeper than one level. Pin the command sequence.
+
+class _TreeBuildClient:
+    """Captures the command stream build_company_tree emits."""
+
+    def __init__(self):
+        self.ops: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def ui_bootstrap(self, views):
+        pass
+
+    async def ui_insert_grid_row(self, view, values, skip_validation=False):
+        self.ops.append(f"insert:{values['Description']}")
+
+    async def ui_command(self, cmd, answer=None):
+        self.ops.append(cmd)
+        return {"graphIsDirty": False}
+
+
+def test_build_company_tree_indent_is_offset_by_one_and_absolute(cfg, monkeypatch):
+    client = _TreeBuildClient()
+    monkeypatch.setattr(server, "ScreenClient", lambda inst, screen_id: client)
+
+    class _Dac:
+        async def run_dac(self, *a, **k):
+            return {"value": []}          # empty instance; skips + verifies vacuously
+
+    monkeypatch.setattr(server, "_client", lambda inst: _Dac())
+    asyncio.run(server.build_company_tree(
+        {"name": "R", "children": [{"name": "A", "children": ["C"]}, "B"]},
+        instance="rw"))
+
+    # depths are R=0, A=1, C=2, B=1 -> each step issues the NEXT node's depth
+    assert client.ops == [
+        "insert:R", "Right", "Save",                 # next (A) is depth 1
+        "insert:A", "Right", "Right", "Save",        # next (C) is depth 2
+        "insert:C", "Right", "Save",                 # next (B) is depth 1
+        "insert:B", "Save",                          # last -> none
+    ]
+
+
+def test_build_company_tree_flat_list_needs_no_indent(cfg, monkeypatch):
+    client = _TreeBuildClient()
+    monkeypatch.setattr(server, "ScreenClient", lambda inst, screen_id: client)
+
+    class _Dac:
+        async def run_dac(self, *a, **k):
+            return {"value": []}
+
+    monkeypatch.setattr(server, "_client", lambda inst: _Dac())
+    asyncio.run(server.build_company_tree(["X", "Y"], instance="rw"))
+    assert client.ops == ["insert:X", "Save", "insert:Y", "Save"]

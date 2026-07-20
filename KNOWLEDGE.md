@@ -1001,6 +1001,54 @@ Caveat carried in the tool: verifying an INSERT inside a batch that also deletes
 `save_verified:"unverified"`. As always this proves the GRID changed, not that the txn committed —
 `run_dac_odata` remains the authority.
 
+### 11c. Classic TREE nodes ARE addressable — "browser-click only" REFUTED (v0.65.0)
+
+`build_company_tree`'s docstring said EP204061 "can't be driven by the API — its parent link is set
+by clicking a tree node, and no field/path/command reproduces that (exhaustively proven)." That was
+true of the SOAP and modern planes. **It is false for the ASPX plane.** Reverse-engineered + proven
+live 2026-07-20:
+
+1. **Selection lives in the tree control's hidden `_state`** — not in any command:
+   `<PXTreeView SelectedNodeID="<domId>" SelectedValue="<key>" ParentValue="<parentKey>"/>`
+2. **Fire the datasource reload** and the detail form/grids re-bind to that node:
+   `__CALLBACKID=ctl00$phDS$ds`, `__CALLBACKPARAM=ReloadPage|<ctl00_phDS_ds LoadedLevel="-1"><![CDATA[]]></ctl00_phDS_ds>`
+3. A **node-scoped action** (Up/Down/AddWorkGroup/…) is then just another ds command + Save.
+
+**MEASURED addressing rules** (all combinations tested): `SelectedNodeID`+`SelectedValue` WORKS;
+`SelectedValue` alone or a WRONG `SelectedNodeID` FAILS silently. So **the dom id is load-bearing
+and must be exact**; `ParentValue` is optional. A **collapsed (lazy) child selects fine** — no
+expansion needed — but it has NO markup in the page, so its dom id can never be scraped.
+
+**The dom id must therefore be DERIVED, not scraped.** It encodes the node's sibling-index path
+(`_node_0_1_0` = "root's 2nd child's 1st child"), with siblings ordered by **`SortOrder`** — so it
+comes from the tree's own DAC (`EPCompanyTree`: WorkGroupID/ParentWGID/SortOrder), which is also the
+only complete view of the tree. `_tree_node_dom_id` does this; `aspx_tree_node_action` is the tool
+(select-only is safe and needs no gate; an action needs allow_write, allow_delete if it deletes).
+
+**Proof:** selecting two nodes loaded two different records (`selected_name` echo), and firing `Up`
+committed a real SortOrder swap to the DB. **Known limit:** `DeleteWorkGroup` fires but stages
+NOTHING (`staged:false`) — a silent no-op, almost certainly an unanswered confirmation dialog; the
+tool reports that honestly rather than claiming success, and Up/Down do stage. Deleting workgroups
+still needs the browser UI (and there, the toolbar Save must actually be clicked — a staged delete
+that is never saved looks done in the UI while the DB is untouched; Ctrl+S is more reliable than
+the icon).
+
+### 11d. `build_company_tree` mis-nested every tree deeper than one level — FIXED (v0.65.0)
+
+The EP204060 indent was fired as `Right` × **absolute depth** on the row just inserted. Both halves
+are wrong, and the real semantics are not guessable — measured with a 4-node probe
+(0/1/0/1 presses → ROOT / ROOT / child-of-#2 / ROOT):
+
+- **OFF BY ONE:** the presses issued after inserting node N take effect on node **N+1**, never on N.
+- **ABSOLUTE + RESETTING:** n presses set that next node's level to **n**; the level resets every
+  step (it does not accumulate, and it is not a delta). `Left` appeared to be ignored.
+
+So the count to issue in step N is simply **the next node's depth**. Before the fix a 3-level tree
+came back `verified:false` with children flattened to the wrong parents; after it, the same
+structure builds `verified:true` (3 levels + an outdent, parents confirmed against EPCompanyTree).
+The tool's own parent read-back is what caught this — a builder that verifies is worth more than one
+that assumes.
+
 ### 11b. No classic grid at all → routed to the modern plane (v0.64.15)
 
 Some grids render ONLY on the modern plane and emit no classic control config (observed: CA202000

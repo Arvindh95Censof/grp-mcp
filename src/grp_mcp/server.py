@@ -19,7 +19,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .acumatica import AcumaticaClient, AcumaticaError
-from .aspx import AspxDiagnostic
+from .aspx import AspxDiagnostic, _tree_node_dom_id
 from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
@@ -3111,6 +3111,110 @@ async def aspx_grid_batch(
 
 
 @mcp.tool()
+async def aspx_tree_node_action(
+    screen_id: str,
+    node_key: int,
+    action: str | None = None,
+    tree_dac: str = "EPCompanyTree",
+    key_field: str = "WorkGroupID",
+    parent_field: str = "ParentWGID",
+    sort_field: str = "SortOrder",
+    page_url: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """SELECT a classic TREE node by key — and optionally fire a node-scoped
+    action on it — over the ASPX plane. The operation long believed to require a
+    browser click.
+
+    PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen's rules
+    before firing any action; tree actions restructure/delete records.
+
+    WHY THIS EXISTS: a classic tree (PXTreeView, e.g. EP204061 Company Tree)
+    binds its detail form and its node-scoped actions to the SELECTED node, and
+    neither the SOAP nor the modern plane can make a selection — which is why
+    `build_company_tree`'s docstring calls driving EP204061 "exhaustively proven"
+    impossible. That verdict was true of THOSE planes only. Selection lives in
+    the tree control's hidden `_state`, and this plane can write it:
+    `<PXTreeView SelectedNodeID=… SelectedValue=…/>` + a datasource reload.
+    Proven live: selecting two different nodes loaded two different records, and
+    firing `Up` on a node committed a real SortOrder change to the database.
+
+    node_key: the node's KEY value (e.g. a WorkGroupID from EPCompanyTree).
+    action:   omit to SELECT ONLY (safe, changes nothing — use it to verify
+        addressing). Otherwise the node-scoped action to fire, then Save
+        (EP204061: Up | Down | AddWorkGroup | DeleteWorkGroup | MoveWorkGroup).
+    tree_dac / key_field / parent_field / sort_field: where the tree's STRUCTURE
+        is read from, to derive the node's DOM id. Defaults are the Company Tree.
+        The DOM id encodes the node's sibling-index path and must be EXACT — a
+        wrong one silently fails to select — so it is DERIVED from these rows,
+        not scraped (a collapsed child has no markup at all yet selects fine).
+
+    Requires allow_write once `action` is set; an action whose name contains
+    "Delete" additionally requires allow_delete. Select-only needs neither.
+
+    The result carries `selected_name` — the record the detail form loaded — which
+    is the PROOF the right node was addressed; check it before trusting an action.
+    As everywhere on this plane, confirm the real outcome with run_dac_odata.
+    """
+    if action:
+        if "delete" in action.lower():
+            _require_delete(instance)
+        else:
+            _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    url = page_url
+    if not url:
+        sm = await run_dac_odata("SiteMap", filter=f"ScreenID eq '{_oq(sid)}'",
+                                 select="ScreenID,Url", top=1, instance=instance)
+        smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+        raw = smv[0].get("Url") if smv else None
+        if not raw or ".aspx" not in raw:
+            return {"ok": False, "screen_id": sid,
+                    "error": f"no classic ASPX page found for {sid} in the site map "
+                             f"(Url={raw!r}) — this screen has no classic plane."}
+        url = inst.base_url.rstrip("/") + raw.lstrip("~")
+    # tree STRUCTURE (for the dom-id derivation) comes from the DAC, not the page
+    rows_resp = await run_dac_odata(
+        tree_dac, select=f"{key_field},{parent_field},{sort_field}",
+        top=5000, instance=instance)
+    rows = (rows_resp.get("value") or []) if isinstance(rows_resp, dict) else []
+    if not rows:
+        return {"ok": False, "screen_id": sid, "tree_dac": tree_dac,
+                "error": f"{tree_dac} returned no rows — cannot derive the node's "
+                         f"DOM id, so the node cannot be addressed."}
+    async with ScreenClient(inst, sid) as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        try:
+            tree_ctl = d.find_tree_control()
+        except ScreenError as e:
+            return {"ok": False, "screen_id": sid, "no_classic_tree": True,
+                    "error": str(e),
+                    "recommend": ("this screen has no classic PXTreeView; if it has "
+                                  "a tree at all it is modern-plane only.")}
+        dom_id = _tree_node_dom_id(node_key, rows, tree_ctl, key_field,
+                                   parent_field, sort_field)
+        if not dom_id:
+            return {"ok": False, "screen_id": sid, "node_key": node_key,
+                    "tree_control": tree_ctl,
+                    "error": f"{key_field}={node_key} is not in {tree_dac} — no such "
+                             f"node, so no DOM id could be derived."}
+        sel = await d.select_tree_node(tree_ctl, dom_id, node_key)
+        out: dict[str, Any] = {"screen_id": sid, "page_url": url,
+                               "tree_control": tree_ctl, "node_key": node_key,
+                               "node_dom_id": dom_id, **sel}
+        if not sel.get("select_verified"):
+            out["ok"] = False
+            return out          # never fire an action on an unconfirmed selection
+        if action:
+            out["action_result"] = await d.tree_node_action(action)
+        out["ok"] = True
+        return out
+
+
+@mcp.tool()
 async def screen_submit(
     screen_id: str,
     commands: list[dict],
@@ -4146,11 +4250,24 @@ async def build_company_tree(
 
     built: list[dict] = []
     async with ScreenClient(inst, "EP204060") as s:
-        for name, depth in flat:
+        for i, (name, depth) in enumerate(flat):
             await s.ui_bootstrap(["Folders", "Items", "Members"])
             await s.ui_insert_grid_row("Items", {"Description": name}, skip_validation=True)
-            for _ in range(depth):
-                await s.ui_command("Right")   # indent the just-inserted (current) node
+            # INDENT SEMANTICS — measured live 2026-07-20, and NOT what they look
+            # like. The original code fired Right `depth` times on the row it had
+            # just inserted, which is wrong twice over:
+            #   (1) OFF BY ONE: the presses issued after inserting node N take
+            #       effect on node N+1, never on N.
+            #   (2) They set that next node's ABSOLUTE level, and the level RESETS
+            #       every step — it does not accumulate and it is not a delta.
+            # So the count to issue in THIS step is simply the next node's depth.
+            # Fitted against a 4-node probe (0/1/0/1 presses -> ROOT / ROOT /
+            # child-of-#2 / ROOT), which only this model explains; it also
+            # reproduces the earlier mis-nested build exactly.
+            # Lefts are never needed (and appeared to be ignored when tried).
+            nxt = flat[i + 1][1] if i + 1 < len(flat) else 0
+            for _ in range(nxt):
+                await s.ui_command("Right")
             await s.ui_command("Save")
             built.append({"name": name, "depth": depth})
 
@@ -7297,6 +7414,11 @@ _GUIDE = {
             "grid's columns, AND classic delete_row can't reach it because the key "
             "isn't a settable field in that container — the ASPX grid often still "
             "exposes the key. Requires allow_delete)",
+            "aspx_tree_node_action (SELECT a classic TREE node by key — and optionally "
+            "fire a node-scoped action on it — over the ASPX plane. The tree-click the "
+            "SOAP/modern planes cannot do: selection lives in the tree control's hidden "
+            "_state, which this plane can write. Proven on EP204061 Company Tree. "
+            "Select-only is safe; an action needs allow_write (allow_delete if it deletes))",
             "aspx_grid_batch (several row changes in ONE atomic Save on the ASPX "
             "plane — the way to change a grid guarded by a CROSS-ROW INVARIANT, e.g. "
             "delete one bank row AND rebalance the survivors to percent-sum 100 in "
