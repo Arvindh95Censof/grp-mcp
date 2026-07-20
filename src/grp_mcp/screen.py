@@ -2661,12 +2661,30 @@ class ScreenClient:
         same friendly name appears in more than one container.
         """
         root = self._tree
+        # Both not-found paths below name the AVAILABLE containers and point at
+        # screen_get_schema: this plane's container names routinely DIFFER from the
+        # modern plane's view names (measured: ui_get_structure('SM203520') exposes
+        # `Companies`, this schema wants `CompanySummary`) — a bare "not found" sent
+        # callers hunting a typo when the real fix is a different plane's name.
+        containers = [c.tag for c in list(root)]
         if "." in name:
             cont, fname = name.split(".", 1)
             c = root.find(cont)
-            el = c.find(fname) if c is not None else None
+            if c is None:
+                raise ScreenError(
+                    f"container {cont!r} not found in schema — available containers: "
+                    f"{containers}. Container names here are CLASSIC-plane names and "
+                    f"often differ from ui_get_structure's modern view names; get the "
+                    f"right one from screen_get_schema('{self.screen_id}').")
+            el = c.find(fname)
             if el is None:
-                raise ScreenError(f"field {name!r} not found in schema")
+                fields = [f.tag for f in list(c)
+                          if f.tag not in ("ServiceCommands", "DisplayName")]
+                raise ScreenError(
+                    f"field {fname!r} not found in container {cont!r} (the container "
+                    f"exists) — its fields: {fields[:40]}. Field names here are the "
+                    f"classic plane's FRIENDLY names, not DAC names; check "
+                    f"screen_get_schema('{self.screen_id}').")
             return copy.deepcopy(el)
         matches = []
         for cont in list(root):
@@ -2676,7 +2694,11 @@ class ScreenClient:
                 if child.tag == name:
                     matches.append((cont.tag, child))
         if not matches:
-            raise ScreenError(f"field {name!r} not found in any container")
+            raise ScreenError(
+                f"field {name!r} not found in any container — available containers: "
+                f"{containers}. Names here are CLASSIC-plane friendly names (modern "
+                f"view/DAC names often differ); list them with "
+                f"screen_get_schema('{self.screen_id}').")
         if len(matches) > 1:
             where = ", ".join(f"{c}.{name}" for c, _ in matches)
             raise ScreenError(f"field {name!r} is ambiguous — qualify it: {where}")

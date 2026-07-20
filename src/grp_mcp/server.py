@@ -8,6 +8,7 @@ default instance is used.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import importlib.resources
 import json
 import os
@@ -386,6 +387,52 @@ def _no_classic_grid_result(sid: str, grid_view: str, url: str,
             f"ui_update_grid_row — they address rows by key via /structure and "
             f"do not need classic markup."),
     }
+
+
+def _aspx_page_missing(exc: Exception) -> bool:
+    """True when the ASPX plane could not even OPEN the page — the screen has no
+    classic WebForms page at all (modern-only, e.g. CS201010). Distinct from
+    _classic_grid_missing, which fires when the PAGE exists but one grid has no
+    classic binding on it. The raw open() message conflates 'no classic page'
+    with 'not authenticated'; every caller here has just passed _ensure_login,
+    so authentication is excluded and the modern-only reading is the right one."""
+    m = str(exc)
+    return ("no __RequestVerificationToken" in m
+            or "page has no control config declarations" in m)
+
+
+def _no_aspx_page_result(sid: str, url: str, exc: Exception) -> dict:
+    """Routing payload for a screen with NO classic ASPX page — instead of a raw
+    raise with no recovery path (measured on CS201010: a generic 'raised at least
+    one error' left the caller to hypothesise and bisect), point at the planes
+    that DO work on a modern-only screen."""
+    return {
+        "ok": False, "screen_id": sid, "page_url": url,
+        "no_classic_page": True,
+        "error": str(exc),
+        "recommend": (
+            f"{sid} has no classic WebForms page (modern-only screen), so the "
+            f"ASPX plane cannot open it at all. Use the modern-plane tools "
+            f"instead: ui_read_grid / ui_insert_grid_row / ui_update_grid_row / "
+            f"ui_delete_grid_row for grids, ui_screen_action for header fields + "
+            f"actions. To diagnose a failing Save here, re-run the write via "
+            f"ui_screen_action (its per-field guards report which value the "
+            f"screen refused) and bisect the field set — there is no ASPX replay "
+            f"to lean on."),
+    }
+
+
+def _is_transport_drop(msg: str) -> bool:
+    """True when a failed call looks like the CONNECTION died, not like the server
+    rejected the request. Only a drop is benign during a recompile: the work
+    continues server-side and polling observes it. A server-side error (an NRE, a
+    validation failure) means nothing was started, and reporting that as
+    "in_progress, keep polling" sends the caller into an infinite poll on work that
+    will never happen — measured on CS100000/ProjectAccounting, 2026-07-20."""
+    m = msg.lower()
+    return any(t in m for t in (
+        "timeout", "timed out", "connection", "connect", "reset by peer",
+        "server disconnected", "incomplete read", "remotely closed", "eof"))
 
 
 def _require_admin(op: str) -> None:
@@ -1373,9 +1420,38 @@ async def create_or_update_entity(
 
     Full detail-row shapes, live-proven entities + rationale:
     guide(topic="create_or_update_entity").
+
+    FIELD NAMES ARE VALIDATED against the endpoint schema before the PUT: the
+    contract layer silently DISCARDS unknown properties (no error, field left at
+    its default — proven live: Ledger `BalanceType` dropped, `Type` defaulted to
+    Actual, and the mistake only surfaced two records later as a misleading
+    "actual ledger already associated" error). An unknown field name here raises
+    with close-match suggestions instead. Skipped only if the schema itself can't
+    be fetched.
     """
     _require_write(instance)
     client = _client(instance, endpoint)
+    # Pre-flight: reject field names the schema doesn't know, BEFORE the PUT.
+    # Zero-cost after the first call (swagger.json is cached per client).
+    try:
+        props = await client._merged_props(entity)
+        known = set(props) | set(client._META_FIELDS)
+    except Exception:  # noqa: BLE001 — schema unavailable: fail open, PUT as before
+        known = None
+    if known is not None:
+        unknown = [k for k in fields if k not in known]
+        if unknown:
+            hints = {
+                k: difflib.get_close_matches(k, sorted(known), n=3, cutoff=0.5)
+                for k in unknown
+            }
+            raise ValueError(
+                f"Unknown field name(s) on entity '{entity}': {unknown}. Acumatica "
+                f"would SILENTLY DISCARD these (no error, field left at default) — "
+                f"refusing the PUT. Close matches: "
+                + "; ".join(f"{k} -> {v or ['(none)']}" for k, v in hints.items())
+                + ". Use get_entity_schema to list valid field names."
+            )
     result = await client.put_entity(entity, _wrap_fields(fields))
     if isinstance(result, dict):
         op = _put_operation(result)
@@ -2169,8 +2245,20 @@ async def ui_screen_action(
     # collect the warnings rather than letting one overwrite the other.
     warnings = []
     if not ok:
-        warnings.append("Action 'Save' returned graphIsDirty=true — the change may NOT "
-                        "have persisted (silent no-op). Read the record back to confirm.")
+        # Deliberately a HEDGE, not a verdict: dirty-after-Save has BOTH outcomes on
+        # record (CS202000 LookupMode: dirty:true yet the value persisted; other
+        # screens: dirty:true = genuinely unsaved). An in-session read-back cannot
+        # disambiguate — the graph holds the staged values either way, and reloading
+        # it to check would DISCARD them if they truly hadn't saved. Only an
+        # out-of-band read is authoritative.
+        warnings.append(
+            "Action 'Save' returned graphIsDirty=true — AMBIGUOUS: on some screens "
+            "this means the change did not persist (silent no-op), on others the "
+            "value saved fine and the graph is dirty for an unrelated reason "
+            "(measured both ways; e.g. CS202000 LookupMode persisted despite "
+            "dirty:true). Do NOT re-run the Save yet — verify out-of-band first "
+            "(run_dac_odata / get_entity / screen_get on a fresh call) and only "
+            "retry if the value is genuinely absent.")
     if rejected:
         out["rejected_fields"] = rejected
         out["ok"] = False
@@ -2922,7 +3010,14 @@ async def diagnose_save_error(
     async with ScreenClient(inst, sid) as s:
         await s._ensure_login()
         d = AspxDiagnostic(s, url)
-        await d.open()
+        try:
+            await d.open()
+        except ScreenError as e:
+            # Login already succeeded above, so a token-less page means the screen
+            # has NO classic plane — route to the modern tools instead of raising.
+            if _aspx_page_missing(e):
+                return _no_aspx_page_result(sid, url, e)
+            raise
         # Headerless LIST screens (e.g. GL202500 Chart of Accounts: the grid IS
         # the primary view, no header record) have nothing to navigate to — an
         # empty record_key skips the step instead of failing "record did not
@@ -3017,7 +3112,14 @@ async def aspx_delete_grid_row(
     async with ScreenClient(inst, sid) as s:
         await s._ensure_login()
         d = AspxDiagnostic(s, url)
-        await d.open()
+        try:
+            await d.open()
+        except ScreenError as e:
+            # Login already succeeded above, so a token-less page means the screen
+            # has NO classic plane — route to the modern tools instead of raising.
+            if _aspx_page_missing(e):
+                return _no_aspx_page_result(sid, url, e)
+            raise
         dk = await d.navigate(record_key) if record_key else None
         try:
             result = await d.replay_grid_save(grid_view, {}, row_key=row_key,
@@ -3097,7 +3199,14 @@ async def aspx_grid_batch(
     async with ScreenClient(inst, sid) as s:
         await s._ensure_login()
         d = AspxDiagnostic(s, url)
-        await d.open()
+        try:
+            await d.open()
+        except ScreenError as e:
+            # Login already succeeded above, so a token-less page means the screen
+            # has NO classic plane — route to the modern tools instead of raising.
+            if _aspx_page_missing(e):
+                return _no_aspx_page_result(sid, url, e)
+            raise
         dk = await d.navigate(record_key) if record_key else None
         try:
             result = await d.replay_grid_batch(grid_view, operations)
@@ -3186,7 +3295,14 @@ async def aspx_tree_node_action(
     async with ScreenClient(inst, sid) as s:
         await s._ensure_login()
         d = AspxDiagnostic(s, url)
-        await d.open()
+        try:
+            await d.open()
+        except ScreenError as e:
+            # Login already succeeded above, so a token-less page means the screen
+            # has NO classic plane — route to the modern tools instead of raising.
+            if _aspx_page_missing(e):
+                return _no_aspx_page_result(sid, url, e)
+            raise
         try:
             tree_ctl = d.find_tree_control()
         except ScreenError as e:
@@ -3849,14 +3965,38 @@ async def activate_features(wait_seconds: float = 40.0, instance: str | None = N
     # may drop this in-flight request — fine, activation proceeds server-side and we
     # observe it via ActivationStatus.
     fire: dict = {"ok": None}
+    fire_error: str | None = None
     try:
         async with ScreenClient(inst, "CS100000", timeout=poll_interval + 5) as s:
             await s.ui_bootstrap()
             fire = await s.ui_command("requestValidation")
     except Exception as e:  # noqa: BLE001 — recompile commonly drops the connection
-        fire = {"ok": None, "transport": str(e)[:160]}
+        # Keep the WHOLE server message. The old [:160] cut mid-sentence at
+        # "...not set to an instance of ", losing the object name that identifies
+        # the null — and ui_command prefixes ~42 chars of its own before the
+        # server's ~120, so the useful tail was always the part discarded.
+        fire_error = str(e)
+        fire = {"ok": None, "transport": fire_error[:600]}
     status = await _activation_status(inst, poll_interval, wait_seconds)
     activated = status == "Validated"
+    # A hard server-side rejection is NOT "in_progress": nothing was started, so
+    # polling would never end. Only a dropped connection is benign here.
+    failed = bool(fire_error) and not _is_transport_drop(fire_error) and not activated
+    if failed:
+        return {
+            "activated": False,
+            "activation_status": status,
+            "status": "failed",
+            "fire_result": fire,
+            "error": fire_error[:600],
+            "note": (
+                "The Enable command was REJECTED by the server — activation never "
+                "started, so polling activate_features_status() will never succeed. "
+                "This is a server-side error, not a recompile. If it names a feature "
+                "field (e.g. an NRE on ProjectAccounting), that feature's activation "
+                "is failing server-side; drive the Enable button in the browser to "
+                "confirm, and see the full message in `error` above."),
+        }
     return {
         "activated": activated,
         "activation_status": status,
@@ -3887,7 +4027,7 @@ async def activate_features_status(instance: str | None = None) -> Any:
         status = rows[0].get("Status") if rows else None
     except Exception as e:  # noqa: BLE001 — site still recompiling
         return {"activated": False, "activation_status": "unknown (site recompiling)",
-                "error": str(e)[:160]}
+                "error": str(e)[:600]}
     return {"activated": status == "Validated", "activation_status": status}
 
 
@@ -3898,6 +4038,7 @@ async def create_financial_calendar(
     has_adjustment_period: bool = False,
     number_of_periods: int | None = None,
     period_type: str | None = None,
+    periods_start_date: str | None = None,
     skip_validation: bool = False,
     instance: str | None = None,
 ) -> Any:
@@ -3909,6 +4050,12 @@ async def create_financial_calendar(
     has_adjustment_period: add a year-end adjustment period (Period 13) to the pattern.
     number_of_periods: override the period count (e.g. 12 monthly). Omit for default.
     period_type: override the period type (e.g. "Month"). Omit for default.
+    periods_start_date: "First Period Start Date" (DAC PeriodsStartDate), M/D/YYYY.
+                Defaults to the year-start date — REQUIRED on a blank tenant: AutoFill
+                does NOT derive it, and without it the Save fails with "Please
+                configure all the Financial Periods for the Year" (proven live,
+                2026R1 blank tenant, 2026-07-20). Sent as friendly name
+                FirstPeriodStartDate — the classic plane rejects the DAC name.
 
     WHY THE START DATE, NOT THE YEAR FIELD: on 2024R2+/26.100 the "First Financial
     Year" field (FiscalYearSetup.FirstFinYear) is READ-ONLY once a calendar pattern
@@ -3935,6 +4082,13 @@ async def create_financial_calendar(
         cmds.append({"set": "NumberOfFinancialPeriods", "to": str(number_of_periods)})
     if has_adjustment_period:
         cmds.append({"set": "HasAdjustmentPeriod", "to": "True"})
+    # "First Period Start Date" (DAC PeriodsStartDate) is REQUIRED and AutoFill does
+    # NOT derive it from the year start — omitting it fails the Save on a blank
+    # tenant ("Please configure all the Financial Periods for the Year", proven live
+    # 2026-07-20). Friendly name on this plane is FirstPeriodStartDate (schema-
+    # verified); the DAC name PeriodsStartDate would be refused/no-op here.
+    cmds.append({"set": "FirstPeriodStartDate",
+                 "to": str(periods_start_date) if periods_start_date else start})
     cmds.append({"action": "AutoFill"})
     cmds.append({"action": "Save"})
     async with ScreenClient(inst, "GL101000") as s:
@@ -6709,6 +6863,61 @@ def _dedup_rows(rows: list) -> tuple[list, int]:
     return unique, len(rows) - len(unique)
 
 
+async def _dac_failure_hint(client, dac: str, err: str) -> str | None:
+    """Diagnose a failed DAC-OData query and route the caller — failure path only,
+    zero overhead on success.
+
+    Three measured failure shapes, none of which the raw error explains:
+      • name not exposed at all -> close matches from the service document;
+      • DAC exists as an EntityType in $metadata but serves NO EntitySet (detail/
+        staging DACs like SYData; config singletons like GLSetup) -> every
+        collection read 404s no matter what, route to get_dac_metadata/ui_read_grid;
+      • name resolved to a DIFFERENT DAC than intended (server-side routing, we do
+        no mapping) and a $select/$filter property is missing on it — e.g.
+        'NumberingSequence' binds to PX.Objects.CS.Numbering (the HEADER), so
+        StartNbr errors "Could not find a property named 'StartNbr' on type
+        'PX.Objects.CS.Numbering'" and the real fix is a different name/plane.
+    """
+    try:
+        hints: list[str] = []
+        m = re.search(r"Could not find a property named '([^']+)' on type '([^']+)'",
+                      err)
+        if m:
+            hints.append(
+                f"'{dac}' resolved server-side to DAC {m.group(2)} which has no "
+                f"{m.group(1)} — you may be on the WRONG DAC (header vs detail is a "
+                f"known trap: 'NumberingSequence' binds to the Numbering HEADER; the "
+                f"sequence-detail table is unreachable by that name — read it via "
+                f"ui_read_grid('CS201010','Sequence')). Check the DAC's real fields "
+                f"with get_dac_metadata('{dac}').")
+        doc = await client.list_dacs()
+        names = [d.get("name") for d in (doc.get("value") or [])
+                 if isinstance(d, dict) and d.get("name")]
+        if dac not in names:
+            csdl = await client.dac_metadata()
+            if f'EntityType Name="{dac}"' in csdl:
+                hints.append(
+                    f"'{dac}' EXISTS in $metadata as an EntityType but serves NO "
+                    f"EntitySet — no collection route, so every read 404s regardless "
+                    f"of query shape (typical for detail/staging DACs and single-row "
+                    f"config DACs). Read its fields with get_dac_metadata('{dac}'); "
+                    f"read its rows via the owning screen instead (screen_get / "
+                    f"ui_read_grid).")
+            else:
+                close = difflib.get_close_matches(dac, names, n=5, cutoff=0.4)
+                sub = [n for n in names if dac.lower() in n.lower()][:5]
+                cand = list(dict.fromkeys(close + sub))
+                if cand:
+                    hints.append(f"'{dac}' is not an exposed OData name. "
+                                 f"Close matches: {cand}.")
+                else:
+                    hints.append(f"'{dac}' is not an exposed OData name and nothing "
+                                 f"similar is — check list_dacs().")
+        return " ".join(hints) if hints else None
+    except Exception:  # noqa: BLE001 — diagnosis must never mask the original error
+        return None
+
+
 @mcp.tool()
 async def run_dac_odata(
     dac: str,
@@ -6760,7 +6969,13 @@ async def run_dac_odata(
         for v in values:
             cond = f"{field} eq '{_oq(v)}'" if isinstance(v, str) else f"{field} eq {v}"
             f = f"({filter}) and {cond}" if filter else cond
-            r = await client.run_dac(dac, {**base, "$filter": f}, timeout=timeout)
+            try:
+                r = await client.run_dac(dac, {**base, "$filter": f}, timeout=timeout)
+            except AcumaticaError as e:
+                hint = await _dac_failure_hint(client, dac, str(e))
+                if hint:
+                    raise AcumaticaError(f"{e} | HINT: {hint}") from e
+                raise
             if isinstance(r, dict) and isinstance(r.get("value"), list):
                 merged.extend(r["value"])
         rows, removed = _dedup_rows(merged) if dedup else (merged, 0)
@@ -6771,7 +6986,18 @@ async def run_dac_odata(
 
     if filter:
         base["$filter"] = filter
-    result = await client.run_dac(dac, base, timeout=timeout)
+    try:
+        result = await client.run_dac(dac, base, timeout=timeout)
+    except AcumaticaError as e:
+        # Failure-path diagnosis only: distinguish "name not exposed" (close
+        # matches), "EntityType with no EntitySet" (no collection route — route to
+        # get_dac_metadata / the owning screen), and "resolved to the wrong DAC"
+        # (header-vs-detail, e.g. NumberingSequence -> Numbering). The raw 404/400
+        # explains none of these.
+        hint = await _dac_failure_hint(client, dac, str(e))
+        if hint:
+            raise AcumaticaError(f"{e} | HINT: {hint}") from e
+        raise
     if dedup and isinstance(result, dict) and isinstance(result.get("value"), list):
         unique, removed = _dedup_rows(result["value"])
         if removed:

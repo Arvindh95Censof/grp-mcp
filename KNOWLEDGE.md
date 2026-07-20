@@ -567,24 +567,43 @@ the last one via the grid/CSDL path.
 
 ## 6. Foundation / GL setup — order and gotchas
 
-Empirically-confirmed build order (each step gates the next):
+Empirically-confirmed build order (each step gates the next; re-proven live on a **blank**
+2026R1 tenant 2026-07-20 — the order below corrects an earlier version of this list AND the
+old `canonical_order` in setup_map.json, both of which put GL prefs before the CoA and the
+calendar generation before GL prefs, and both of which fail on a blank tenant):
 
 1. **Features** (`CS100000`) — set the feature flag, then **`activate_features`** — the apply is the
    `RequestValidation` action (flips `Pending → Validated`). It **recompiles the site (~1–3 min)**;
    the in-flight call often 500s as the app pool restarts, so it's **fire-and-verify**
-   (`activate_features` polls `ActivationStatus`).
-2. **Financial calendar** (`GL101000`) — `create_financial_calendar(first_year, starts_on=…)`:
-   `FirstFinancialYear → AutoFill (Create Periods) → set start AFTER AutoFill → Save`, with
-   `auto_answer="Yes"`. Start-date is fully SOAP-settable (old "picker-only" verdict was wrong).
+   (`activate_features` polls `ActivationStatus`). **v0.66.0:** a server-side rejection of the
+   Enable command (e.g. an NRE naming a feature field) now returns `status: "failed"` with the
+   FULL error — it used to be swallowed into `"in_progress"`, sending you into an endless poll
+   on an activation that never started. Only a dropped connection still means "keep polling".
+2. **Financial calendar** (`GL101000`) — `create_financial_calendar(first_year, starts_on=…)`.
+   **v0.66.0:** the tool now also sends **`FirstPeriodStartDate`** (DAC `PeriodsStartDate`,
+   defaulting to the year start; override with `periods_start_date=`) — it is REQUIRED and
+   `AutoFill` does **not** derive it: without it the Save fails on a blank tenant with
+   *"Please configure all the Financial Periods for the Year"*. Note the plane-specific name:
+   the classic plane wants the friendly `FirstPeriodStartDate`, not the DAC name.
 3. **Ledger** (`GL201500`) — `create_ledger`. **This alone does NOT make it the org's Actual
    Ledger.** You must separately **link ledger → org** on **`CS101500`** (Companies → Ledgers tab).
-   GL screens behave as if no ledger exists until this link is made.
-4. **GL preferences** (`GL102000`) — `set_gl_preferences(retained_earnings, ytd_net_income, …)`.
-   Both accounts must be **type Liability** and must already exist in the CoA.
-5. **Chart of accounts** (`GL202500`) — `chart_of_accounts(accounts)` (grid writer).
-6. **Generate periods** (`GL201000` "Generate Calendar") — classic SOAP silently no-ops this;
+   GL screens behave as if no ledger exists until this link is made. The Ledger entity's type
+   field is **`Type`** (`"Actual"`/`"Statistical"`/…), NOT `BalanceType` — and as of v0.66.0
+   `create_or_update_entity` REJECTS unknown field names instead of letting Acumatica silently
+   drop them (the old behavior defaulted `Type` to Actual and only failed two records later).
+4. **Account classes** (`GL202000`) — optional, but do it before the CoA if custom classes are
+   wanted. On a fresh instance the read 500s with `PXSetupNotEnteredException[Branch]` until a
+   company + branch RECORD exist (CS101500/CS102000).
+5. **Chart of accounts** (`GL202500`) — `chart_of_accounts(accounts)` (grid writer). Must include
+   Retained Earnings + YTD Net Income, both **Liability**.
+6. **GL preferences** (`GL102000`) — `set_gl_preferences(retained_earnings, ytd_net_income, …)`.
+   HARD GATE, must come AFTER the CoA: a bare Save fails with *"'YTD Net Income Account' cannot
+   be empty. 'Retained Earnings Account' cannot be empty."* (the "a bare Save materializes the
+   setup row" rule does NOT hold for GL102000). Both accounts must be **type Liability**.
+7. **Generate periods** (`GL201000` "Generate Calendar") — REQUIRES GLSetup (step 6): fails with
+   `SetupNotEntered` until GL preferences exist. Classic SOAP silently no-ops the action;
    `generate_master_calendar` drives it on the **modern plane** (proven).
-7. **Open periods** (`GL503000`) — `manage_financial_periods` (`Action=Open`, `ProcessAll`) —
+8. **Open periods** (`GL503000`) — `manage_financial_periods` (`Action=Open`, `ProcessAll`) —
    cleanly SOAP-drivable.
 
 `setup_readiness` reports the gaps (feature activation, GL prefs, open periods, calendar) so you know
@@ -1060,6 +1079,54 @@ modern-plane grid tools (`ui_read_grid` → `ui_delete_grid_row`/`ui_insert_grid
 `ui_update_grid_row`), which key rows via `/structure` and need no classic markup. The match is on
 find_grid_control's own messages, so an ordinary business/validation error is NOT swallowed as this
 case (unit-tested both ways).
+
+---
+
+## 12. Failure routing — errors that route you to the working plane (v0.66.0)
+
+A live 2026R1 foundation build produced a defect register whose common shape was: **a failure path
+raising a bare message when the codebase already held the knowledge needed to route the caller to
+the plane that works.** v0.66.0 closes that class at five choke points:
+
+- **`create_or_update_entity` validates field names before the PUT.** The contract layer silently
+  DISCARDS unknown properties — no error, field left at its default (proven: Ledger `BalanceType`
+  dropped, `Type` defaulted to Actual, surfaced two records later as a misleading "actual ledger
+  already associated" error). Unknown names now raise pre-PUT with difflib close-matches. Costs
+  nothing after the first call (swagger.json is cached per client); fails open if the schema
+  itself can't be fetched.
+- **`run_dac_odata` failures carry a `HINT`** distinguishing three measured shapes the raw
+  404/400 explains none of: (a) name not exposed → close matches from the service document;
+  (b) DAC exists in `$metadata` as an EntityType but serves **no EntitySet** (detail/staging DACs,
+  single-row config DACs) → every collection read 404s regardless of query shape; read fields via
+  `get_dac_metadata`, rows via the owning screen; (c) the name resolved server-side to the WRONG
+  DAC — `'NumberingSequence'` binds to the Numbering HEADER, so `StartNbr` errors "Could not find
+  a property … on type 'PX.Objects.CS.Numbering'"; the sequence detail is only reachable via
+  `ui_read_grid('CS201010','Sequence')`. Diagnosis runs on the failure path only and never masks
+  the original error.
+- **A screen with NO classic ASPX page routes instead of raising.** All four ASPX tools
+  (`diagnose_save_error`, `aspx_delete_grid_row`, `aspx_grid_batch`, `aspx_tree_node_action`)
+  previously died at `open()` with "no __RequestVerificationToken …" on modern-only screens
+  (observed: CS201010) — leaving a generic "raised at least one error" with no recovery path. They
+  now return `{no_classic_page: true, recommend: …}` pointing at the modern-plane tools, and note
+  that diagnosing a failing Save there means re-running via `ui_screen_action` (whose per-field
+  guards name the refused value) and bisecting. Distinct from 11b: that's "page exists, one grid
+  unbound"; this is "no classic page at all".
+- **Classic-plane `_find_field` misses name the schema tool.** "field 'X' not found" now lists the
+  available containers (or the container's fields if only the field half is wrong) and points at
+  `screen_get_schema` — because the usual cause is not a typo but the §3 plane-naming trap:
+  modern view names ≠ classic container names (measured: `ui_get_structure('SM203520')` exposes
+  `Companies`; the classic schema wants `CompanySummary`).
+- **`ui_screen_action`'s dirty-after-Save warning is now an honest AMBIGUOUS verdict.** Measured
+  both ways: on some screens `graphIsDirty:true` after Save = genuinely unsaved; on others the
+  value persisted anyway (CS202000 LookupMode). An in-session read-back CANNOT disambiguate — the
+  graph holds the staged values either way, and reloading it to check would discard them if they
+  truly hadn't saved. The warning now says exactly that and directs to an out-of-band read
+  (`run_dac_odata` / `get_entity` / fresh `screen_get`) BEFORE any re-run of the Save.
+
+Related fix, same register: `activate_features` no longer swallows a server-side rejection of the
+Enable command as `"in_progress"` (see §6 step 1), and its error text is no longer truncated at
+160 chars — the old cut landed mid-sentence at "…instance of ", discarding exactly the object name
+that identifies the null.
 
 ---
 

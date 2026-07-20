@@ -127,12 +127,12 @@
     "CS202000",
     "CS203000",
     "GL101000",
-    "GL201000",
-    "GL503000",
     "GL201500",
     "GL202000",
     "GL202500",
     "GL102000",
+    "GL201000",
+    "GL503000",
     "CS206500",
     "CA101000",
     "CA202000",
@@ -316,17 +316,18 @@
         "Create Periods unavailable for week-based types",
         "one-time; structure meant to be permanent"
       ],
-      "plane": "create_financial_calendar (recipe; first_year + AutoFill + optional starts_on)",
+      "plane": "create_financial_calendar (recipe; first_year + AutoFill + optional starts_on; sends FirstPeriodStartDate=year start unless periods_start_date given - required, AutoFill does NOT derive it)",
       "verify": "screen_get('GL101000', ['Periods.PeriodNbr','Periods.StartDate'])"
     },
     "GL201000": {
       "name": "Master Financial Calendar",
       "area": "GL",
-      "order": 8,
+      "order": 12,
       "purpose": "Generate financial periods for a year range (created Inactive).",
       "prerequisites": [
         "GL101000 year+periods configured",
-        "Actual ledger linked to org"
+        "Actual ledger linked to org",
+        "GLSetup saved (GL102000) - Generate fails with SetupNotEntered until GL preferences exist (proven live, blank 2026R1 tenant)"
       ],
       "required_fields": [
         "GenerateParams.FromYear",
@@ -344,7 +345,7 @@
     "GL503000": {
       "name": "Manage Financial Periods",
       "area": "GL",
-      "order": 9,
+      "order": 13,
       "purpose": "Open generated (Inactive) periods so they become postable.",
       "prerequisites": [
         "periods generated on GL201000 (exist as Inactive)"
@@ -365,7 +366,7 @@
     "GL201500": {
       "name": "Ledgers",
       "area": "GL",
-      "order": 10,
+      "order": 8,
       "purpose": "Create the Actual ledger (usually done via CS101500 Create Ledger).",
       "prerequisites": [
         "company exists"
@@ -385,7 +386,7 @@
     "GL202000": {
       "name": "Account Classes",
       "area": "GL",
-      "order": 11,
+      "order": 9,
       "purpose": "Optional grouping of accounts for reporting. Predefined classes exist.",
       "prerequisites": [
         "none; do before CoA if custom classes wanted"
@@ -407,7 +408,7 @@
     "GL202500": {
       "name": "Chart of Accounts",
       "area": "GL",
-      "order": 12,
+      "order": 10,
       "purpose": "Create the account structure. Must include Net Income + Retained Earnings (Liability).",
       "prerequisites": [
         "Actual ledger",
@@ -431,7 +432,7 @@
     "GL102000": {
       "name": "General Ledger Preferences",
       "area": "GL",
-      "order": 13,
+      "order": 11,
       "purpose": "Set system accounts + posting flags. HARD GATE: needs RetEarn+NetIncome in CoA first.",
       "prerequisites": [
         "CoA with Retained Earnings + YTD Net Income (Liability)",
