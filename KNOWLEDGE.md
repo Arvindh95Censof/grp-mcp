@@ -762,9 +762,15 @@ design — the other planes remain the write path.
 - **Headerless LIST screens (the grid IS the primary view, e.g. GL202500)**: pass `record_key={}`
   — navigation is skipped (there is no header record to load; forcing it fails "record did not
   load"). LIMITATION (proven live, insert AND update): RowChanges against the PRIMARY grid never
-  bind — the Save answers clean with `isDirty:1` and zero error text, because the browser drives
-  such grids through a per-cell commit flow this plane client does not emulate. The result carries
-  an explicit `note` saying validation never fired (an empty error list must not read as "no
+  bind — the Save answers clean with `isDirty:1` and zero error text. ROOT CAUSE (captured live
+  2026-07-20, superseding the earlier "per-cell commit flow" hypothesis): the browser addresses
+  the RowChanges callback to **the grid control** (`__CALLBACKID=ctl00$phL$grid`, one `Save|` +
+  RowChanges per ROW commit, answered with `<UpdateResult Status Affected>`), and only a separate
+  ds-addressed `Save|` (`ctl00$phDS$ds`, Ctrl+S) persists to the DB. This client always posts
+  RowChanges to the ds — the right addressee for child grids under a header, the wrong one for a
+  headerless primary grid. Same envelope grammar, same cell format; emulable if ever needed, but
+  headerless screens are normally written via contract REST / the modern UI, so the tool keeps
+  the explicit `note` saying validation never fired (an empty error list must not read as "no
   problem found"). Detail/child grids under a loaded header remain the fully supported shape.
 - **A replayed change that is actually VALID persists** — the tool requires `allow_write` and
   flags `possibly_saved: true`; only replay changes that already failed.
@@ -906,15 +912,17 @@ wrong twice before it was right — the first throwaway attribute was ControlTyp
 legitimately has NO value list, so every insert was correctly dropped, on BOTH planes, silently); a
 `screen_submit` "ok:true" for those rows meant nothing.
 
-**Deferred investigation — headerless list-screen grid binding (GL202500).** RowChanges against the
-PRIMARY grid of a headerless list screen land with the graph dirty and never bind (see the "no error
-but graph dirty" note above). The earlier verdict "the browser uses a per-cell commit flow this tool
-does not emulate" was INFERRED, never captured — so it is a hypothesis, not a fact. Resolving it
-means driving GL202500 in a browser and capturing the actual save-callback traffic. **Consciously
-parked, not fixed:** low capability value (headerless list screens are normally written via contract
-REST or the modern UI, not this diagnostic plane), so the payoff is epistemic ("now we know") rather
-than a new capability. Revisit only if a real need to write a headerless list grid through this plane
-appears.
+**CLOSED (2026-07-20) — headerless list-screen grid binding (GL202500), root cause CAPTURED.** The
+long-standing "RowChanges never bind on a headerless primary grid" limit was resolved by capturing
+the browser's actual save-callback traffic on GL202500 (a live Active-checkbox toggle, discarded via
+Cancel; DB untouched). Verdict: the earlier "per-cell commit flow" hypothesis was directionally
+right but wrong in detail — the browser fires a per-ROW commit callback addressed to **the grid
+control** (`__CALLBACKID=ctl00$phL$grid`, `Save|` + `<RowChanges>` with `Commit="1"`; response
+`<UpdateResult Status="1" Affected="1">` echoing the row with per-cell ReadOnly flags; ds flips
+`isDirty:1`), then persists with a separate ds-addressed `Save|`. Our replay's ds-addressed
+RowChanges is simply the wrong ADDRESSEE for that one grid shape. The envelope grammar is identical,
+so grid-addressed emulation is feasible — still not built (headerless screens are written via
+contract REST / modern UI), but the question is now answered by capture, not inference.
 
 **The "cannot be found in the system" selector error is a SubstituteKey — send the display
 name, NOT the code/id (root-caused from source + a live persisted write; CORRECTS an earlier
