@@ -503,15 +503,22 @@ class AspxDiagnostic:
                     "possibly_saved": False,
                 }
 
-        # PRE-FLIGHT the row_key against the grid's ACTUAL rows. A key that
-        # matches nothing is the documented footgun this plane's delete has:
-        # the server matches no row, changes nothing, and still answers
-        # `possibly_saved: true` with no error (proven live on CS205000 — the
-        # composite key's `ValueID` alone silently no-op'd). Now that the rows
-        # are in hand, that is detectable BEFORE the write instead of only by a
-        # DB read-back afterwards. A key matching MANY rows is refused too: it
-        # is a partial key by definition, and which row the server picks is not
-        # something to find out by deleting one.
+        # PRE-FLIGHT the row_key against the grid's ACTUAL rows. A key matching
+        # NOTHING would have the server match no row, change nothing, and still
+        # answer `possibly_saved: true`; a key matching MANY rows is a partial
+        # key by definition, and which row the server picks is not something to
+        # find out by deleting one. Both are refusable now that the rows are in
+        # hand.
+        #
+        # THIS IS NOT A COMPLETE GUARD, and the gap is measured, not theoretical:
+        # a partial key that happens to be UNIQUE within the grid passes here and
+        # STILL silently no-ops server-side, because the server matches on the
+        # full key. Proven live on CS205000 — {"ValueID": "BBB"} hits exactly one
+        # grid row, sails through this check, and deletes nothing
+        # (possibly_saved:true, rows 3 -> 3). The grid payload carries no "is
+        # key" flag, so which columns form the key is not knowable here. The
+        # post-Save read-back in _verify_save is what catches that case; these
+        # two checks are layered deliberately.
         if row_key and rows_before:
             hits = [r for r in rows_before if _row_matches(r, row_key)]
             if not hits:

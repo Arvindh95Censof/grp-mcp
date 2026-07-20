@@ -2922,12 +2922,15 @@ async def aspx_delete_grid_row(
         removes the WRONG row, so it is refused up front. Must carry EVERY key
         column: a single identity key needs one cell (PY309000
         {"EmployeeBankDetailID": 14551}); a COMPOSITE key needs all parts
-        (CS205000 {"AttributeID": "COLOR", "ValueID": "RED"}). A partial key is
-        now REFUSED up front: the grid's rows are read first, and a key matching
-        no row — or more than one — is rejected with `refused` + `grid_rows`
-        rather than sent (it would otherwise match nothing, delete nothing, and
-        still report a clean result). Key names must be the CLASSIC grid's column
-        dataFields (unknown keys are refused with the real `grid_columns` list).
+        (CS205000 {"AttributeID": "COLOR", "ValueID": "RED"}). The grid's rows
+        are read first, so a key matching NO row — or more than one — is refused
+        up front with `refused` + `grid_rows` rather than sent. That guard is
+        NOT complete: a partial key that is unique within the grid passes it and
+        still silently no-ops server-side (measured live: {"ValueID": "BBB"}
+        deleted nothing while reporting clean), so `delete_verified` below is
+        the check that actually catches a wrong key — read it every time. Key
+        names must be the CLASSIC grid's column dataFields (unknown keys are
+        refused with the real `grid_columns` list).
     record_key: {keyField: value} loading the header record (e.g.
         {"EmployeeCD": "EMP001"}); pass {} for a headerless list screen.
 

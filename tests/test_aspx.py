@@ -697,3 +697,22 @@ def test_insert_error_note_does_not_blame_the_row_index():
     assert "RULED OUT" in note
     assert "collide" not in note.lower()
     assert "run_dac_odata" in note
+
+
+def test_preflight_does_not_catch_a_grid_unique_partial_key():
+    """MEASURED GAP, pinned deliberately (live CS205000, 2026-07-20).
+
+    {"ValueID": "BBB"} matches exactly ONE grid row, so the pre-flight passes
+    it — but the server matches on the FULL key and silently no-ops
+    (possibly_saved:true, rows 3 -> 3, nothing deleted). The pre-flight cannot
+    close this: the grid payload carries no "is key" flag. The post-Save
+    read-back is the check that catches it, so assert BOTH halves: not refused,
+    and caught afterwards.
+    """
+    d = _cs_diag(_CLEAN_SAVE)  # after == before: the row survives
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"ValueID": "2"}, operation="delete"))
+    assert "refused" not in r          # the gap: pre-flight lets it through
+    assert r["possibly_saved"] is True  # and the plane reports it clean
+    assert r["delete_verified"] is False        # only the read-back catches it
+    assert "SILENT NO-OP" in r["verify_note"]

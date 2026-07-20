@@ -786,10 +786,15 @@ nothing — always `run_dac_odata`.
 "documented footguns" into enforced behaviour.** The grid Refresh callback that
 `replay_grid_save` already ran to harvest column names *also* carries every row; it was being
 thrown away. `_grid_rows` now parses it. Two payoffs:
-- **Partial keys are REFUSED before the write.** The `row_key` is matched against the grid's real
-  rows: zero matches → `refused` + `grid_rows` (this is the CS205000 `ValueID`-alone case, which
-  used to silently no-op); more than one match → `refused` as a partial key, because which row the
-  server picks is not a thing to discover by deleting one.
+- **Keys that match zero or many rows are REFUSED before the write.** The `row_key` is matched
+  against the grid's real rows: zero matches → `refused` + `grid_rows`; more than one match →
+  `refused` as a partial key, because which row the server picks is not a thing to discover by
+  deleting one. **KNOWN GAP, measured live 2026-07-20 — this does NOT catch a partial key that is
+  unique within the grid.** `{"ValueID": "BBB"}` on CS205000 matches exactly ONE grid row, so it
+  passes the pre-flight, yet the server still requires the FULL key and silently no-ops (verified:
+  `possibly_saved:true`, rows 3→3, nothing deleted). The grid payload carries no "is key" flag, so
+  the tool cannot tell which columns form the key. **The post-Save read-back below is what catches
+  this case** — the two checks are layered on purpose, and the pre-flight alone is not sufficient.
 - **`possibly_saved`'s ambiguity is resolved by a post-Save re-read.** `save_verified` (plus
   `delete_verified` for deletes) is `true` / `false` / `"unverified"` with a reason: delete checks
   the key is gone, insert checks the row count grew, update checks the keyed row now carries the
