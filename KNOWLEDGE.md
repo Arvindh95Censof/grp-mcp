@@ -19,7 +19,7 @@ Picking the wrong one is the single biggest time-sink. When unsure, call **`guid
 |-------|--------------|----------|-------------|
 | **Contract REST** | `create_or_update_entity`, `load_from_excel`, `get_entity`, `invoke_action` | Standalone entities exposed on the web-service endpoint; bulk CRUD | Context/master-detail screens the endpoint can't model; many import paths crash |
 | **DAC OData** | `run_dac_odata`, `get_dac_metadata`, `count_entity` | Reading any table/DAC (incl. config singletons) + mandatory-field metadata | Read-only; needs the OData v4 role or returns 403 |
-| **Classic screen SOAP** | `screen_submit`, `screen_get`, `screen_record`, `screen_insert_rows`, recipes | Context/wizard/master-detail screens; "as-a-user" command replay | No random-access to a non-first grid row (`set` edits the current row, `delete_row` always hits row 0 — §3); some action tags are silently no-ops |
+| **Classic screen SOAP** | `screen_submit`, `screen_get`, `screen_record`, `screen_insert_rows`, recipes | Context/wizard/master-detail screens; "as-a-user" command replay | Non-first grid row reachable ONLY by setting its exposed KEY field first; a non-key `set` edits the current row (§3); some action tags are silently no-ops |
 | **Modern UI-screen** | `ui_screen_action`, `ui_set_field`, `ui_read_grid`, `ui_update_grid_row`, `ui_get_structure` | Actions the classic plane can't reach; grid-row identity; enum allowed-values; structured errors | Some codebehind-only toolbar actions (Copy/Paste, Insert-From) are shimmed to no-ops |
 | **Classic ASPX callbacks** *(diagnostic-only)* | `diagnose_save_error` | Recovering the REAL validation message behind a failed grid save — both API planes above truncate it to "record raised at least one error" | Screens with no classic `.aspx` page; it replays a real Save (§11) |
 
@@ -78,12 +78,24 @@ instructions; honor it. Pure reads are exempt.
 
 ### Hard limits (platform, not tooling)
 
-- **No random-access to a non-first grid row via classic SOAP.** `{"row":N}` / `{"key":field}` all
-  leave the cursor on row 1 on config master-detail grids. The **modern plane** has per-row GUID
-  identity and is the way to edit an arbitrary existing row.
+- **Row targeting via classic SOAP: possible ONLY by setting the grid's KEY field first
+  (corrected 2026-07-20 — the earlier blanket "no random access" claim was WRONG).** Setting a
+  **key** field DOES select that row: on CS205000 `AttributeDetails`, `set ValueID='BBB'` +
+  `delete_row` deleted **BBB** specifically, twice over (then `CCC`), leaving the other rows —
+  including row 0 — completely untouched (original ValueID *and* description intact, so nothing
+  was edited-in-place). Two hard conditions:
+  1. the key field must be **exposed as a settable field in that container's schema** — where it
+     isn't (`EmployeeBankDetailID` is absent from PY309000's `BankDetails`) there is nothing to
+     select with, and you really are stuck on row 0;
+  2. it must be the **key** — setting a NON-key field never navigates, it edits the current row
+     (see the grid-write semantics below).
+  The **modern plane** (per-row GUID identity) remains the fallback when the key isn't exposed —
+  but it needs `/structure` column metadata, which some grids omit entirely (§11).
 - **Classic grid-write semantics (2026-07-20).** Three rules — note the differing evidence
   strength, rule 1 is far better established than 2–3:
-  1. **`set` on a grid field MODIFIES THE CURRENT ROW — it never navigates/locates.**
+  1. **`set` on a NON-KEY grid field MODIFIES THE CURRENT ROW — it never navigates/locates.**
+     (A **key** field is the exception and DOES select the row — see the row-targeting bullet
+     above; every test below used non-key fields.)
      **Directly observed, cross-module: PY309000 `EmployeeBankDetails` (custom Payroll) AND
      GL301000 `GLTranModuleBatNbr` (stock GL).** On GL301000 the sharp version of the test was
      run: setting `TransactionDescription` to `"Credit line"` — a value lines 2 and 4 *already
@@ -116,12 +128,26 @@ instructions; honor it. Pure reads are exempt.
   deleting row 0 of a 50/50 pair leaves 50 — which the invariant rejects regardless. **Only a
   grid with no cross-row invariant can be characterised at all.**
 
-  **Practical rule: do not assume grid-write semantics transfer between grids.** Rule 1 (`set`
-  edits the current row) held on every grid tested (PY309000, GL301000, CS205000). Rules 2–3 hold
-  on CS205000 and provably not on PY309000's bank grid. Characterise the specific grid you're
-  writing to, and **always read back** — `ok:true` proves nothing. Meta-lesson from this thread:
-  each rule survived until it was tried on a *different* screen, and three separate claims were
-  overturned that way (the selector hint's cause, rule 3, and then rule 3's own generality).
+  **Practical rule: do not assume grid-write semantics transfer between grids.** Rule 1 (a
+  non-key `set` edits the current row) held on every grid tested (PY309000, GL301000, CS205000).
+  Rules 2–3 hold on CS205000 and provably not on PY309000's bank grid. Characterise the specific
+  grid you're writing to, and **always read back** — `ok:true` proves nothing. Meta-lesson from
+  this thread: each rule survived until it was tried on a *different* screen, and four separate
+  claims were overturned that way (the selector hint's cause, rule 3, rule 3's generality, and
+  finally the blanket "no row targeting" limit).
+- **`_verify_deletes` false-positived on every successful targeted delete (found + FIXED
+  2026-07-20, v0.64.11).** The read-back guard flagged a silent no-op whenever the verification
+  Export returned ANY rows — never checking that a returned row actually *carried* the searched
+  value. On CS205000 the classic Export's filter does not discriminate at all: filtering
+  `AttributeDetails.ValueID` for an **existing** value and for a **deleted** one both return the
+  same header-level row with a **blank** detail column. So a delete that genuinely worked came
+  back `ok:false` + "STILL EXISTS". The guard now (a) flags a real no-op only when a returned row
+  carries the value, (b) reports `delete_verified: "unverified"` + a note when rows come back that
+  do NOT carry it (the filter isn't discriminating, so absence proves nothing either) instead of
+  failing the call, and (c) passes only on a genuinely empty read-back. **Lesson: a verification
+  step is itself code that needs verifying — this one had been silently mis-reporting since
+  2026-07-15**, and it only surfaced because a delete that was *known* to have worked was
+  reported as failed.
 
   **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
   **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is

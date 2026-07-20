@@ -2709,7 +2709,18 @@ class ScreenClient:
                                          filters=[{"field": field, "value": value}])
             except Exception:  # noqa: BLE001 — verification must never break a delete
                 continue
-            if back.get("rows"):
+            # Check the returned rows actually CARRY the value we searched for.
+            # Merely non-empty `rows` is NOT evidence the row survived: the classic
+            # Export's filter does not discriminate on every screen — on CS205000
+            # a filter for an EXISTING ValueID and for a DELETED one both return
+            # the same header-level row with a BLANK detail column. Trusting
+            # non-emptiness there reported every successful targeted delete as a
+            # silent no-op (false positive, found live 2026-07-20).
+            rows = back.get("rows") or []
+            leaf = field.rsplit(".", 1)[-1]
+            matched = [r for r in rows
+                       if str(r.get(leaf, "") or "") == str(value)]
+            if matched:
                 result["ok"] = False
                 result["delete_verified"] = False
                 result["error"] = (
@@ -2717,6 +2728,19 @@ class ScreenClient:
                     f"({field} = {value!r}) STILL EXISTS — a classic-SOAP silent "
                     "no-op delete. Use ui_delete_grid_row (modern plane, key-"
                     "addressed) to actually delete it."
+                )
+            elif rows:
+                # Rows came back but NONE carry the searched value — a correctly
+                # filtering Export would return matches or nothing, so its filter
+                # isn't working here and ABSENCE PROVES NOTHING either way. Say so
+                # instead of silently passing (or failing) the delete.
+                result["delete_verified"] = "unverified"
+                result["delete_verify_note"] = (
+                    f"could not verify the delete on {container!r}: the classic "
+                    f"Export filter for {field} = {value!r} returned row(s) that "
+                    "do not carry that value (its filter does not discriminate on "
+                    "this screen), so neither survival nor deletion is proven. "
+                    "Confirm with run_dac_odata."
                 )
             else:
                 result["delete_verified"] = True

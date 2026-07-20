@@ -3202,6 +3202,51 @@ def test_delete_verify_targets_pairs_nearest_preceding_set():
     assert f(cmds2) == [("X", "B", "2")]
 
 
+def _verify_deletes_stub(monkeypatch, export_rows):
+    """A ScreenClient whose export() returns `export_rows`, for _verify_deletes."""
+    c = ScreenClient.__new__(ScreenClient)
+
+    async def fake_export(fields, top=10, filters=None):
+        return {"rows": export_rows}
+
+    c.export = fake_export                                     # type: ignore[assignment]
+    c._container_has_field = lambda container, field: True     # type: ignore[assignment]
+    return c
+
+
+def test_verify_deletes_flags_only_a_row_that_carries_the_value():
+    # A returned row actually carrying the searched value = a REAL silent no-op.
+    c = _verify_deletes_stub(None, [{"ValueID": "BBB"}])
+    cmds = [{"set": "AttributeDetails.ValueID", "to": "BBB"},
+            {"delete_row": "AttributeDetails"}]
+    out = asyncio.run(c._verify_deletes(cmds, {"ok": True}))
+    assert out["ok"] is False
+    assert out["delete_verified"] is False
+    assert "STILL EXISTS" in out["error"]
+
+
+def test_verify_deletes_reports_unverified_when_filter_does_not_discriminate():
+    # Found live on CS205000: the classic Export returns a header-level row with a
+    # BLANK detail column whether the row exists or not, so non-empty `rows` alone
+    # used to report every successful targeted delete as a silent no-op.
+    c = _verify_deletes_stub(None, [{"ValueID": ""}])
+    cmds = [{"set": "AttributeDetails.ValueID", "to": "CCC"},
+            {"delete_row": "AttributeDetails"}]
+    out = asyncio.run(c._verify_deletes(cmds, {"ok": True}))
+    assert out["ok"] is True                       # must NOT fail the delete
+    assert out["delete_verified"] == "unverified"
+    assert "does not discriminate" in out["delete_verify_note"]
+
+
+def test_verify_deletes_passes_when_export_returns_nothing():
+    c = _verify_deletes_stub(None, [])
+    cmds = [{"set": "AttributeDetails.ValueID", "to": "CCC"},
+            {"delete_row": "AttributeDetails"}]
+    out = asyncio.run(c._verify_deletes(cmds, {"ok": True}))
+    assert out["ok"] is True
+    assert out["delete_verified"] is True
+
+
 # ---- v0.61: external audit fixes (2026-07-15 report) ------------------------
 
 # --- #1: session-only add_instance must not bypass the admin gate when it
