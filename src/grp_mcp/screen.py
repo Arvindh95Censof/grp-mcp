@@ -398,33 +398,42 @@ def _lookup_meta(field_state: dict) -> dict | None:
     }
 
 
-# A selector that rejects a value it can't resolve reports "<X> cannot be found
-# in the system" — even when that value demonstrably exists in the target table.
-# The usual cause (proven live on PY309000's EmployeeBankID, whose selector is
-# PXSelector(..., SubstituteKey = CSPYEmployeeBank.name)) is a SubstituteKey: the
-# field accepts the record's DISPLAY name/description, NOT its code or numeric ID.
-# Sending "MBB" (the code) or 1148 (the id) fails; sending the bank's full name
-# resolves. This is invisible from the API — the SubstituteKey lives only in the
-# compiled DAC — so the value_form to send can't be auto-derived for a grid whose
-# /structure omits column metadata. The next best thing is to TELL the caller.
+# A selector that can't resolve a value reports "<X> cannot be found in the
+# system". That single message covers TWO distinct causes, and the tool cannot
+# tell them apart from the text alone — so the hint names both, commonest first:
+#   (1) the value genuinely does not exist in the lookup's target table (proven
+#       live on GL301000: account "ZZZ999" -> "'Account' cannot be found");
+#   (2) the value DOES exist but was sent in the wrong FORM — a SubstituteKey
+#       selector accepts the record's DISPLAY name/description, not its code or
+#       numeric id (proven live on PY309000's EmployeeBankID, whose selector is
+#       PXSelector(..., SubstituteKey = CSPYEmployeeBank.name): "MBB" and 1148
+#       both fail, the bank's full name resolves and commits).
+# Cause (2) is invisible from every runtime API — the SubstituteKey lives only in
+# the compiled DAC — so the right value form can't be auto-derived for a grid
+# whose /structure omits column metadata. The next best thing is to TELL the
+# caller. An earlier version of this hint led with (2) alone, which mis-diagnosed
+# the far commoner (1) — caught by cross-screen testing on GL301000.
 _SELECTOR_NOT_FOUND_RE = re.compile(r"cannot be found in the system", re.IGNORECASE)
 
 
 def _selector_value_hint(message: str | None) -> str | None:
     """If `message` is a selector rejecting an unresolvable value ('<X> cannot be
-    found in the system'), return actionable guidance that the field may be a
-    SubstituteKey selector expecting the display name/description (not the code or
-    id); None otherwise. Pure/unit-testable — used to annotate write-tool errors."""
+    found in the system'), return actionable guidance covering BOTH causes — the
+    value not existing, and the SubstituteKey wrong-value-form gotcha; None
+    otherwise. Pure/unit-testable — used to annotate write-tool errors."""
     if message and _SELECTOR_NOT_FOUND_RE.search(message):
         return (
-            "this looks like a selector that couldn't resolve the value you sent. "
-            "Many selectors use a SubstituteKey — they accept the target record's "
-            "DISPLAY name/description, NOT its code or numeric id (proven live: "
-            "PY309000 'Employee Bank' rejects the code 'MBB' and the id 1148 but "
-            "accepts the bank's full name). To find the right value: read the "
-            "field's lookup.value_field from ui_get_structure and send THAT "
-            "column; if the grid exposes no column metadata, query the lookup's "
-            "target table with run_dac_odata and send its name/description value."
+            "the selector could not resolve the value you sent. Two common "
+            "causes: (1) the value does not exist in the lookup's target table — "
+            "verify it with run_dac_odata; (2) it DOES exist but you sent the "
+            "wrong form — many selectors use a SubstituteKey and accept the "
+            "target record's DISPLAY name/description, NOT its code or numeric "
+            "id (proven live: PY309000 'Employee Bank' rejects the code 'MBB' "
+            "and the id 1148 but accepts the bank's full name). To find the "
+            "right value: read the field's lookup.value_field from "
+            "ui_get_structure and send THAT column; if the grid exposes no "
+            "column metadata, query the lookup's target table with "
+            "run_dac_odata and send its name/description value."
         )
     return None
 

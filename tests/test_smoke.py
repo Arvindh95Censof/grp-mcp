@@ -1292,8 +1292,13 @@ def test_selector_value_hint_matches_cannot_be_found():
     from grp_mcp.screen import _selector_value_hint
     hint = _selector_value_hint("'Employee Bank' cannot be found in the system.")
     assert hint is not None
-    assert "SubstituteKey" in hint
-    assert "value_field" in hint
+    # Must name BOTH causes — an earlier version led with SubstituteKey alone,
+    # which mis-diagnosed the commoner "value simply doesn't exist" case
+    # (caught by cross-screen testing: GL301000 account "ZZZ999").
+    assert "does not exist" in hint          # cause 1, listed first
+    assert "SubstituteKey" in hint           # cause 2
+    assert "value_field" in hint             # how to find the right value
+    assert hint.index("does not exist") < hint.index("SubstituteKey")
     # case-insensitive
     assert _selector_value_hint("X CANNOT BE FOUND IN THE SYSTEM") is not None
 

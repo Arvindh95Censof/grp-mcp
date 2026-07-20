@@ -678,8 +678,17 @@ aggregated `Search4<…GroupBy>` selector, no SubstituteKey — not retested wit
 API (it lives only in the compiled DAC), grp-mcp can't auto-translate the value for a
 metadata-blind grid — but it now DETECTS the "cannot be found in the system" error and attaches an
 actionable `hint`/`selector_hint` to the result of `screen_submit` (per-field-error `hint`) and
-`diagnose_save_error` (`selector_hint`), telling the caller to send the name/description. Pure
-helper `_selector_value_hint` in `screen.py`. (An auto-translate for *exposed* selectors was
+`diagnose_save_error` (`selector_hint`). Pure helper `_selector_value_hint` in `screen.py`.
+**The message names BOTH causes of that error, commonest first** — (1) the value genuinely does
+not exist in the target table, (2) it exists but was sent in the wrong FORM (SubstituteKey). The
+tool cannot distinguish them from the error text alone, so it must not assert either. v0.64.9
+led with (2) alone and thereby mis-diagnosed (1); **cross-screen testing on GL301000 caught it**
+(a genuinely nonexistent account `ZZZ999` → `"'Account' cannot be found in the system"` got a
+confident SubstituteKey explanation that was simply wrong). Fixed in v0.64.10 — a reminder that
+validating a heuristic on the ONE screen that inspired it will confirm the happy path and miss
+the mis-fire. Cross-screen validation also proved the hint reaches errors via all three channels:
+on PY309000 it arrived in `alert`, on GL301000 only in `cell_errors`/`rows_error_text` (the alert
+was the generic "raised at least one error") — which is why the check scans all of them. (An auto-translate for *exposed* selectors was
 considered and deferred: it only helps selectors whose `/structure` metadata is present — which
 mostly already work via `value_field` — and it's gated on verifying whether `value_field` reports
 the substitute key vs. the display code when they differ, which wasn't confirmable on an exposed
