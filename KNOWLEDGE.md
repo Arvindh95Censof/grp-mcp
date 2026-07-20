@@ -638,6 +638,37 @@ since insert in particular can still reach validation a read/update can't. Verif
 `run_dac_odata` either way; revert any accidental real persist immediately (this was tested live,
 reverted, and re-verified — see the ASPX protocol memory for the exact repro/revert).
 
+**`replay_grid_save`'s `operation="insert"` always targets `Row i="0"` — unreliable on a
+non-empty grid (external bug report, PY309000/EmployeeBankDetails, 2026-07-20, reproduced
+independently).** The insert-path RowChanges XML hardcodes `i="0"` regardless of how many rows
+already exist in the live grid — there's no row-count-aware indexing. On a grid that already has
+≥1 row, this can collide with an existing row instead of landing on a genuinely new one.
+**Confirmed live**: the IDENTICAL insert request (same screen, grid, values) returned DIFFERENT
+error text across repeat calls in the same session — `"'Employee Bank' cannot be found in the
+system"` once, `"'Employee Bank' cannot be empty"` the next, on the exact same valid input — real
+business validation of unchanged data would never do this, which is itself the strongest evidence
+of state corruption, independent of the report's own (plausible but not 100%-confirmed) fabricated
+-uniqueness-error hypothesis. Root-caused to the exact line in `aspx.py`, but the *correct* new-row
+index convention Acumatica's classic grid protocol expects (next free index? negative/temp key?)
+is not confirmed, so rather than guess at an unverified fix, `replay_grid_save` now attaches an
+honest `note` to any insert result that returns error text: treat it as **unreliable** on a
+non-empty grid, verify independently via `run_dac_odata`, or retest against a genuinely empty grid
+if available. Same discipline as `possibly_saved`'s uncertainty note — flag what's not known rather
+than present a fabricated-looking error as confirmed validation.
+
+**The same report also surfaced (not grp-mcp bugs, documented for reference):** (1) PY309000's
+`EmployeeBankID`/`TptEmployeeBankID`/`SchemeCD` selectors return a generic "cannot be found in the
+system" on BOTH classic SOAP and the ASPX diagnostic plane even for confirmed-valid values (e.g.
+`EmployeeBankID` CD `MBB`, verified to exist via `run_dac_odata` on `CSPYEmployeeBank`) — an
+Acumatica/customization-side `PXSelector` wiring gap, not something grp-mcp's client code can work
+around. (2) `ui_get_structure`'s `grids` section returns ONLY the key field for every grid on
+PY309000 (`EmployeeBankDetails`, `EmploymentHistories`, `EmpPayTransactions`,
+`EmployeeProjects`, `EmployeeInstitutions`, `EmployeeCashAward` — checked all six, all show
+`columns: [<key field only>]`) — confirmed this is grp-mcp faithfully parsing whatever Acumatica's
+own `/structure` response contains (`screen.py` does `cd.get("columns")` with no filtering), so
+the gap is server-side, not a grp-mcp extraction bug. Whether this is PY309000-specific or a
+broader custom-PY-module pattern is unconfirmed — not swept.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

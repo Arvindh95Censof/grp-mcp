@@ -414,6 +414,33 @@ class AspxDiagnostic:
             "possibly_saved": saved,
             "response_len": len(body),
         }
+        if operation == "insert" and (alert or any(errs.values())):
+            # Row i="0" is hardcoded for EVERY insert regardless of how many
+            # rows already exist in the live grid (see the RowChanges XML
+            # built above) — on a grid that already has >=1 row, a genuine
+            # insert can COLLIDE with an existing row instead of landing on
+            # a new one. Confirmed live on PY309000/EmployeeBankDetails
+            # (external bug report 2026-07-20, reproduced independently):
+            # the IDENTICAL insert request (same screen/grid/values) returned
+            # DIFFERENT error text across repeat calls in the same session —
+            # "cannot be found" once, "cannot be empty" the next — which real
+            # business validation of unchanged input would never do. The
+            # report's own hypothesis (a fabricated uniqueness error from
+            # colliding with the existing row) is plausible but NOT the only
+            # symptom observed; treat ANY error text from an insert as
+            # potentially describing a collision with an existing row rather
+            # than the new data, not confirmed business validation.
+            out["note"] = (
+                "operation=\"insert\" always targets Row i=\"0\" — there is no "
+                "row-count-aware indexing for inserts yet, so on a grid that "
+                "already has at least one row this can collide with that "
+                "existing row instead of a genuinely new one. Confirmed live: "
+                "the identical insert request returned DIFFERENT error text "
+                "across repeat calls with no change in input, which real "
+                "validation of the same data would not do. Treat this error "
+                "as UNRELIABLE for insert on a non-empty grid — verify "
+                "independently via run_dac_odata, or retest against a "
+                "genuinely empty grid if one is available.")
         if not alert and not any(errs.values()) and ds.get("isDirty"):
             # Dirty graph + zero error text = the RowChanges never BOUND, so
             # validation never fired (proven live on GL202500: both insert and

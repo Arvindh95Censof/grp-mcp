@@ -274,6 +274,25 @@ def test_replay_grid_save_no_note_when_error_present():
     assert "note" not in result
 
 
+def test_replay_grid_save_insert_with_error_gets_row_collision_note():
+    # operation="insert" always emits Row i="0" regardless of live row count
+    # (external bug report 2026-07-20, reproduced independently on
+    # PY309000/EmployeeBankDetails: the IDENTICAL insert request returned
+    # DIFFERENT error text across repeat calls). The tool must flag insert
+    # error text as unreliable on a non-empty grid rather than present it as
+    # confirmed business validation — update operations must NOT get this
+    # note (see test_replay_grid_save_no_note_when_error_present above).
+    body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+    d = _diag_stub(_GL301000_GRID_JS, body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50}, operation="insert"))
+    assert result["alert"] == "Boom"
+    assert "Row i=" in result["note"]
+    assert "UNRELIABLE" in result["note"]
+
+
 # ---- replay_grid_save: unconfirmed "clean" no-op (GL301000, live re-probe) --
 #
 # 2026-07-19: re-verifying with a fresh session found the earlier "GL301000
