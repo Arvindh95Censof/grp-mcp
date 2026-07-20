@@ -100,17 +100,28 @@ instructions; honor it. Pure reads are exempt.
      created. An earlier version of this section asserted the opposite, inferred from a PY309000
      save rejection; that inference was **wrong**.
 
-  **Why the PY309000 inference misled, and what's still open.** Rules 2–3 were originally deduced
-  from *which saves got rejected* on PY309000's `EmployeeBankDetails`, never from watching a
-  delete land. With rule 3 corrected, that screen's attempt-2 rejection is no longer explained:
-  delete row 0 (CIMB) → edit the survivor to CIMB/100% should have summed to 100 and COMMITTED,
-  but it was rejected on the sum rule. The likeliest reading is the **known per-grid silent-no-op
-  delete** (`_verify_deletes` exists precisely because classic `DeleteRow` can return ok while the
-  row survives — reproduced on GL202500, fine on CA203000): if the delete no-op'd, the sets edited
-  CIMB and MBB stayed, giving 150 → rejected. **So `delete_row` is NOT uniform across grids** —
-  it deleted row 0 reliably on CS205000 but may silently no-op elsewhere. Always read back.
-  Lesson: a rule inferred from failure *outcomes* can fit several mechanisms; only a grid where
-  the operation can PERSIST and be read back actually distinguishes them.
+  **CRITICAL: rules 2–3 are PER-GRID and do NOT generalize.** They were re-tested back on
+  PY309000's `EmployeeBankDetails` by rebuilding a 50/50 two-row setup and replaying the exact
+  sequence CS205000 semantics say must COMMIT (delete row 0 → sets edit the survivor → one row at
+  100%). It was **reproducibly REJECTED** on the sum rule. So `EmployeeBankDetails` demonstrably
+  does NOT behave like `AttributeDetails`, and CS205000's result cannot be treated as the
+  platform-wide truth.
+
+  **The PY309000 mechanism is UNDETERMINED — two candidates fit equally and cannot be separated
+  on that grid:** (a) `delete_row` silently no-ops (the known per-grid quirk `_verify_deletes`
+  exists for — classic `DeleteRow` can return ok while the row survives; reproduced GL202500,
+  fine CA203000), so the sets edit CIMB → 100+50 = 150 → reject; or (b) the delete fires but
+  sets-after-delete start a NEW row here (the old rule 3), giving survivor 50 + new 100 = 150 →
+  reject. Both yield exactly 150. An isolated delete test can't separate them either, because
+  deleting row 0 of a 50/50 pair leaves 50 — which the invariant rejects regardless. **Only a
+  grid with no cross-row invariant can be characterised at all.**
+
+  **Practical rule: do not assume grid-write semantics transfer between grids.** Rule 1 (`set`
+  edits the current row) held on every grid tested (PY309000, GL301000, CS205000). Rules 2–3 hold
+  on CS205000 and provably not on PY309000's bank grid. Characterise the specific grid you're
+  writing to, and **always read back** — `ok:true` proves nothing. Meta-lesson from this thread:
+  each rule survived until it was tried on a *different* screen, and three separate claims were
+  overturned that way (the selector hint's cause, rule 3, and then rule 3's own generality).
 
   **The only reliable write pattern is `new_row` + sets** (also the one the forward insert used).
   **Consequence: you cannot delete a specific non-first row on this plane.** If the grid's key is
