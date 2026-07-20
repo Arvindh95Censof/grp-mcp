@@ -1,6 +1,6 @@
 # grp-mcp — Complete Installation & Setup Guide
 
-**Version 0.52.6 · Acumatica ERP MCP Server**
+**Version 0.64.7 · Acumatica ERP MCP Server**
 
 This guide takes a **fresh Windows, macOS, or Linux PC** from nothing installed to a
 working grp-mcp connection inside Claude. It covers every dependency, every credential,
@@ -226,6 +226,20 @@ It writes a `connections.json` file. **Note the full path it saved to** — you 
 Section 9. The page never returns your secret/password to the browser once saved (only whether
 one is set). Stop the command with `Ctrl+C` when done.
 
+> **Gotcha:** without `GRP_MCP_CONNECTIONS` set, `grp-mcp-ui` writes to `connections.json` in
+> whatever folder you happened to launch it from (its **current working directory**) — not a
+> fixed location. Launching it from an unexpected folder (a fresh terminal often defaults
+> somewhere unrelated to your project) silently creates/edits the wrong file, and Claude never
+> sees the change. Set `GRP_MCP_CONNECTIONS` to a fixed path *before* running the UI to avoid
+> this entirely (see Section 9's `-e GRP_MCP_CONNECTIONS=...` — use the same path both places).
+
+**Easier: double-click `Edit-Connections.bat`** (in this repo, next to this guide) instead of
+typing the command above. It pins `GRP_MCP_CONNECTIONS` to the `connections.json` sitting next
+to the script itself — immune to the working-directory gotcha above — checks `uvx` is installed,
+launches the config server in its own window, and opens the browser for you automatically. Keep
+the script and `connections.json` together in the same permanent folder (e.g. `C:\grp-mcp\`),
+and use that same folder's path in Section 9's registration command.
+
 ### 7.2 Option B — write `connections.json` by hand
 
 Create a file anywhere (e.g. `C:\grp-mcp\connections.json`):
@@ -400,7 +414,7 @@ If it fails, the error says whether it's a **credentials** problem (recheck Sect
 
 With the `uvx` install path there is **nothing to do** — `uvx` resolves the latest published
 version of `grp-mcp` from PyPI on each run. To force a specific version, pin it in the launch
-command (e.g. `uvx grp-mcp==0.52.6`). After any upgrade, **fully restart Claude** so the host
+command (e.g. `uvx grp-mcp==0.64.7`). After any upgrade, **fully restart Claude** so the host
 reloads the server. See the release history at
 **https://github.com/Arvindh95Censof/grp-mcp/releases** (and the package page,
 **https://pypi.org/project/grp-mcp/**).
@@ -496,4 +510,4 @@ claude mcp add grp-mcp -s user -e GRP_MCP_CONNECTIONS="C:\path\to\connections.js
 
 ---
 
-*grp-mcp v0.52.6 · PyPI: https://pypi.org/project/grp-mcp/ · Source: https://github.com/Arvindh95Censof/grp-mcp*
+*grp-mcp v0.64.7 · PyPI: https://pypi.org/project/grp-mcp/ · Source: https://github.com/Arvindh95Censof/grp-mcp*
