@@ -898,27 +898,42 @@ and each op gets its own verdict in `verifications` (`save_verified` true|false|
 one set of helpers (`_preflight_op`, `_cells_xml`, `_read_save_response`, `_verify_one_op`) so they
 validate and verify identically — the refactor is behaviour-preserving (all prior tests still pass).
 
-**Evidence — each leg tested LIVE (csmdev, 2026-07-20), the PASS case proven by COMPOSITION not yet
-end-to-end:**
-- **Test A (mechanism, direct):** throwaway CS205000 `ZZBATCH`, 3 rows. One batch = `<Deleted>`(BBB)
-  + `<Modified>`(CCC.Description). Result `all_verified:true`, rows 3→2; **`run_dac_odata` confirmed
-  BBB gone AND CCC changed** — both sections committed atomically from one Save. So the server
-  accepts a multi-section envelope and applies every section (this was the one real unknown —
-  "untested whether the server accepts it").
-- **Test B1 (invariant validates NET state, direct):** on the real PY309000 bank grid, a batch
-  updating EMP001's only row 100→50 → `alert:"Percent should be 100 for sum of all banks"`,
-  `possibly_saved:false`; `run_dac_odata` confirmed the row **unchanged** (still 100). Decisive
-  detail: the server reported the sum as **50** — i.e. it validated the MODIFIED value, so the
-  invariant is checked against the **net post-batch state**, not the pre-state. And the batch path
-  surfaced the real rule rather than a silent no-op.
-- **Delete+rebalance PASS = A ∘ B1, not yet run end-to-end.** A shows all sections apply to one
-  working set before commit; B1 shows the invariant validates that net state. So a `<Deleted>`(row)
-  + `<Modified>`(survivor→100) nets to 100 and passes. Each leg is directly observed; the
-  *combination* (a Deleted + a Modified on an invariant grid netting to 100) has not been run
-  directly, because it needs a 2-row setup that mutates a real employee's bank config (adds a row →
-  burns an identity value, needs the SubstituteKey selector). Flagged for the user to approve rather
-  than done unprompted. **Stated honestly so the composition isn't mistaken for a direct test** —
-  the recurring lesson of this whole investigation.
+**Evidence — all tested LIVE (csmdev, 2026-07-20), delete+rebalance PASS now proven END-TO-END:**
+- **Test A (mechanism):** throwaway CS205000 `ZZBATCH`, 3 rows. One batch = `<Deleted>`(BBB) +
+  `<Modified>`(CCC.Description). `all_verified:true`, rows 3→2; **`run_dac_odata` confirmed BBB gone
+  AND CCC changed** — both sections committed atomically from one Save. The one real unknown
+  ("untested whether the server accepts a multi-section envelope") is closed.
+- **Test B1 (invariant validates NET state):** real PY309000 bank grid, batch updating EMP001's only
+  row 100→50 → `alert:"Percent should be 100 for sum of all banks"`, `possibly_saved:false`;
+  `run_dac_odata` confirmed the row **unchanged**. Decisive: the server reported the sum as **50**,
+  i.e. it validated the MODIFIED value — the invariant is checked against the **net post-batch
+  state**, and the batch path surfaced the real rule rather than a silent no-op.
+- **Test B2 (delete+rebalance PASS, END-TO-END):** on the real PY309000 bank grid, a batch of TWO
+  `<Deleted>` + one `<Modified>` (delete two rows, set the survivor to 100) netting to 100 committed
+  atomically; **`run_dac_odata` confirmed** EMP001 left with exactly one row at 100. So a
+  delete-and-rebalance that a standalone delete cannot do (invariant would reject) PASSES as one
+  batch — the whole reason this tool exists, now directly observed, not just composed.
+
+**Three things that setting B2 up TAUGHT (all live, all now documented):**
+1. **`screen_submit` corrupted the grid during setup — do NOT use the classic SOAP plane to build a
+   multi-row split.** One `new_row` plus an edit-existing-row in a single `screen_submit` produced
+   a PHANTOM third row (bank data I never sent) and left the grid summing **200%**, all under
+   `ok:true`. This is the documented "phantom artifact rows / values cross" hazard (§3) AND a new
+   finding: **the percent-sum invariant did NOT fire on the SOAP plane** (200% persisted) even
+   though it fires on the ASPX plane (B1). Different planes, different validation paths — the SOAP
+   plane is NOT a safe way to write this grid. The cleanup itself (delete both extras + rebalance
+   in one `aspx_grid_batch`) is what became Test B2.
+2. **`aspx_grid_batch`/`aspx_delete_grid_row` read-back is INERT on PY309000 child grids.** The
+   grid Refresh returns the COLUMNS but **no `<Row>` elements at all** (captured: an 866-byte body,
+   `EmployeeBankDetails` columns present, zero rows — the child grid's data never materializes in
+   the Refresh, consistent with `/structure` also omitting its columns). So `rows_before`/`after`
+   are empty → the row_key pre-flight is SKIPPED and every post-Save verdict is `"unverified"`.
+   The WRITE still works (RowChanges match by key cells server-side, DB-confirmed), but on the exact
+   grid this plane exists for, **`run_dac_odata` is the ONLY check**. v0.64.16 surfaces this loudly:
+   when a keyed op runs on a columns-but-no-rows grid the result carries `grid_rows_readable:false`
+   + a `guard_note` saying both guards were inert — so silence never reads as "checked and fine".
+3. **The ASPX navigate can fail transiently** ("record did not load — no header dataKey"); the
+   identical call succeeded on retry. Worth one retry before concluding a key is wrong.
 
 Caveat carried in the tool: verifying an INSERT inside a batch that also deletes is unreliable
 (insert is checked by row-count growth, which the concurrent delete masks) → that op returns

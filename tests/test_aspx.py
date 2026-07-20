@@ -827,3 +827,64 @@ def test_batch_insert_alongside_delete_is_unverified():
     ins = next(v for v in r["verifications"] if v["operation"] == "insert")
     assert ins["save_verified"] == "unverified"
     assert "row-count" in ins["verify_note"]
+
+
+# ---- columns-but-no-rows grids (PY309000 child grids): guards go inert -------
+# A verbatim-shaped PY309000 EmployeeBankDetails Refresh: Props carry the
+# columns, but there is NO <Rows>/<Row> element at all (the child grid's data
+# never materializes in the Refresh — captured live 2026-07-20, body ~866B).
+_PY309_REFRESH_NO_ROWS = (
+    '0|<ctl00_phG_grid><ctl00_phG_grid><![CDATA[<ctl00_phG_grid Props="'
+    '{&quot;dataMember&quot;:&quot;EmployeeBankDetails&quot;,&quot;levels&quot;:'
+    '[{&quot;columns&quot;:[{&quot;dataField&quot;:&quot;EmployeeBankID&quot;},'
+    '{&quot;dataField&quot;:&quot;AccountNo&quot;},'
+    '{&quot;dataField&quot;:&quot;Percent&quot;},'
+    '{&quot;dataField&quot;:&quot;EmployeeBankDetailID&quot;}]}]}"/>'
+    ']]></ctl00_phG_grid></ctl00_phG_grid>')
+
+
+def test_grid_rows_empty_but_columns_present():
+    # the exact PY309000 shape: columns parse, rows do not (there are none)
+    assert _grid_column_slots(_PY309_REFRESH_NO_ROWS) == [
+        "EmployeeBankID", "AccountNo", "Percent", "EmployeeBankDetailID"]
+    assert _grid_rows(_PY309_REFRESH_NO_ROWS, "ctl00_phG_grid") == []
+
+
+def _norows_diag(save_body=_CLEAN_SAVE):
+    """Stub whose grid Refresh returns columns but ZERO rows (PY309000 shape)."""
+    d = _diag_with_html(
+        'var _ctl00_phG_grid = {"dataMember":"EmployeeBankDetails",'
+        '"levels":[{"columns":[]}]};')
+    bodies = iter([_PY309_REFRESH_NO_ROWS, save_body, _PY309_REFRESH_NO_ROWS])
+
+    async def fake_callback(cbid, cbparam, **kw):
+        return next(bodies)
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    return d
+
+
+def test_single_delete_flags_guards_inert_when_rows_unreadable():
+    d = _norows_diag()
+    r = asyncio.run(d.replay_grid_save(
+        "EmployeeBankDetails", {}, row_key={"EmployeeBankDetailID": 14552},
+        operation="delete"))
+    # not refused (no rows to match against), Save sent, but flagged honestly
+    assert "refused" not in r
+    assert r["grid_rows_readable"] is False
+    assert "run_dac_odata is the ONLY authority" in r["guard_note"]
+    # verification cannot confirm either
+    assert r["save_verified"] == "unverified"
+
+
+def test_batch_flags_guards_inert_when_rows_unreadable():
+    d = _norows_diag()
+    r = asyncio.run(d.replay_grid_batch("EmployeeBankDetails", [
+        {"operation": "delete", "row_key": {"EmployeeBankDetailID": 14553}},
+        {"operation": "update", "row_key": {"EmployeeBankDetailID": 14552},
+         "cells": {"Percent": 100}},
+    ]))
+    assert r["grid_rows_readable"] is False
+    assert "pre-flight was SKIPPED" in r["guard_note"]
+    assert r["all_verified"] is False
+    assert all(v["save_verified"] == "unverified" for v in r["verifications"])

@@ -668,6 +668,17 @@ class AspxDiagnostic:
         out = _read_save_response(body)
         if "server_error" in out:
             return out  # codebehind crashed before validation — never guess saved
+        # Columns-but-no-rows grid (PY309000 child grids): a keyed op could not be
+        # pre-flighted and cannot be verified — say so, don't let silence read as
+        # "checked and fine". run_dac_odata is the only authority there.
+        if row_key and columns and not rows_before:
+            out["grid_rows_readable"] = False
+            out["guard_note"] = (
+                "this grid returned COLUMNS but NO ROWS to the Refresh (seen on "
+                "PY309000 child grids), so the row_key pre-flight was SKIPPED and "
+                "this result cannot be verified from the grid. The Save was still "
+                "sent (RowChanges match by key cells server-side). run_dac_odata "
+                "is the ONLY authority here.")
         alert = out["alert"]
         any_err = any([out["rows_error_text"], out["row_errors"], out["cell_errors"]])
         saved = out["possibly_saved"]
@@ -806,6 +817,19 @@ class AspxDiagnostic:
             self._activate_tab(tab_ctl, tab_idx)
         columns, rows_before = await self._grid_snapshot(grid_ctl)
 
+        # Some grids return their COLUMNS to the Refresh but no ROWS (proven live
+        # on PY309000 EmployeeBankDetails — the child grid's data never
+        # materializes in the Refresh, so rows_before is empty even when the DB
+        # has rows). On such a grid BOTH guards are inert: _preflight_op can't
+        # match a key it can't see, and the post-Save read-back can't verify.
+        # The Save itself still works (RowChanges match server-side by key
+        # cells), but the caller must be told the automated checks did nothing
+        # and run_dac_odata is the ONLY authority. columns-but-no-rows is
+        # distinguishable from an empty grid ONLY in that columns came back, so
+        # this fires whenever a keyed op is present yet no rows were readable.
+        keyed = any(op.get("row_key") for op in operations)
+        rows_unreadable = keyed and columns and not rows_before
+
         # Pre-flight every op against the SAME snapshot; refuse the whole batch if
         # any fails (an atomic Save that would half-apply is worse than not sent).
         refusals = []
@@ -842,6 +866,14 @@ class AspxDiagnostic:
                                   "operations": len(operations), **out}
         if "server_error" in out:
             return result
+        if rows_unreadable:
+            result["grid_rows_readable"] = False
+            result["guard_note"] = (
+                "this grid returned COLUMNS but NO ROWS to the Refresh (seen on "
+                "PY309000 child grids), so the row_key pre-flight was SKIPPED and "
+                "the post-Save verdicts below are 'unverified' — neither guard "
+                "could run. The Save was still sent (RowChanges match by key "
+                "cells server-side). run_dac_odata is the ONLY authority here.")
         _hint = _selector_value_hint(" ".join(filter(None, [
             out["alert"], *out["rows_error_text"], *out["row_errors"],
             *out["cell_errors"]])))
