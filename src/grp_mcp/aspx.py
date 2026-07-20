@@ -91,6 +91,94 @@ def _parse_control_blocks(body: str) -> dict[str, dict]:
     return out
 
 
+def _grid_column_slots(body: str) -> list[str | None]:
+    """The grid's columns as POSITIONAL slots, `None` for a framework cell.
+
+    A grid callback's Props JSON carries `levels[0].columns` as an array in
+    which the leading entries are bare `{}` — the row's file and note indicator
+    cells, which have no dataField but DO occupy a `<Cell>` position. Captured
+    live (CS205000/AttributeDetails): 7 columns = 2 empty + ValueID,
+    Description, SortOrder, Disabled, AttributeID, and each `<Row>` echoes
+    exactly 7 `<Cell>`s in that same order. Preserving the empties is what makes
+    cell->field alignment exact rather than an end-offset guess.
+
+    Note a column can be `"visible":0` and still be a real, present cell
+    (AttributeID above) — invisible on screen, still addressable here.
+
+    Props is entity-escaped inside the CDATA (`&quot;`) while the `<Rows>` XML
+    beside it is literal, so this unescapes before parsing while _grid_rows
+    must NOT. Bracket-matched rather than regexed: the array nests objects.
+    """
+    plain = unescape(body)
+    i = plain.find('"columns":[')
+    if i < 0:
+        return []
+    start = i + len('"columns":')
+    depth = 0
+    for j in range(start, len(plain)):
+        if plain[j] == "[":
+            depth += 1
+        elif plain[j] == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    cols = json.loads(plain[start:j + 1])
+                except Exception:  # noqa: BLE001 — malformed Props; caller degrades
+                    return []
+                return [(c.get("dataField") if isinstance(c, dict) else None) or None
+                        for c in cols]
+    return []
+
+
+def _grid_rows(body: str, grid_ctl: str) -> list[dict[str, str]]:
+    """Every row of the grid as {dataField: value}, from a Refresh/Save echo.
+
+    This is the read-back the ASPX plane previously had NO way to do: it lets a
+    write be verified against the grid's own post-save state without knowing the
+    DAC name, which matters because the grids that need this plane are exactly
+    the ones the other planes cannot see (PY309000's key is absent from both the
+    SOAP container and /structure).
+
+    Values are unescaped INDIVIDUALLY — the `<Cell>` XML is literal in the raw
+    body, so unescaping the whole payload first would corrupt a value containing
+    a quote into an attribute delimiter. Framework cells are dropped.
+    Returns [] if the block/rows are absent (a grid with no rows, or a failed
+    Refresh) — an EMPTY LIST AND "COULD NOT PARSE" ARE NOT DISTINGUISHED here,
+    so callers must not read absence as proof of deletion on its own.
+    """
+    slots = _grid_column_slots(body)
+    if not slots:
+        return []
+    m = re.search(rf'<{re.escape(grid_ctl)}[^>]*>(.*?)</{re.escape(grid_ctl)}>',
+                  body, re.S)
+    region = m.group(1) if m else body
+    out: list[dict[str, str]] = []
+    for rm in re.finditer(r'<Row i="\d+"[^>]*>(.*?)</Row>', region, re.S):
+        cells = re.findall(r'<Cell ([^/>]*)/>', rm.group(1))
+        if len(cells) != len(slots):
+            # Alignment is positional; a length mismatch means the assumption
+            # broke (different level, or a shape not seen live). Skip the row
+            # rather than emit fields mapped to the wrong values.
+            continue
+        row: dict[str, str] = {}
+        for field, attrs in zip(slots, cells):
+            if not field:
+                continue
+            vm = re.search(r'Value="([^"]*)"', attrs)
+            if vm:
+                row[field] = unescape(vm.group(1))
+        if row:
+            out.append(row)
+    return out
+
+
+def _row_matches(row: dict[str, str], key: dict[str, Any]) -> bool:
+    """Does `row` carry every cell of `key`? Compared as STRINGS — the grid
+    echoes everything as text, so an int key from run_dac_odata (14551) must
+    match the cell "14551"."""
+    return all(str(row.get(k, "\0")) == str(v) for k, v in key.items())
+
+
 def _row0_readonly_fields(body: str, grid_ctl: str, columns: list[str]) -> list[str]:
     """Which of `columns` are ReadOnly="True" on row 0's OWN echo in a Save
     response — a REAL, confirmed cause of a silent no-op (an existing line's
@@ -297,6 +385,29 @@ class AspxDiagnostic:
             f'<PXBoundPanel PageCount="0" PageIndex="0" SelectedIndex="{index}">'
             f'<Items/></PXBoundPanel>', safe="")
 
+    async def _grid_refresh(self, grid_ctl: str) -> str:
+        """Raw body of a targeted grid Refresh callback ("" if it fails).
+
+        Split out from _grid_columns because the SAME response also carries every
+        row (see _grid_rows) — the callers that need a read-back would otherwise
+        pay for a second identical round trip to get data they already fetched.
+        """
+        cb_target = grid_ctl.replace("_", "$")
+        try:
+            return await self._callback(
+                cb_target,
+                f'Refresh|<{grid_ctl} LoadedLevel="-1"><![CDATA[]]></{grid_ctl}>')
+        except ScreenError:
+            return ""
+
+    async def _grid_snapshot(self, grid_ctl: str) -> tuple[list[str], list[dict[str, str]]]:
+        """(columns, rows) from ONE Refresh — the grid's current state."""
+        body = await self._grid_refresh(grid_ctl)
+        if not body:
+            return [], []
+        return ([c for c in _grid_column_slots(body) if c],
+                _grid_rows(body, grid_ctl))
+
     async def _grid_columns(self, grid_ctl: str) -> list[str]:
         """The grid's authoritative column dataFields, from a targeted Refresh
         callback. This is load-bearing twice over (both proven live, GL301000):
@@ -309,12 +420,8 @@ class AspxDiagnostic:
         silently no-ops). Present even when the grid returns ZERO rows
         (PY309000). Empty list if the Refresh itself fails — caller then skips
         validation rather than blocking the diagnosis."""
-        cb_target = grid_ctl.replace("_", "$")
-        try:
-            body = await self._callback(
-                cb_target,
-                f'Refresh|<{grid_ctl} LoadedLevel="-1"><![CDATA[]]></{grid_ctl}>')
-        except ScreenError:
+        body = await self._grid_refresh(grid_ctl)
+        if not body:
             return []
         return list(dict.fromkeys(
             re.findall(r'"dataField":"([A-Za-z0-9_]+)"', unescape(body))))
@@ -371,7 +478,7 @@ class AspxDiagnostic:
         if tab_ctl is not None:
             self._activate_tab(tab_ctl, tab_idx)
 
-        columns = await self._grid_columns(grid_ctl)
+        columns, rows_before = await self._grid_snapshot(grid_ctl)
         if columns:
             colset = set(columns)
             unknown = [f for f in list(cells) + list(row_key or {})
@@ -396,6 +503,45 @@ class AspxDiagnostic:
                     "possibly_saved": False,
                 }
 
+        # PRE-FLIGHT the row_key against the grid's ACTUAL rows. A key that
+        # matches nothing is the documented footgun this plane's delete has:
+        # the server matches no row, changes nothing, and still answers
+        # `possibly_saved: true` with no error (proven live on CS205000 — the
+        # composite key's `ValueID` alone silently no-op'd). Now that the rows
+        # are in hand, that is detectable BEFORE the write instead of only by a
+        # DB read-back afterwards. A key matching MANY rows is refused too: it
+        # is a partial key by definition, and which row the server picks is not
+        # something to find out by deleting one.
+        if row_key and rows_before:
+            hits = [r for r in rows_before if _row_matches(r, row_key)]
+            if not hits:
+                return {
+                    "refused": (
+                        f"row_key {row_key} matches NO row in this grid — the "
+                        f"server would match nothing, change nothing, and still "
+                        f"return a clean result. Check the value, or supply the "
+                        f"row's FULL key (every key column, not just one): "
+                        f"see grid_rows for what is actually there."),
+                    "row_key": row_key, "grid_rows": rows_before,
+                    "grid_columns": columns,
+                    "alert": None,
+                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
+                    "graph_dirty": False, "possibly_saved": False,
+                }
+            if len(hits) > 1 and operation != "insert":
+                return {
+                    "refused": (
+                        f"row_key {row_key} matches {len(hits)} rows — it is a "
+                        f"PARTIAL key, so the row actually hit would be the "
+                        f"server's choice, not yours. Add the remaining key "
+                        f"column(s) until exactly one row matches."),
+                    "row_key": row_key, "matched_rows": hits,
+                    "grid_rows": rows_before, "grid_columns": columns,
+                    "alert": None,
+                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
+                    "graph_dirty": False, "possibly_saved": False,
+                }
+
         cell_xml = []
         for f, v in cells.items():
             old = (old_values or {}).get(f)
@@ -411,6 +557,11 @@ class AspxDiagnostic:
         section = ("Inserted" if operation == "insert"
                    else "Deleted" if operation == "delete"
                    else "Modified")
+        # i="0" is the row's ordinal WITHIN THIS BATCH, not a position in the
+        # live grid — every operation here sends exactly one row, so it is always
+        # 0. Proven live (CS205000, 2026-07-20): an insert at i="99" into a
+        # two-row grid appended cleanly with both rows intact, so the index
+        # addresses nothing. Rows are targeted by the row_key CELLS above.
         changes = (f'<RowChanges><{section}><Row i="0"><Cells>'
                    f'{"".join(cell_xml)}</Cells></Row></{section}></RowChanges>')
         inner = (f'<{grid_ctl}><![CDATA[{changes}]]></{grid_ctl}>')
@@ -457,32 +608,34 @@ class AspxDiagnostic:
         if _sel_hint:
             out["selector_hint"] = _sel_hint
         if operation == "insert" and (alert or any(errs.values())):
-            # Row i="0" is hardcoded for EVERY insert regardless of how many
-            # rows already exist in the live grid (see the RowChanges XML
-            # built above) — on a grid that already has >=1 row, a genuine
-            # insert can COLLIDE with an existing row instead of landing on
-            # a new one. Confirmed live on PY309000/EmployeeBankDetails
-            # (external bug report 2026-07-20, reproduced independently):
-            # the IDENTICAL insert request (same screen/grid/values) returned
-            # DIFFERENT error text across repeat calls in the same session —
-            # "cannot be found" once, "cannot be empty" the next — which real
-            # business validation of unchanged input would never do. The
-            # report's own hypothesis (a fabricated uniqueness error from
-            # colliding with the existing row) is plausible but NOT the only
-            # symptom observed; treat ANY error text from an insert as
-            # potentially describing a collision with an existing row rather
-            # than the new data, not confirmed business validation.
+            # THE "Row i=0 COLLIDES WITH AN EXISTING ROW" THEORY IS REFUTED
+            # (tested live 2026-07-20, csmdev CS205000/AttributeDetails).
+            # `i` is a BATCH ORDINAL, not a row locator: the server assigns the
+            # new row's position itself. Decisive test — inserting at i="99"
+            # into a TWO-row grid appended a third row cleanly, leaving both
+            # existing rows intact; an insert at i="0" into a one-row grid
+            # likewise appended rather than overwriting row 0. That is coherent
+            # with how the other operations behave: delete and update target
+            # rows through the row_key CELLS, never through `i`, so nothing on
+            # this plane uses the index to address a row.
+            #
+            # What is NOT explained: PY309000/EmployeeBankDetails returned
+            # DIFFERENT error text across IDENTICAL repeat inserts ("cannot be
+            # found", then "cannot be empty") — real validation of unchanged
+            # input would not do that. The external bug report blamed the
+            # hardcoded index; that mechanism is now ruled out, so the cause of
+            # the nondeterminism is genuinely unknown and PY309000 has not been
+            # retested since. Keep warning about the SYMPTOM, drop the refuted
+            # explanation.
             out["note"] = (
-                "operation=\"insert\" always targets Row i=\"0\" — there is no "
-                "row-count-aware indexing for inserts yet, so on a grid that "
-                "already has at least one row this can collide with that "
-                "existing row instead of a genuinely new one. Confirmed live: "
-                "the identical insert request returned DIFFERENT error text "
-                "across repeat calls with no change in input, which real "
-                "validation of the same data would not do. Treat this error "
-                "as UNRELIABLE for insert on a non-empty grid — verify "
-                "independently via run_dac_odata, or retest against a "
-                "genuinely empty grid if one is available.")
+                "an insert that reports an error is not always reporting real "
+                "business validation: on PY309000/EmployeeBankDetails the "
+                "IDENTICAL insert returned DIFFERENT error text across repeat "
+                "calls with no change in input. The cause is unknown — the "
+                "previously-suspected row-index collision has been RULED OUT "
+                "(the row index is a batch ordinal, not a row locator; proven "
+                "live on CS205000). Verify what actually happened with "
+                "run_dac_odata rather than trusting this message.")
         if not alert and not any(errs.values()) and ds.get("isDirty"):
             # Dirty graph + zero error text = the RowChanges never BOUND, so
             # validation never fired (proven live on GL202500: both insert and
@@ -523,4 +676,83 @@ class AspxDiagnostic:
                    "explanation this time.")
                 + " ALWAYS verify the real database state via run_dac_odata "
                 "before trusting this result either way.")
+        if saved:
+            out.update(await self._verify_save(
+                grid_ctl, cells, row_key, operation, rows_before))
         return out
+
+    async def _verify_save(self, grid_ctl: str, cells: dict[str, Any],
+                           row_key: dict[str, Any] | None, operation: str,
+                           rows_before: list[dict[str, str]]) -> dict[str, Any]:
+        """Re-read the grid after an apparently-clean Save and say what ACTUALLY
+        changed. Only meaningful when `possibly_saved` is True — that is exactly
+        the ambiguous case, where "no error" cannot distinguish a silent success
+        from a silent no-op.
+
+        Returns `save_verified`: True (the change is visibly there), False (the
+        grid is unchanged — a silent no-op, which this plane does produce), or
+        "unverified" with a reason when the read-back itself cannot decide.
+        Deletes additionally get `delete_verified` for symmetry with the classic
+        SOAP plane's field of the same name.
+
+        NOT a substitute for run_dac_odata: this reads the SCREEN's view of the
+        rows, so it can only prove the grid changed, not that the transaction
+        committed to the database. It rules out the silent no-op — the specific
+        failure this plane is known for — and nothing more.
+        """
+        rows_after = _grid_rows(await self._grid_refresh(grid_ctl), grid_ctl)
+        if not rows_after and not rows_before:
+            return {"save_verified": "unverified",
+                    "verify_note": ("could not read any rows back from this grid "
+                                    "(no rows parsed before OR after), so the "
+                                    "change cannot be confirmed either way here "
+                                    "— verify with run_dac_odata.")}
+        if operation == "delete":
+            gone = not any(_row_matches(r, row_key or {}) for r in rows_after)
+            return {
+                "save_verified": gone, "delete_verified": gone,
+                "rows_before": len(rows_before), "rows_after": len(rows_after),
+                "verify_note": (
+                    f"row {row_key} is GONE from the grid on re-read — the delete "
+                    f"engaged and hit the intended row."
+                    if gone else
+                    f"SILENT NO-OP: the Save reported no error, but row {row_key} "
+                    f"is STILL PRESENT on re-read. Nothing was deleted. A row "
+                    f"REFERENCED elsewhere is refused exactly like this, with no "
+                    f"error text — check the screen's rules in kb-mcp-dual.")}
+        if operation == "insert":
+            grew = len(rows_after) > len(rows_before)
+            return {
+                "save_verified": grew,
+                "rows_before": len(rows_before), "rows_after": len(rows_after),
+                "verify_note": (
+                    f"row count went {len(rows_before)} -> {len(rows_after)}: a "
+                    f"row was added."
+                    if grew else
+                    f"SILENT NO-OP: no error was returned but the row count did "
+                    f"not change ({len(rows_before)}). Note insert targets "
+                    f"Row i=\"0\", so on a non-empty grid it may have OVERWRITTEN "
+                    f"an existing row rather than added one — compare the rows.")}
+        # update: the keyed row must now carry the values that were sent.
+        target = [r for r in rows_after if _row_matches(r, row_key or {})]
+        if not target:
+            return {"save_verified": "unverified",
+                    "verify_note": (f"could not find row {row_key} on re-read, so "
+                                    f"the update cannot be confirmed — verify with "
+                                    f"run_dac_odata.")}
+        mismatched = {f: {"sent": str(v), "now": target[0].get(f)}
+                      for f, v in cells.items()
+                      if f in target[0] and str(target[0][f]) != str(v)}
+        applied = [f for f in cells if f in target[0]]
+        if not applied:
+            return {"save_verified": "unverified",
+                    "verify_note": ("none of the changed fields are readable as "
+                                    "grid cells, so the update cannot be confirmed "
+                                    "— verify with run_dac_odata.")}
+        return {
+            "save_verified": not mismatched,
+            "verify_note": (
+                f"re-read confirms {applied} now hold the values sent."
+                if not mismatched else
+                f"SILENT NO-OP (at least partly): the Save reported no error but "
+                f"{list(mismatched)} did NOT change on re-read: {mismatched}.")}

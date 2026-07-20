@@ -2922,18 +2922,27 @@ async def aspx_delete_grid_row(
         removes the WRONG row, so it is refused up front. Must carry EVERY key
         column: a single identity key needs one cell (PY309000
         {"EmployeeBankDetailID": 14551}); a COMPOSITE key needs all parts
-        (CS205000 {"AttributeID": "COLOR", "ValueID": "RED"}) — a partial key
-        matches nothing and SILENTLY no-ops (`possibly_saved:true`, row survives).
-        Key names must be the CLASSIC grid's column dataFields (unknown keys are
-        refused with the real `grid_columns` list).
+        (CS205000 {"AttributeID": "COLOR", "ValueID": "RED"}). A partial key is
+        now REFUSED up front: the grid's rows are read first, and a key matching
+        no row — or more than one — is rejected with `refused` + `grid_rows`
+        rather than sent (it would otherwise match nothing, delete nothing, and
+        still report a clean result). Key names must be the CLASSIC grid's column
+        dataFields (unknown keys are refused with the real `grid_columns` list).
     record_key: {keyField: value} loading the header record (e.g.
         {"EmployeeCD": "EMP001"}); pass {} for a headerless list screen.
 
     DESTRUCTIVE — requires allow_delete (stricter than allow_write). A row that
-    something else REFERENCES is refused SILENTLY: `ok` looks clean and the row
-    SURVIVES, with no error (Acumatica blocks it; the classic Submit doesn't
-    fault). The result therefore carries `deleted_verified` from a real
-    `run_dac_odata` read-back — trust THAT, not the absence of an error.
+    something else REFERENCES is refused SILENTLY: the response looks clean and
+    the row SURVIVES, with no error (Acumatica blocks it; the classic Submit
+    doesn't fault). So the tool re-reads the grid after the Save and returns
+    `delete_verified`: true (row gone), false (row still present — a silent
+    no-op, and the result says so), or "unverified" with a reason. TRUST THAT
+    FIELD, not the absence of an error.
+
+    Scope of that check: it re-reads the SCREEN's rows, which proves the grid
+    changed, not that the transaction committed. It rules out the silent no-op
+    this plane is known for. For confirmation of the database state itself,
+    still read back with run_dac_odata.
     """
     _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)

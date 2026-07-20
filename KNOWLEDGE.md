@@ -782,23 +782,54 @@ caught by reading the DB back**: a partial-key delete that reported `possibly_sa
 changed nothing, and "engages" on PY309000 is not "persists". `possibly_saved`/`ok:true` prove
 nothing — always `run_dac_odata`.
 
-**`replay_grid_save`'s `operation="insert"` always targets `Row i="0"` — unreliable on a
-non-empty grid (external bug report, PY309000/EmployeeBankDetails, 2026-07-20, reproduced
-independently).** The insert-path RowChanges XML hardcodes `i="0"` regardless of how many rows
-already exist in the live grid — there's no row-count-aware indexing. On a grid that already has
-≥1 row, this can collide with an existing row instead of landing on a genuinely new one.
-**Confirmed live**: the IDENTICAL insert request (same screen, grid, values) returned DIFFERENT
-error text across repeat calls in the same session — `"'Employee Bank' cannot be found in the
-system"` once, `"'Employee Bank' cannot be empty"` the next, on the exact same valid input — real
-business validation of unchanged data would never do this, which is itself the strongest evidence
-of state corruption, independent of the report's own (plausible but not 100%-confirmed) fabricated
--uniqueness-error hypothesis. Root-caused to the exact line in `aspx.py`, but the *correct* new-row
-index convention Acumatica's classic grid protocol expects (next free index? negative/temp key?)
-is not confirmed, so rather than guess at an unverified fix, `replay_grid_save` now attaches an
-honest `note` to any insert result that returns error text: treat it as **unreliable** on a
-non-empty grid, verify independently via `run_dac_odata`, or retest against a genuinely empty grid
-if available. Same discipline as `possibly_saved`'s uncertainty note — flag what's not known rather
-than present a fabricated-looking error as confirmed validation.
+**v0.64.13 — the plane can now READ ITS OWN ROWS BACK, which turns two of the above from
+"documented footguns" into enforced behaviour.** The grid Refresh callback that
+`replay_grid_save` already ran to harvest column names *also* carries every row; it was being
+thrown away. `_grid_rows` now parses it. Two payoffs:
+- **Partial keys are REFUSED before the write.** The `row_key` is matched against the grid's real
+  rows: zero matches → `refused` + `grid_rows` (this is the CS205000 `ValueID`-alone case, which
+  used to silently no-op); more than one match → `refused` as a partial key, because which row the
+  server picks is not a thing to discover by deleting one.
+- **`possibly_saved`'s ambiguity is resolved by a post-Save re-read.** `save_verified` (plus
+  `delete_verified` for deletes) is `true` / `false` / `"unverified"` with a reason: delete checks
+  the key is gone, insert checks the row count grew, update checks the keyed row now carries the
+  values sent. **Scope, stated honestly: this reads the SCREEN's rows, so it proves the grid
+  changed, not that the transaction committed** — it rules out the silent no-op this plane is
+  known for, and nothing more. `run_dac_odata` is still the authority on database state.
+
+Two parsing details that are load-bearing (both from a verbatim live capture, kept as a test
+fixture): the Props JSON is entity-escaped (`&quot;`) while the `<Rows>` XML beside it is literal,
+**in the same payload** — so values are unescaped individually, never wholesale; and the columns
+array contains leading bare `{}` entries (the file/note indicator cells) plus `"visible":0`
+columns that are still real `<Cell>` positions, so cell→field alignment is positional over ALL
+slots rather than an end-offset guess.
+
+**A docstring shipped in v0.64.12 promised `deleted_verified` "from a real `run_dac_odata`
+read-back" — no such read-back existed.** It was an overclaim written into the docs of the very
+tool whose purpose is to stop the caller trusting unverified success. v0.64.13 makes the claim
+true (via the grid re-read, and the docstring now states that narrower scope precisely).
+
+**REFUTED (2026-07-20): the row index is NOT a row locator, and `Row i="0"` does NOT collide with
+an existing row.** An external bug report blamed `replay_grid_save`'s hardcoded `i="0"` for
+PY309000's erratic inserts, and this file asserted that as root-caused. Direct testing killed it.
+Throwaway grid `ZZIDX` on csmdev CS205000 `AttributeDetails`: inserting at `i="0"` into a ONE-row
+grid **appended** (existing row intact), and inserting at `i="99"` into a TWO-row grid **appended a
+third row cleanly** — an index that addressed anything real could not behave that way. `i` is the
+row's ordinal *within the RowChanges batch*; the server assigns the new row's position itself.
+This is coherent with the rest of the plane: `delete` and `update` target rows through the
+`row_key` CELLS, never through `i`, so **nothing here uses the index to address a row**.
+
+What remains TRUE and unexplained: PY309000/`EmployeeBankDetails` returned DIFFERENT error text
+across IDENTICAL repeat inserts — `"'Employee Bank' cannot be found in the system"` once,
+`"'Employee Bank' cannot be empty"` the next, on the same valid input. Real validation of unchanged
+data does not do that, so the symptom is real; only the *explanation* was wrong. The cause is now
+genuinely unknown and PY309000 has not been retested since. `replay_grid_save` still attaches a
+`note` to any insert that returns error text — warning about the symptom, explicitly stating the
+index mechanism is ruled out. **Lesson: "root-caused to the exact line" was an inference from a
+plausible-looking code smell, never a test. A mechanism nobody has tested is a hypothesis.** The
+setup for this test was itself wrong twice before it was right — the first throwaway attribute was
+ControlType=Text (which legitimately has NO value list, so every insert was correctly dropped,
+on BOTH planes, silently); a `screen_submit` "ok:true" for those rows meant nothing.
 
 **The "cannot be found in the system" selector error is a SubstituteKey — send the display
 name, NOT the code/id (root-caused from source + a live persisted write; CORRECTS an earlier

@@ -11,9 +11,10 @@ import asyncio
 
 import pytest
 
-from grp_mcp.aspx import (AspxDiagnostic, _grid_errors, _parse_control_blocks,
-                          _parse_hidden_inputs, _row0_readonly_fields,
-                          _xml_attr_escape)
+from grp_mcp.aspx import (AspxDiagnostic, _grid_column_slots, _grid_errors,
+                          _grid_rows, _parse_control_blocks,
+                          _parse_hidden_inputs, _row_matches,
+                          _row0_readonly_fields, _xml_attr_escape)
 
 
 def _diag_with_html(html: str) -> AspxDiagnostic:
@@ -366,13 +367,15 @@ def test_replay_grid_save_attaches_selector_hint_on_cannot_be_found():
 
 
 def test_replay_grid_save_insert_with_error_gets_row_collision_note():
-    # operation="insert" always emits Row i="0" regardless of live row count
-    # (external bug report 2026-07-20, reproduced independently on
-    # PY309000/EmployeeBankDetails: the IDENTICAL insert request returned
-    # DIFFERENT error text across repeat calls). The tool must flag insert
-    # error text as unreliable on a non-empty grid rather than present it as
-    # confirmed business validation — update operations must NOT get this
-    # note (see test_replay_grid_save_no_note_when_error_present above).
+    # An insert that errors must still be flagged as potentially unreliable:
+    # PY309000/EmployeeBankDetails returned DIFFERENT error text across
+    # IDENTICAL repeat inserts (external report 2026-07-20, reproduced), which
+    # real validation of unchanged input would not do. The SYMPTOM stands; the
+    # originally-blamed mechanism (a hardcoded row index colliding with row 0)
+    # was disproven live in 2026-07-20 testing and must not be reasserted here
+    # — see test_insert_error_note_does_not_blame_the_row_index. Update
+    # operations must NOT get this note (see
+    # test_replay_grid_save_no_note_when_error_present above).
     body = (
         '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
         '&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
@@ -380,8 +383,8 @@ def test_replay_grid_save_insert_with_error_gets_row_collision_note():
     result = asyncio.run(d.replay_grid_save(
         "GLTranModuleBatNbr", {"CuryCreditAmt": 50}, operation="insert"))
     assert result["alert"] == "Boom"
-    assert "Row i=" in result["note"]
-    assert "UNRELIABLE" in result["note"]
+    assert "PY309000" in result["note"]
+    assert "cause is unknown" in result["note"]
 
 
 # ---- replay_grid_save: unconfirmed "clean" no-op (GL301000, live re-probe) --
@@ -474,3 +477,223 @@ def test_replay_grid_save_skips_validation_when_refresh_fails():
         "GLTranModuleBatNbr", {"AnythingGoes": 1}))
     assert result["alert"] == "Boom"
     assert "refused" not in result
+
+
+# ---- grid row read-back (v0.64.13) ----------------------------------------
+# VERBATIM capture of a real Refresh callback (csmstg DBKK, CS205000, attribute
+# COPYPO, 3 detail values). Note the two leading {} framework columns and the
+# visible:0 AttributeID column — both are real <Cell> positions, which is why
+# alignment is positional over ALL slots rather than an end-offset guess.
+_CS205000_REFRESH_BODY = (
+    '0|<ctl00_phG_grid><ctl00_phG_grid><![CDATA[<ctl00_phG_grid Props="{&quot'
+    ';colsFilterActive&quot;:0,&quot;hidden&quot;:0,&quot;dataMember&quot;:&q'
+    'uot;AttributeDetails&quot;,&quot;delDefaultsVisible&quot;:1,&quot;emptyM'
+    'essageMode&quot;:0,&quot;levels&quot;:[{&quot;columns&quot;:[{},{},{&quo'
+    't;dataField&quot;:&quot;ValueID&quot;},{&quot;dataField&quot;:&quot;Desc'
+    'ription&quot;},{&quot;dataField&quot;:&quot;SortOrder&quot;},{&quot;data'
+    'Field&quot;:&quot;Disabled&quot;},{&quot;dataField&quot;:&quot;Attribute'
+    'ID&quot;,&quot;visible&quot;:0}]}],&quot;pageSize&quot;:200,&quot;totalR'
+    'owCount&quot;:-1}"><Rows Level="0" HashCode=""><Row i="0"><Cells><Cell V'
+    'alue="0" Text="control@RowFileEmpty" /><Cell Value="0" Text="control@Row'
+    'NoteEmpty" /><Cell Value="1" /><Cell Value="ASAL" /><Cell Value="" /><Ce'
+    'll Value="False" /><Cell Value="COPYPO" /></Cells></Row><Row i="1"><Cell'
+    's><Cell Value="0" Text="control@RowFileEmpty" /><Cell Value="0" Text="co'
+    'ntrol@RowNoteEmpty" /><Cell Value="2" /><Cell Value="PENDUA" /><Cell Val'
+    'ue="" /><Cell Value="False" /><Cell Value="COPYPO" /></Cells></Row><Row '
+    'i="2"><Cells><Cell Value="0" Text="control@RowFileEmpty" /><Cell Value="'
+    '0" Text="control@RowNoteEmpty" /><Cell Value="3" /><Cell Value="PENIGA" '
+    '/><Cell Value="" /><Cell Value="False" /><Cell Value="COPYPO" /></Cells>'
+    '</Row></Rows></ctl00_phG_grid>]]></ctl00_phG_grid></ctl00_phG_grid>'
+)
+
+
+def test_grid_column_slots_preserves_framework_positions():
+    slots = _grid_column_slots(_CS205000_REFRESH_BODY)
+    # the two bare {} entries MUST survive as None — they occupy real <Cell>
+    # positions, and collapsing them shifts every field one place left
+    assert slots == [None, None, "ValueID", "Description", "SortOrder",
+                     "Disabled", "AttributeID"]
+
+
+def test_grid_rows_parses_every_row_aligned_to_fields():
+    rows = _grid_rows(_CS205000_REFRESH_BODY, "ctl00_phG_grid")
+    assert len(rows) == 3
+    assert rows[0] == {"ValueID": "1", "Description": "ASAL", "SortOrder": "",
+                       "Disabled": "False", "AttributeID": "COPYPO"}
+    # a visible:0 column is still a real, readable cell
+    assert [r["Description"] for r in rows] == ["ASAL", "PENDUA", "PENIGA"]
+
+
+def test_grid_rows_empty_when_no_columns():
+    assert _grid_rows("0|<ctl00_phG_grid/>", "ctl00_phG_grid") == []
+
+
+def test_row_matches_compares_as_strings():
+    row = {"EmployeeBankDetailID": "14551", "Percent": "50"}
+    # run_dac_odata hands back ints; the grid echoes text
+    assert _row_matches(row, {"EmployeeBankDetailID": 14551})
+    assert not _row_matches(row, {"EmployeeBankDetailID": 14550})
+    # a missing key must never match (sentinel, not None-equals-None)
+    assert not _row_matches(row, {"Nope": ""})
+
+
+def _cs_diag(save_body: str, refresh_body: str = _CS205000_REFRESH_BODY,
+             after_body: str | None = None):
+    """CS205000 stub: Refresh -> Save -> (verification Refresh)."""
+    d = _diag_with_html(
+        'var _ctl00_phG_grid = {"dataMember":"AttributeDetails",'
+        '"levels":[{"columns":[]}]};')
+    bodies = iter([refresh_body, save_body,
+                   after_body if after_body is not None else refresh_body])
+
+    async def fake_callback(cbid, cbparam, **kw):
+        return next(bodies)
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    return d
+
+
+_CLEAN_SAVE = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+               '{&quot;isDirty&quot;:0}"/>]]></ctl00_phDS_ds>')
+
+
+# ---- #2 partial-key pre-flight ---------------------------------------------
+
+def test_delete_refuses_key_matching_no_row():
+    d = _cs_diag(_CLEAN_SAVE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO",
+                                         "ValueID": "NOPE"},
+        operation="delete"))
+    assert "matches NO row" in r["refused"]
+    assert r["possibly_saved"] is False
+    assert len(r["grid_rows"]) == 3
+
+
+def test_delete_refuses_partial_key_matching_many_rows():
+    # THE live footgun: AttributeID alone matches all 3 rows. Previously this
+    # was sent and silently no-op'd with possibly_saved:true.
+    d = _cs_diag(_CLEAN_SAVE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO"},
+        operation="delete"))
+    assert "PARTIAL key" in r["refused"]
+    assert len(r["matched_rows"]) == 3
+    assert r["possibly_saved"] is False
+
+
+def test_delete_with_full_key_is_not_refused():
+    d = _cs_diag(_CLEAN_SAVE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO",
+                                         "ValueID": "2"},
+        operation="delete"))
+    assert "refused" not in r
+
+
+# ---- #1 post-save read-back -------------------------------------------------
+
+_AFTER_DELETE = _CS205000_REFRESH_BODY.replace(
+    '<Row i="1"><Cells><Cell Value="0" Text="control@RowFileEmpty" />'
+    '<Cell Value="0" Text="control@RowNoteEmpty" /><Cell Value="2" />'
+    '<Cell Value="PENDUA" /><Cell Value="" /><Cell Value="False" />'
+    '<Cell Value="COPYPO" /></Cells></Row>', '')
+
+
+def test_delete_verified_true_when_row_gone_on_reread():
+    d = _cs_diag(_CLEAN_SAVE, after_body=_AFTER_DELETE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO",
+                                         "ValueID": "2"},
+        operation="delete"))
+    assert r["possibly_saved"] is True
+    assert r["delete_verified"] is True and r["save_verified"] is True
+    assert r["rows_before"] == 3 and r["rows_after"] == 2
+
+
+def test_delete_verified_false_catches_silent_noop():
+    # clean Save, row STILL THERE on re-read: the exact silent no-op that
+    # possibly_saved could never distinguish from success.
+    d = _cs_diag(_CLEAN_SAVE)  # after == before
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO",
+                                         "ValueID": "2"},
+        operation="delete"))
+    assert r["possibly_saved"] is True          # the old, ambiguous signal
+    assert r["delete_verified"] is False        # the new, decisive one
+    assert "SILENT NO-OP" in r["verify_note"]
+
+
+def test_update_verified_false_when_cell_unchanged():
+    d = _cs_diag(_CLEAN_SAVE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {"Description": "CHANGED"},
+        row_key={"AttributeID": "COPYPO", "ValueID": "2"}))
+    assert r["save_verified"] is False
+    assert "SILENT NO-OP" in r["verify_note"]
+
+
+def test_update_verified_true_when_cell_changed():
+    after = _CS205000_REFRESH_BODY.replace('Value="PENDUA"', 'Value="CHANGED"')
+    d = _cs_diag(_CLEAN_SAVE, after_body=after)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {"Description": "CHANGED"},
+        row_key={"AttributeID": "COPYPO", "ValueID": "2"}))
+    assert r["save_verified"] is True
+    assert "now hold the values sent" in r["verify_note"]
+
+
+def test_insert_verified_by_row_count_growth():
+    after = _CS205000_REFRESH_BODY.replace(
+        '</Rows>',
+        '<Row i="3"><Cells><Cell Value="0" /><Cell Value="0" />'
+        '<Cell Value="4" /><Cell Value="NEW" /><Cell Value="" />'
+        '<Cell Value="False" /><Cell Value="COPYPO" /></Cells></Row></Rows>')
+    d = _cs_diag(_CLEAN_SAVE, after_body=after)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {"ValueID": "4", "Description": "NEW"},
+        operation="insert"))
+    assert r["save_verified"] is True
+    assert r["rows_before"] == 3 and r["rows_after"] == 4
+
+
+def test_insert_noop_flagged_when_count_static():
+    d = _cs_diag(_CLEAN_SAVE)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {"ValueID": "4", "Description": "NEW"},
+        operation="insert"))
+    assert r["save_verified"] is False
+    assert "OVERWRITTEN" in r["verify_note"]
+
+
+def test_verification_skipped_when_save_errored():
+    # a Save that reported a real error is not ambiguous; no read-back needed
+    err = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+           '{&quot;alert&quot;:&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]>'
+           '</ctl00_phDS_ds>')
+    d = _cs_diag(err)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {}, row_key={"AttributeID": "COPYPO",
+                                         "ValueID": "2"},
+        operation="delete"))
+    assert r["alert"] == "Boom"
+    assert "save_verified" not in r
+
+
+# ---- #3 insert row index: REFUTED as a collision cause ----------------------
+
+def test_insert_error_note_does_not_blame_the_row_index():
+    """The row index is a BATCH ORDINAL, not a row locator — proven live on
+    CS205000 (insert at i="99" into a 2-row grid appended cleanly, both rows
+    intact). The note must warn about the unexplained PY309000 nondeterminism
+    WITHOUT reasserting the refuted collision mechanism."""
+    err = ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="'
+           '{&quot;alert&quot;:&quot;Boom&quot;,&quot;isDirty&quot;:1}"/>]]>'
+           '</ctl00_phDS_ds>')
+    d = _cs_diag(err)
+    r = asyncio.run(d.replay_grid_save(
+        "AttributeDetails", {"ValueID": "X"}, operation="insert"))
+    note = r["note"]
+    assert "RULED OUT" in note
+    assert "collide" not in note.lower()
+    assert "run_dac_odata" in note
