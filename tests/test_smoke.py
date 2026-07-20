@@ -3767,3 +3767,27 @@ def test_screen_capabilities_reraises_other_screen_errors(cfg, monkeypatch):
     _patch_screen_client(monkeypatch, _RaisingUIScreenClient(err))
     with pytest.raises(ScreenError, match="NOT AUTHENTICATED"):
         asyncio.run(server.screen_capabilities("X", instance="ro"))
+
+
+def test_classic_grid_missing_routing():
+    """#3: an ASPX call that failed because the grid has no classic binding is
+    detected (so the caller is routed to modern-plane tools) — but a genuine
+    grid-not-on-page-yet or a business error is NOT swallowed as that case."""
+    from grp_mcp.server import _classic_grid_missing, _no_classic_grid_result
+    from grp_mcp.screen import ScreenError
+
+    assert _classic_grid_missing(ScreenError(
+        "aspx: no control bound to view 'ETDetails' on this page "
+        "(dataMember not found in the page HTML)"))
+    assert _classic_grid_missing(ScreenError(
+        "aspx: page has no control config declarations — not a classic "
+        "WebForms page?"))
+    # NOT the no-classic-grid case: an ordinary validation/business error
+    assert not _classic_grid_missing(ScreenError(
+        "Percent should be 100 for sum of all banks"))
+    assert not _classic_grid_missing(ScreenError("session lost"))
+
+    r = _no_classic_grid_result("CA202000", "ETDetails", "http://x/CA202000.aspx",
+                                ScreenError("no control bound to view 'ETDetails'"))
+    assert r["no_classic_grid"] is True and r["ok"] is False
+    assert "ui_delete_grid_row" in r["recommend"]

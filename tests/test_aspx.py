@@ -716,3 +716,114 @@ def test_preflight_does_not_catch_a_grid_unique_partial_key():
     assert r["possibly_saved"] is True  # and the plane reports it clean
     assert r["delete_verified"] is False        # only the read-back catches it
     assert "SILENT NO-OP" in r["verify_note"]
+
+
+# ---- #1 multi-section batch (replay_grid_batch) -----------------------------
+
+def _batch_diag(save_body=_CLEAN_SAVE, after_body=None, capture=None):
+    """CS205000 stub for batch: Refresh (snapshot) -> Save -> Refresh (verify).
+    If `capture` is a dict, the Save envelope is recorded under 'save'."""
+    d = _diag_with_html(
+        'var _ctl00_phG_grid = {"dataMember":"AttributeDetails",'
+        '"levels":[{"columns":[]}]};')
+    bodies = iter([_CS205000_REFRESH_BODY, save_body,
+                   after_body if after_body is not None else _CS205000_REFRESH_BODY])
+
+    async def fake_callback(cbid, cbparam, **kw):
+        if capture is not None and cbparam.startswith("Save|"):
+            capture["save"] = cbparam
+        return next(bodies)
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    return d
+
+
+def test_batch_raises_on_empty_operations():
+    d = _batch_diag()
+    with pytest.raises(Exception):
+        asyncio.run(d.replay_grid_batch("AttributeDetails", []))
+
+
+def test_batch_raises_on_unknown_operation():
+    d = _batch_diag()
+    with pytest.raises(Exception):
+        asyncio.run(d.replay_grid_batch(
+            "AttributeDetails", [{"operation": "frobnicate", "cells": {}}]))
+
+
+def test_batch_raises_on_delete_without_row_key():
+    d = _batch_diag()
+    with pytest.raises(Exception):
+        asyncio.run(d.replay_grid_batch(
+            "AttributeDetails", [{"operation": "delete"}]))
+
+
+def test_batch_emits_sibling_sections_in_one_rowchanges():
+    cap = {}
+    d = _batch_diag(after_body=_AFTER_DELETE, capture=cap)
+    asyncio.run(d.replay_grid_batch("AttributeDetails", [
+        {"operation": "delete", "row_key": {"AttributeID": "COPYPO", "ValueID": "2"}},
+        {"operation": "update", "row_key": {"AttributeID": "COPYPO", "ValueID": "3"},
+         "cells": {"Description": "REBAL"}},
+    ]))
+    xml = cap["save"]
+    # both sections ride inside ONE RowChanges envelope, delete before modify
+    assert xml.count("<RowChanges>") == 1
+    assert "<Deleted>" in xml and "<Modified>" in xml
+    assert xml.index("<Deleted>") < xml.index("<Modified>")
+    assert 'Key="Description"' in xml and 'Value="REBAL"' in xml
+
+
+def test_batch_refuses_whole_batch_when_one_op_invalid():
+    # first op is fine, second names a nonexistent row -> NOTHING is sent
+    d = _batch_diag()
+    r = asyncio.run(d.replay_grid_batch("AttributeDetails", [
+        {"operation": "update", "row_key": {"AttributeID": "COPYPO", "ValueID": "2"},
+         "cells": {"Description": "X"}},
+        {"operation": "delete", "row_key": {"AttributeID": "COPYPO", "ValueID": "NOPE"}},
+    ]))
+    assert "refused_ops" in r
+    assert [x["op_index"] for x in r["refused_ops"]] == [1]
+    assert "matches NO row" in r["refused_ops"][0]["refused"]
+    assert r["possibly_saved"] is False
+
+
+def test_batch_delete_plus_update_both_verified():
+    after = _AFTER_DELETE.replace('Value="PENIGA"', 'Value="REBAL"')
+    d = _batch_diag(after_body=after)
+    r = asyncio.run(d.replay_grid_batch("AttributeDetails", [
+        {"operation": "delete", "row_key": {"AttributeID": "COPYPO", "ValueID": "2"}},
+        {"operation": "update", "row_key": {"AttributeID": "COPYPO", "ValueID": "3"},
+         "cells": {"Description": "REBAL"}},
+    ]))
+    assert r["possibly_saved"] is True
+    assert r["all_verified"] is True
+    assert r["rows_before"] == 3 and r["rows_after"] == 2
+    verdicts = {v["operation"]: v["save_verified"] for v in r["verifications"]}
+    assert verdicts == {"delete": True, "update": True}
+
+
+def test_batch_catches_partial_apply():
+    # Save came back clean, but only the delete took: the update row is unchanged
+    d = _batch_diag(after_body=_AFTER_DELETE)  # PENIGA still says PENIGA
+    r = asyncio.run(d.replay_grid_batch("AttributeDetails", [
+        {"operation": "delete", "row_key": {"AttributeID": "COPYPO", "ValueID": "2"}},
+        {"operation": "update", "row_key": {"AttributeID": "COPYPO", "ValueID": "3"},
+         "cells": {"Description": "REBAL"}},
+    ]))
+    assert r["all_verified"] is False
+    v = {x["operation"]: x for x in r["verifications"]}
+    assert v["delete"]["save_verified"] is True
+    assert v["update"]["save_verified"] is False
+    assert "SILENT NO-OP" in v["update"]["verify_note"]
+
+
+def test_batch_insert_alongside_delete_is_unverified():
+    d = _batch_diag(after_body=_AFTER_DELETE)  # net count 3->2, insert masked
+    r = asyncio.run(d.replay_grid_batch("AttributeDetails", [
+        {"operation": "delete", "row_key": {"AttributeID": "COPYPO", "ValueID": "2"}},
+        {"operation": "insert", "cells": {"ValueID": "9", "Description": "new"}},
+    ]))
+    ins = next(v for v in r["verifications"] if v["operation"] == "insert")
+    assert ins["save_verified"] == "unverified"
+    assert "row-count" in ins["verify_note"]

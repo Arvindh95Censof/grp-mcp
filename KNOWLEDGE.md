@@ -883,6 +883,60 @@ SubstituteKey can't be auto-resolved for this grid: with no column metadata ther
 `lookup.value_field` and no target-DAC to translate against — hence the hint (above) rather than
 an auto-fix. Whether the metadata gap is PY309000-specific or broader is unconfirmed — not swept.
 
+### 11a. Multi-section batch — `aspx_grid_batch` (v0.64.15): change an INVARIANT-guarded grid
+
+`aspx_delete_grid_row` and `diagnose_save_error` each send ONE RowChanges section. A grid with a
+**cross-row invariant** (PY309000 `EmployeeBankDetails`: percent must sum to 100) rejects a
+standalone delete — the survivors no longer sum to 100. A human deletes AND rebalances in one Save.
+`aspx_grid_batch(screen_id, record_key, grid_view, operations)` does the same: several ops
+(`{operation, cells, row_key}`) become sibling sections (`<Deleted>` + `<Modified>` + …) in ONE
+envelope, one atomic Save. Every op is pre-flighted against ONE grid snapshot (unknown-column /
+no-match / partial-key) and the WHOLE batch is refused (`refused_ops`, nothing sent) if any op
+fails — a half-applied atomic Save is worse than none. After a clean Save the grid is re-read once
+and each op gets its own verdict in `verifications` (`save_verified` true|false|"unverified");
+`all_verified` is their AND. The single-op path (`replay_grid_save`) and the batch path now share
+one set of helpers (`_preflight_op`, `_cells_xml`, `_read_save_response`, `_verify_one_op`) so they
+validate and verify identically — the refactor is behaviour-preserving (all prior tests still pass).
+
+**Evidence — each leg tested LIVE (csmdev, 2026-07-20), the PASS case proven by COMPOSITION not yet
+end-to-end:**
+- **Test A (mechanism, direct):** throwaway CS205000 `ZZBATCH`, 3 rows. One batch = `<Deleted>`(BBB)
+  + `<Modified>`(CCC.Description). Result `all_verified:true`, rows 3→2; **`run_dac_odata` confirmed
+  BBB gone AND CCC changed** — both sections committed atomically from one Save. So the server
+  accepts a multi-section envelope and applies every section (this was the one real unknown —
+  "untested whether the server accepts it").
+- **Test B1 (invariant validates NET state, direct):** on the real PY309000 bank grid, a batch
+  updating EMP001's only row 100→50 → `alert:"Percent should be 100 for sum of all banks"`,
+  `possibly_saved:false`; `run_dac_odata` confirmed the row **unchanged** (still 100). Decisive
+  detail: the server reported the sum as **50** — i.e. it validated the MODIFIED value, so the
+  invariant is checked against the **net post-batch state**, not the pre-state. And the batch path
+  surfaced the real rule rather than a silent no-op.
+- **Delete+rebalance PASS = A ∘ B1, not yet run end-to-end.** A shows all sections apply to one
+  working set before commit; B1 shows the invariant validates that net state. So a `<Deleted>`(row)
+  + `<Modified>`(survivor→100) nets to 100 and passes. Each leg is directly observed; the
+  *combination* (a Deleted + a Modified on an invariant grid netting to 100) has not been run
+  directly, because it needs a 2-row setup that mutates a real employee's bank config (adds a row →
+  burns an identity value, needs the SubstituteKey selector). Flagged for the user to approve rather
+  than done unprompted. **Stated honestly so the composition isn't mistaken for a direct test** —
+  the recurring lesson of this whole investigation.
+
+Caveat carried in the tool: verifying an INSERT inside a batch that also deletes is unreliable
+(insert is checked by row-count growth, which the concurrent delete masks) → that op returns
+`save_verified:"unverified"`. As always this proves the GRID changed, not that the txn committed —
+`run_dac_odata` remains the authority.
+
+### 11b. No classic grid at all → routed to the modern plane (v0.64.15)
+
+Some grids render ONLY on the modern plane and emit no classic control config (observed: CA202000
+`ETDetails`). The ASPX plane genuinely cannot address those — a real, permanent limit, not a bug.
+Rather than surface `find_grid_control`'s bare "no control bound to view" error, the three ASPX
+tools (`diagnose_save_error`, `aspx_delete_grid_row`, `aspx_grid_batch`) now catch that specific
+case (`_classic_grid_missing`) and return `{no_classic_grid: true, recommend: …}` pointing at the
+modern-plane grid tools (`ui_read_grid` → `ui_delete_grid_row`/`ui_insert_grid_row`/
+`ui_update_grid_row`), which key rows via `/structure` and need no classic markup. The match is on
+find_grid_control's own messages, so an ordinary business/validation error is NOT swallowed as this
+case (unit-tested both ways).
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

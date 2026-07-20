@@ -179,6 +179,171 @@ def _row_matches(row: dict[str, str], key: dict[str, Any]) -> bool:
     return all(str(row.get(k, "\0")) == str(v) for k, v in key.items())
 
 
+# RowChanges section per operation. `Modified`/`Inserted`/`Deleted` are the
+# classic grid's own section names; a Save envelope may carry several siblings.
+_SECTION = {"insert": "Inserted", "update": "Modified", "delete": "Deleted"}
+
+# The "nothing was sent" tail a refusal carries so its shape matches a real
+# (empty) Save result — callers branch on possibly_saved either way.
+_EMPTY_SAVE_FIELDS = {"alert": None, "rows_error_text": [], "row_errors": [],
+                      "cell_errors": [], "graph_dirty": False,
+                      "possibly_saved": False}
+
+
+def _cells_xml(cells: dict[str, Any] | None, row_key: dict[str, Any] | None,
+               old_values: dict[str, Any] | None) -> str:
+    """The `<Cell .../>` list for ONE row: the changed cells (each with an
+    optional OldValue attr) followed by the row_key cells that address the row.
+    Rows are located by these key cells, never by the row's `i` index (proven:
+    i is a batch ordinal, not a locator)."""
+    parts = []
+    for f, v in (cells or {}).items():
+        old = (old_values or {}).get(f)
+        oattr = f' OldValue="{_xml_attr_escape(old)}"' if old is not None else ""
+        parts.append(f'<Cell Value="{_xml_attr_escape(v)}"{oattr} Key="{f}"/>')
+    for f, v in (row_key or {}).items():
+        parts.append(f'<Cell Value="{_xml_attr_escape(v)}" Key="{f}"/>')
+    return "".join(parts)
+
+
+def _preflight_op(operation: str, cells: dict[str, Any], row_key: dict[str, Any] | None,
+                  columns: list[str], rows_before: list[dict[str, str]]) -> dict | None:
+    """Validate ONE row change against the grid's real columns and current rows
+    before it is sent. Returns a refusal dict (reason + supporting data) or None
+    if the op is safe to send. Shared by the single-op and batch paths so both
+    refuse identically.
+
+    NOT a complete guard for delete/update: a partial key that is UNIQUE within
+    the grid passes here and still no-ops server-side (the server matches the
+    FULL key; the grid payload carries no is-key flag). Only the post-Save
+    read-back in _verify_one_op catches that — the two checks are layered."""
+    if columns:
+        colset = set(columns)
+        unknown = [f for f in list(cells or {}) + list(row_key or {})
+                   if f not in colset]
+        if unknown:
+            suggestions = {f: f"Cury{f}" for f in unknown if f"Cury{f}" in colset}
+            return {
+                "refused": (
+                    f"field(s) {unknown} are not columns of this grid on the "
+                    f"classic page — sending them would crash or silently no-op "
+                    f"the callback. Use the exact column names from grid_columns"
+                    + (f"; likely mapping: {suggestions}" if suggestions else "")
+                    + "."),
+                "unknown_fields": unknown, "suggestions": suggestions,
+                "grid_columns": columns}
+    if row_key and rows_before:
+        hits = [r for r in rows_before if _row_matches(r, row_key)]
+        if not hits:
+            return {
+                "refused": (
+                    f"row_key {row_key} matches NO row in this grid — the server "
+                    f"would match nothing, change nothing, and still return a "
+                    f"clean result. Check the value, or supply the row's FULL key "
+                    f"(every key column, not just one): see grid_rows for what is "
+                    f"actually there."),
+                "row_key": row_key, "grid_rows": rows_before,
+                "grid_columns": columns}
+        if len(hits) > 1 and operation != "insert":
+            return {
+                "refused": (
+                    f"row_key {row_key} matches {len(hits)} rows — it is a PARTIAL "
+                    f"key, so the row actually hit would be the server's choice, "
+                    f"not yours. Add the remaining key column(s) until exactly one "
+                    f"row matches."),
+                "row_key": row_key, "matched_rows": hits,
+                "grid_rows": rows_before, "grid_columns": columns}
+    return None
+
+
+def _read_save_response(body: str) -> dict[str, Any]:
+    """Base result from a Save callback response, shared by the single-op and
+    batch paths. Surfaces the server-crash case (no `0|` prefix and no parseable
+    control blocks — a raw, unwrapped codebehind exception) instead of guessing
+    `possibly_saved: true` on a request that never reached validation."""
+    blocks = _parse_control_blocks(body)
+    if not body.startswith("0|") and not blocks:
+        return {"alert": None, "rows_error_text": [], "row_errors": [],
+                "cell_errors": [], "server_error": body.strip()[:500],
+                "graph_dirty": False, "possibly_saved": False,
+                "response_len": len(body)}
+    ds = blocks.get(_DS_BLOCK) or {}
+    errs = _grid_errors(body)
+    alert = ds.get("alert")
+    saved = not alert and not any(errs.values()) and not ds.get("isDirty")
+    return {"alert": alert, **errs, "graph_dirty": bool(ds.get("isDirty")),
+            "possibly_saved": saved, "response_len": len(body)}
+
+
+def _verify_one_op(operation: str, cells: dict[str, Any], row_key: dict[str, Any] | None,
+                   rows_before: list[dict[str, str]],
+                   rows_after: list[dict[str, str]]) -> dict[str, Any]:
+    """Per-op verdict from the grid's before/after row snapshots. Only meaningful
+    when the Save came back clean (`possibly_saved`) — that is exactly the
+    ambiguous case where "no error" cannot tell a silent success from a silent
+    no-op.
+
+    `save_verified`: True (the change is visibly there), False (unchanged — the
+    silent no-op this plane produces), or "unverified" with a reason when the
+    read-back itself cannot decide. Deletes also get `delete_verified` for
+    symmetry with the classic SOAP plane's field of the same name. Reads the
+    SCREEN's rows, so it proves the grid changed, not that the txn committed —
+    run_dac_odata remains the authority."""
+    if not rows_after and not rows_before:
+        return {"save_verified": "unverified",
+                "verify_note": ("could not read any rows back from this grid "
+                                "(no rows parsed before OR after), so the change "
+                                "cannot be confirmed either way here — verify "
+                                "with run_dac_odata.")}
+    if operation == "delete":
+        gone = not any(_row_matches(r, row_key or {}) for r in rows_after)
+        return {
+            "save_verified": gone, "delete_verified": gone,
+            "verify_note": (
+                f"row {row_key} is GONE from the grid on re-read — the delete "
+                f"engaged and hit the intended row."
+                if gone else
+                f"SILENT NO-OP: the Save reported no error, but row {row_key} "
+                f"is STILL PRESENT on re-read. Nothing was deleted. A row "
+                f"REFERENCED elsewhere is refused exactly like this, with no "
+                f"error text — check the screen's rules in kb-mcp-dual.")}
+    if operation == "insert":
+        grew = len(rows_after) > len(rows_before)
+        return {
+            "save_verified": grew,
+            "verify_note": (
+                f"row count went {len(rows_before)} -> {len(rows_after)}: a row "
+                f"was added."
+                if grew else
+                f"SILENT NO-OP: no error was returned but the row count did not "
+                f"change ({len(rows_before)}). Note insert targets Row i=\"0\", "
+                f"so on a non-empty grid it may have OVERWRITTEN an existing row "
+                f"rather than added one — compare the rows.")}
+    # update: the keyed row must now carry the values that were sent.
+    target = [r for r in rows_after if _row_matches(r, row_key or {})]
+    if not target:
+        return {"save_verified": "unverified",
+                "verify_note": (f"could not find row {row_key} on re-read, so the "
+                                f"update cannot be confirmed — verify with "
+                                f"run_dac_odata.")}
+    mismatched = {f: {"sent": str(v), "now": target[0].get(f)}
+                  for f, v in cells.items()
+                  if f in target[0] and str(target[0][f]) != str(v)}
+    applied = [f for f in cells if f in target[0]]
+    if not applied:
+        return {"save_verified": "unverified",
+                "verify_note": ("none of the changed fields are readable as grid "
+                                "cells, so the update cannot be confirmed — verify "
+                                "with run_dac_odata.")}
+    return {
+        "save_verified": not mismatched,
+        "verify_note": (
+            f"re-read confirms {applied} now hold the values sent."
+            if not mismatched else
+            f"SILENT NO-OP (at least partly): the Save reported no error but "
+            f"{list(mismatched)} did NOT change on re-read: {mismatched}.")}
+
+
 def _row0_readonly_fields(body: str, grid_ctl: str, columns: list[str]) -> list[str]:
     """Which of `columns` are ReadOnly="True" on row 0's OWN echo in a Save
     response — a REAL, confirmed cause of a silent no-op (an existing line's
@@ -479,142 +644,41 @@ class AspxDiagnostic:
             self._activate_tab(tab_ctl, tab_idx)
 
         columns, rows_before = await self._grid_snapshot(grid_ctl)
-        if columns:
-            colset = set(columns)
-            unknown = [f for f in list(cells) + list(row_key or {})
-                       if f not in colset]
-            if unknown:
-                # best-guess mapping: modern-plane name -> Cury-prefixed column
-                suggestions = {f: f"Cury{f}" for f in unknown
-                               if f"Cury{f}" in colset}
-                return {
-                    "refused": (
-                        f"field(s) {unknown} are not columns of this grid on the "
-                        f"classic page — sending them would crash or silently "
-                        f"no-op the callback. Use the exact column names from "
-                        f"grid_columns" + (f"; likely mapping: {suggestions}"
-                                            if suggestions else "") + "."),
-                    "unknown_fields": unknown,
-                    "suggestions": suggestions,
-                    "grid_columns": columns,
-                    "alert": None,
-                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
-                    "graph_dirty": False,
-                    "possibly_saved": False,
-                }
+        # Validate this one change against the grid's real columns + rows before
+        # sending. The refusal carries the empty-Save tail so its shape matches a
+        # real (nothing-sent) result. NOTE this guard is layered, not complete —
+        # a partial key unique within the grid slips through and is caught only by
+        # the post-Save read-back below (see _preflight_op / _verify_one_op).
+        refusal = _preflight_op(operation, cells, row_key, columns, rows_before)
+        if refusal:
+            return {**refusal, **_EMPTY_SAVE_FIELDS}
 
-        # PRE-FLIGHT the row_key against the grid's ACTUAL rows. A key matching
-        # NOTHING would have the server match no row, change nothing, and still
-        # answer `possibly_saved: true`; a key matching MANY rows is a partial
-        # key by definition, and which row the server picks is not something to
-        # find out by deleting one. Both are refusable now that the rows are in
-        # hand.
-        #
-        # THIS IS NOT A COMPLETE GUARD, and the gap is measured, not theoretical:
-        # a partial key that happens to be UNIQUE within the grid passes here and
-        # STILL silently no-ops server-side, because the server matches on the
-        # full key. Proven live on CS205000 — {"ValueID": "BBB"} hits exactly one
-        # grid row, sails through this check, and deletes nothing
-        # (possibly_saved:true, rows 3 -> 3). The grid payload carries no "is
-        # key" flag, so which columns form the key is not knowable here. The
-        # post-Save read-back in _verify_save is what catches that case; these
-        # two checks are layered deliberately.
-        if row_key and rows_before:
-            hits = [r for r in rows_before if _row_matches(r, row_key)]
-            if not hits:
-                return {
-                    "refused": (
-                        f"row_key {row_key} matches NO row in this grid — the "
-                        f"server would match nothing, change nothing, and still "
-                        f"return a clean result. Check the value, or supply the "
-                        f"row's FULL key (every key column, not just one): "
-                        f"see grid_rows for what is actually there."),
-                    "row_key": row_key, "grid_rows": rows_before,
-                    "grid_columns": columns,
-                    "alert": None,
-                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
-                    "graph_dirty": False, "possibly_saved": False,
-                }
-            if len(hits) > 1 and operation != "insert":
-                return {
-                    "refused": (
-                        f"row_key {row_key} matches {len(hits)} rows — it is a "
-                        f"PARTIAL key, so the row actually hit would be the "
-                        f"server's choice, not yours. Add the remaining key "
-                        f"column(s) until exactly one row matches."),
-                    "row_key": row_key, "matched_rows": hits,
-                    "grid_rows": rows_before, "grid_columns": columns,
-                    "alert": None,
-                    "rows_error_text": [], "row_errors": [], "cell_errors": [],
-                    "graph_dirty": False, "possibly_saved": False,
-                }
-
-        cell_xml = []
-        for f, v in cells.items():
-            old = (old_values or {}).get(f)
-            oattr = f' OldValue="{_xml_attr_escape(old)}"' if old is not None else ""
-            cell_xml.append(
-                f'<Cell Value="{_xml_attr_escape(v)}"{oattr} Key="{f}"/>')
-        for f, v in (row_key or {}).items():
-            cell_xml.append(f'<Cell Value="{_xml_attr_escape(v)}" Key="{f}"/>')
-        # "Deleted" removes the row identified by the row_key cells above. Unlike
-        # the classic SOAP plane — whose delete_row can only ever take ROW 0, and
-        # which on this grid has no key to address a row with at all — a keyed
-        # Deleted section targets a specific row (row_key binding proven live).
-        section = ("Inserted" if operation == "insert"
-                   else "Deleted" if operation == "delete"
-                   else "Modified")
-        # i="0" is the row's ordinal WITHIN THIS BATCH, not a position in the
-        # live grid — every operation here sends exactly one row, so it is always
-        # 0. Proven live (CS205000, 2026-07-20): an insert at i="99" into a
-        # two-row grid appended cleanly with both rows intact, so the index
-        # addresses nothing. Rows are targeted by the row_key CELLS above.
+        # One row, one section. i="0" is the row's ordinal WITHIN THIS BATCH, not
+        # a position in the live grid (proven: an insert at i="99" into a two-row
+        # grid appended cleanly — the index addresses nothing; rows are located
+        # by the row_key CELLS). "Deleted" removes the keyed row, which the
+        # classic SOAP plane cannot do on a grid whose key it does not expose.
+        section = _SECTION[operation]
         changes = (f'<RowChanges><{section}><Row i="0"><Cells>'
-                   f'{"".join(cell_xml)}</Cells></Row></{section}></RowChanges>')
+                   f'{_cells_xml(cells, row_key, old_values)}'
+                   f'</Cells></Row></{section}></RowChanges>')
         inner = (f'<{grid_ctl}><![CDATA[{changes}]]></{grid_ctl}>')
         body = await self._callback(
             _DS_CTL, _DS_ENVELOPE.format(cmd="Save", inner=inner))
-        blocks = _parse_control_blocks(body)
-        # A well-formed callback response ALWAYS starts with "0|" (the ASP.NET
-        # ICallbackEventHandler success/argument-count prefix) — observed on
-        # every captured response, success or business-validation error alike.
-        # A callback that CRASHES server-side (e.g. a NullReferenceException in
-        # the screen's codebehind — proven live: GL301000's Transactions grid)
-        # instead returns raw, unwrapped exception text with no "0|" prefix and
-        # no parseable control blocks. Silently falling through to the "clean"
-        # heuristic below would report `possibly_saved: true` on a request that
-        # never even reached validation — exactly the false confidence this
-        # tool exists to prevent. Surface the raw text and refuse to guess.
-        if not body.startswith("0|") and not blocks:
-            return {
-                "alert": None,
-                "rows_error_text": [], "row_errors": [], "cell_errors": [],
-                "server_error": body.strip()[:500],
-                "graph_dirty": False,
-                "possibly_saved": False,
-                "response_len": len(body),
-            }
-        ds = blocks.get(_DS_BLOCK) or {}
-        errs = _grid_errors(body)
-        alert = ds.get("alert")
-        saved = not alert and not any(errs.values()) and not ds.get("isDirty")
-        out = {
-            "alert": alert,
-            **errs,
-            "graph_dirty": bool(ds.get("isDirty")),
-            "possibly_saved": saved,
-            "response_len": len(body),
-        }
+        out = _read_save_response(body)
+        if "server_error" in out:
+            return out  # codebehind crashed before validation — never guess saved
+        alert = out["alert"]
+        any_err = any([out["rows_error_text"], out["row_errors"], out["cell_errors"]])
+        saved = out["possibly_saved"]
         # If a selector rejected a value it couldn't resolve, point the caller at
         # the SubstituteKey gotcha (send the name/description, not the code/id).
-        # Check the alert + any per-row/per-cell error text this save surfaced.
-        _hint_src = " ".join(filter(None, [alert, *errs.get("rows_error_text", []),
-                                           *errs.get("row_errors", []),
-                                           *errs.get("cell_errors", [])]))
+        _hint_src = " ".join(filter(None, [alert, *out["rows_error_text"],
+                                           *out["row_errors"], *out["cell_errors"]]))
         _sel_hint = _selector_value_hint(_hint_src)
         if _sel_hint:
             out["selector_hint"] = _sel_hint
-        if operation == "insert" and (alert or any(errs.values())):
+        if operation == "insert" and (alert or any_err):
             # THE "Row i=0 COLLIDES WITH AN EXISTING ROW" THEORY IS REFUTED
             # (tested live 2026-07-20, csmdev CS205000/AttributeDetails).
             # `i` is a BATCH ORDINAL, not a row locator: the server assigns the
@@ -643,7 +707,7 @@ class AspxDiagnostic:
                 "(the row index is a batch ordinal, not a row locator; proven "
                 "live on CS205000). Verify what actually happened with "
                 "run_dac_odata rather than trusting this message.")
-        if not alert and not any(errs.values()) and ds.get("isDirty"):
+        if not alert and not any_err and out["graph_dirty"]:
             # Dirty graph + zero error text = the RowChanges never BOUND, so
             # validation never fired (proven live on GL202500: both insert and
             # update against the PRIMARY grid of a headerless list screen land
@@ -691,75 +755,114 @@ class AspxDiagnostic:
     async def _verify_save(self, grid_ctl: str, cells: dict[str, Any],
                            row_key: dict[str, Any] | None, operation: str,
                            rows_before: list[dict[str, str]]) -> dict[str, Any]:
-        """Re-read the grid after an apparently-clean Save and say what ACTUALLY
-        changed. Only meaningful when `possibly_saved` is True — that is exactly
-        the ambiguous case, where "no error" cannot distinguish a silent success
-        from a silent no-op.
-
-        Returns `save_verified`: True (the change is visibly there), False (the
-        grid is unchanged — a silent no-op, which this plane does produce), or
-        "unverified" with a reason when the read-back itself cannot decide.
-        Deletes additionally get `delete_verified` for symmetry with the classic
-        SOAP plane's field of the same name.
-
-        NOT a substitute for run_dac_odata: this reads the SCREEN's view of the
-        rows, so it can only prove the grid changed, not that the transaction
-        committed to the database. It rules out the silent no-op — the specific
-        failure this plane is known for — and nothing more.
-        """
+        """Re-read the grid after an apparently-clean single-op Save and return
+        the per-op verdict (see _verify_one_op) plus the row counts."""
         rows_after = _grid_rows(await self._grid_refresh(grid_ctl), grid_ctl)
-        if not rows_after and not rows_before:
-            return {"save_verified": "unverified",
-                    "verify_note": ("could not read any rows back from this grid "
-                                    "(no rows parsed before OR after), so the "
-                                    "change cannot be confirmed either way here "
-                                    "— verify with run_dac_odata.")}
-        if operation == "delete":
-            gone = not any(_row_matches(r, row_key or {}) for r in rows_after)
-            return {
-                "save_verified": gone, "delete_verified": gone,
-                "rows_before": len(rows_before), "rows_after": len(rows_after),
-                "verify_note": (
-                    f"row {row_key} is GONE from the grid on re-read — the delete "
-                    f"engaged and hit the intended row."
-                    if gone else
-                    f"SILENT NO-OP: the Save reported no error, but row {row_key} "
-                    f"is STILL PRESENT on re-read. Nothing was deleted. A row "
-                    f"REFERENCED elsewhere is refused exactly like this, with no "
-                    f"error text — check the screen's rules in kb-mcp-dual.")}
-        if operation == "insert":
-            grew = len(rows_after) > len(rows_before)
-            return {
-                "save_verified": grew,
-                "rows_before": len(rows_before), "rows_after": len(rows_after),
-                "verify_note": (
-                    f"row count went {len(rows_before)} -> {len(rows_after)}: a "
-                    f"row was added."
-                    if grew else
-                    f"SILENT NO-OP: no error was returned but the row count did "
-                    f"not change ({len(rows_before)}). Note insert targets "
-                    f"Row i=\"0\", so on a non-empty grid it may have OVERWRITTEN "
-                    f"an existing row rather than added one — compare the rows.")}
-        # update: the keyed row must now carry the values that were sent.
-        target = [r for r in rows_after if _row_matches(r, row_key or {})]
-        if not target:
-            return {"save_verified": "unverified",
-                    "verify_note": (f"could not find row {row_key} on re-read, so "
-                                    f"the update cannot be confirmed — verify with "
-                                    f"run_dac_odata.")}
-        mismatched = {f: {"sent": str(v), "now": target[0].get(f)}
-                      for f, v in cells.items()
-                      if f in target[0] and str(target[0][f]) != str(v)}
-        applied = [f for f in cells if f in target[0]]
-        if not applied:
-            return {"save_verified": "unverified",
-                    "verify_note": ("none of the changed fields are readable as "
-                                    "grid cells, so the update cannot be confirmed "
-                                    "— verify with run_dac_odata.")}
-        return {
-            "save_verified": not mismatched,
-            "verify_note": (
-                f"re-read confirms {applied} now hold the values sent."
-                if not mismatched else
-                f"SILENT NO-OP (at least partly): the Save reported no error but "
-                f"{list(mismatched)} did NOT change on re-read: {mismatched}.")}
+        v = _verify_one_op(operation, cells, row_key or {}, rows_before, rows_after)
+        v.setdefault("rows_before", len(rows_before))
+        v.setdefault("rows_after", len(rows_after))
+        return v
+
+    async def replay_grid_batch(self, grid_view: str,
+                                operations: list[dict[str, Any]]) -> dict[str, Any]:
+        """Apply MULTIPLE row changes to ONE grid in a SINGLE atomic Save.
+
+        The point is cross-row invariants. A grid like PY309000 EmployeeBankDetails
+        enforces "percent must sum to 100 across all rows", so a STANDALONE delete
+        of one row is rejected — the survivors no longer sum to 100. The browser
+        deletes-and-rebalances in one Save; this does the same by emitting several
+        RowChanges sections (e.g. <Deleted> + <Modified>) in one envelope.
+
+        operations: a list of {operation, cells, row_key, old_values} dicts, each
+        shaped exactly like replay_grid_save's args:
+            {"operation": "delete", "row_key": {"EmployeeBankDetailID": 14551}}
+            {"operation": "update", "row_key": {"EmployeeBankDetailID": 14550},
+             "cells": {"Percent": 100}}
+        Order is preserved within each section. Every op is pre-flighted against
+        ONE grid snapshot (unknown columns, no-match / partial keys) and the WHOLE
+        batch is refused if any op fails — nothing partial is sent. After a clean
+        Save the grid is re-read ONCE and each op gets its own verdict.
+
+        CAVEAT — verifying an INSERT inside a batch that also deletes is
+        unreliable (insert is verified by row-count growth, which a concurrent
+        delete masks); such inserts come back save_verified "unverified". As
+        always this proves the GRID changed, not that the txn committed — confirm
+        with run_dac_odata. DESTRUCTIVE if any op is a delete.
+        """
+        if not operations:
+            raise ScreenError("replay_grid_batch: operations is empty")
+        for i, op in enumerate(operations):
+            if op.get("operation") not in _SECTION:
+                raise ScreenError(
+                    f"operations[{i}]: unknown operation {op.get('operation')!r} "
+                    f"— use one of insert/update/delete.")
+            if op["operation"] == "delete" and not op.get("row_key"):
+                raise ScreenError(
+                    f"operations[{i}]: delete requires row_key (the row's FULL "
+                    f"key); without it it would fall back to row 0.")
+
+        grid_ctl, tab_ctl, tab_idx = self.find_grid_control(grid_view)
+        if tab_ctl is not None:
+            self._activate_tab(tab_ctl, tab_idx)
+        columns, rows_before = await self._grid_snapshot(grid_ctl)
+
+        # Pre-flight every op against the SAME snapshot; refuse the whole batch if
+        # any fails (an atomic Save that would half-apply is worse than not sent).
+        refusals = []
+        for i, op in enumerate(operations):
+            r = _preflight_op(op["operation"], op.get("cells") or {},
+                              op.get("row_key"), columns, rows_before)
+            if r:
+                refusals.append({"op_index": i, **r})
+        if refusals:
+            return {"grid_view": grid_view, "operations": len(operations),
+                    "refused_ops": refusals, "grid_columns": columns,
+                    "possibly_saved": False,
+                    "note": ("no Save was sent — every operation is validated "
+                             "against the grid first and one or more failed.")}
+
+        # Build one RowChanges with sibling sections, grouped by section; i is a
+        # per-section batch ordinal (not a locator — rows are keyed by cells).
+        by_section: dict[str, list[str]] = {}
+        for op in operations:
+            sec = _SECTION[op["operation"]]
+            rows = by_section.setdefault(sec, [])
+            rows.append(f'<Row i="{len(rows)}"><Cells>'
+                        f'{_cells_xml(op.get("cells") or {}, op.get("row_key"), op.get("old_values"))}'
+                        f'</Cells></Row>')
+        changes = ("<RowChanges>"
+                   + "".join(f"<{sec}>{''.join(rows)}</{sec}>"
+                             for sec, rows in by_section.items())
+                   + "</RowChanges>")
+        inner = f'<{grid_ctl}><![CDATA[{changes}]]></{grid_ctl}>'
+        body = await self._callback(_DS_CTL, _DS_ENVELOPE.format(cmd="Save", inner=inner))
+
+        out = _read_save_response(body)
+        result: dict[str, Any] = {"grid_view": grid_view,
+                                  "operations": len(operations), **out}
+        if "server_error" in out:
+            return result
+        _hint = _selector_value_hint(" ".join(filter(None, [
+            out["alert"], *out["rows_error_text"], *out["row_errors"],
+            *out["cell_errors"]])))
+        if _hint:
+            result["selector_hint"] = _hint
+        if out["possibly_saved"]:
+            rows_after = _grid_rows(await self._grid_refresh(grid_ctl), grid_ctl)
+            has_delete = any(o["operation"] == "delete" for o in operations)
+            verifs = []
+            for i, op in enumerate(operations):
+                v = _verify_one_op(op["operation"], op.get("cells") or {},
+                                   op.get("row_key"), rows_before, rows_after)
+                if op["operation"] == "insert" and has_delete and v["save_verified"] is not True:
+                    v = {"save_verified": "unverified",
+                         "verify_note": ("insert verification is by row-count "
+                                         "growth, which a concurrent delete in "
+                                         "this batch masks — confirm with "
+                                         "run_dac_odata.")}
+                verifs.append({"op_index": i, "operation": op["operation"], **v})
+            result["verifications"] = verifs
+            result["all_verified"] = all(v["save_verified"] is True for v in verifs)
+            result["rows_before"] = len(rows_before)
+            result["rows_after"] = len(rows_after)
+        return result

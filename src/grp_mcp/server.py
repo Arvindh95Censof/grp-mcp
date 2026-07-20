@@ -357,6 +357,37 @@ def _require_delete(instance: str | None) -> None:
         )
 
 
+def _classic_grid_missing(exc: Exception) -> bool:
+    """True when an ASPX-plane call failed because the grid has NO classic
+    binding on the page — a real, permanent limit of this plane (some grids,
+    e.g. CA202000 `ETDetails`, render only on the modern plane and emit no
+    classic control config). Distinguished from ordinary failures by
+    find_grid_control's specific messages so the caller can be routed to the
+    modern-plane tools instead of shown a bare error."""
+    m = str(exc)
+    return ("no control bound to view" in m
+            or "no control config declarations" in m)
+
+
+def _no_classic_grid_result(sid: str, grid_view: str, url: str,
+                            exc: Exception) -> dict:
+    """The routing payload for a grid the ASPX plane cannot address — point the
+    caller at the modern-plane grid tools, which key rows via /structure and
+    need no classic markup."""
+    return {
+        "ok": False, "screen_id": sid, "grid_view": grid_view, "page_url": url,
+        "no_classic_grid": True,
+        "error": str(exc),
+        "recommend": (
+            f"'{grid_view}' has no classic ASPX binding on this page, so the "
+            f"ASPX plane cannot address it (this grid renders only on the modern "
+            f"plane). Use the modern-plane grid tools instead: ui_read_grid to "
+            f"see the rows, then ui_delete_grid_row / ui_insert_grid_row / "
+            f"ui_update_grid_row — they address rows by key via /structure and "
+            f"do not need classic markup."),
+    }
+
+
 def _require_admin(op: str) -> None:
     """Gate config-file MUTATIONS behind an explicit opt-in env var — a separate,
     higher-trust gate than the per-instance write gates, since these edit the
@@ -2882,8 +2913,14 @@ async def diagnose_save_error(
         # empty record_key skips the step instead of failing "record did not
         # load" on a screen that has no record to load.
         dk = await d.navigate(record_key) if record_key else None
-        result = await d.replay_grid_save(grid_view, values, row_key=row_key,
-                                          old_values=old_values, operation=operation)
+        try:
+            result = await d.replay_grid_save(grid_view, values, row_key=row_key,
+                                              old_values=old_values,
+                                              operation=operation)
+        except ScreenError as e:
+            if _classic_grid_missing(e):
+                return _no_classic_grid_result(sid, grid_view, url, e)
+            raise
     return {"screen_id": sid, "page_url": url, "record_key": record_key,
             "record_loaded": bool(dk) if record_key else "skipped (headerless)",
             "grid_view": grid_view,
@@ -2967,12 +3004,95 @@ async def aspx_delete_grid_row(
         d = AspxDiagnostic(s, url)
         await d.open()
         dk = await d.navigate(record_key) if record_key else None
-        result = await d.replay_grid_save(grid_view, {}, row_key=row_key,
-                                          operation="delete")
+        try:
+            result = await d.replay_grid_save(grid_view, {}, row_key=row_key,
+                                              operation="delete")
+        except ScreenError as e:
+            if _classic_grid_missing(e):
+                return _no_classic_grid_result(sid, grid_view, url, e)
+            raise
     return {"screen_id": sid, "page_url": url, "record_key": record_key,
             "record_loaded": bool(dk) if record_key else "skipped (headerless)",
             "grid_view": grid_view, "row_key": row_key,
             "operation": "delete", **result}
+
+
+@mcp.tool()
+async def aspx_grid_batch(
+    screen_id: str,
+    record_key: dict,
+    grid_view: str,
+    operations: list[dict],
+    page_url: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Apply SEVERAL row changes to ONE grid in a SINGLE atomic Save over the
+    classic ASPX plane — the way to change a grid guarded by a CROSS-ROW INVARIANT.
+
+    PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen's rules
+    (the invariant you must satisfy, referenced-row constraints) before writing.
+
+    WHY THIS EXISTS: a grid like PY309000 `EmployeeBankDetails` enforces
+    "percent must sum to 100 across all rows", so deleting one row on its own is
+    REJECTED — the survivors no longer sum to 100. A human deletes AND rebalances
+    in one Save; aspx_delete_grid_row (one op) cannot. This sends several
+    RowChanges sections (e.g. <Deleted> + <Modified>) in one envelope, so the
+    net change satisfies the invariant and commits atomically.
+
+    operations: an ordered list of row changes, each shaped like
+        {"operation": "delete", "row_key": {"EmployeeBankDetailID": 14551}}
+        {"operation": "update", "row_key": {"EmployeeBankDetailID": 14550},
+         "cells": {"Percent": 100}}
+        {"operation": "insert", "cells": {...}}          # row_key unused
+      Keys must be the CLASSIC grid's column dataFields and each delete/update
+      row_key must be the row's FULL key (get it from run_dac_odata). Every op is
+      pre-flighted against ONE grid snapshot; if ANY op names an unknown column
+      or a no-match/partial key, the WHOLE batch is refused (`refused_ops`) and
+      NOTHING is sent — an atomic Save that half-applies is worse than none.
+    record_key: {keyField: value} to load the header (e.g. {"EmployeeCD":
+        "EMP001"}); pass {} for a headerless list screen.
+
+    After a clean Save the grid is re-read ONCE and each op gets its own verdict
+    in `verifications` (save_verified true|false|"unverified"); `all_verified` is
+    the AND of them. Same scope caveat as the other ASPX writes: this proves the
+    GRID changed, not that the transaction committed — confirm with run_dac_odata.
+    Verifying an insert INSIDE a batch that also deletes is unreliable (insert is
+    checked by row-count growth, which the delete masks) and returns "unverified".
+
+    DESTRUCTIVE — requires allow_delete when any op is a delete, else allow_write.
+    """
+    if any(op.get("operation") == "delete" for op in operations):
+        _require_delete(instance)
+    else:
+        _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    url = page_url
+    if not url:
+        sm = await run_dac_odata("SiteMap", filter=f"ScreenID eq '{_oq(sid)}'",
+                                 select="ScreenID,Url", top=1, instance=instance)
+        smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+        raw = smv[0].get("Url") if smv else None
+        if not raw or ".aspx" not in raw:
+            return {"ok": False, "screen_id": sid,
+                    "error": f"no classic ASPX page found for {sid} in the site map "
+                             f"(Url={raw!r}) — this screen has no classic plane; "
+                             f"pass page_url explicitly if the site map is wrong."}
+        url = inst.base_url.rstrip("/") + raw.lstrip("~")
+    async with ScreenClient(inst, sid) as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        dk = await d.navigate(record_key) if record_key else None
+        try:
+            result = await d.replay_grid_batch(grid_view, operations)
+        except ScreenError as e:
+            if _classic_grid_missing(e):
+                return _no_classic_grid_result(sid, grid_view, url, e)
+            raise
+    return {"screen_id": sid, "page_url": url, "record_key": record_key,
+            "record_loaded": bool(dk) if record_key else "skipped (headerless)",
+            **result}
 
 
 @mcp.tool()
@@ -7161,7 +7281,12 @@ _GUIDE = {
             "ui_delete_grid_row can't resolve the row because /structure omits the "
             "grid's columns, AND classic delete_row can't reach it because the key "
             "isn't a settable field in that container — the ASPX grid often still "
-            "exposes the key. Requires allow_delete)"],
+            "exposes the key. Requires allow_delete)",
+            "aspx_grid_batch (several row changes in ONE atomic Save on the ASPX "
+            "plane — the way to change a grid guarded by a CROSS-ROW INVARIANT, e.g. "
+            "delete one bank row AND rebalance the survivors to percent-sum 100 in "
+            "the same Save, which a standalone delete can't. Requires allow_delete "
+            "when any op deletes)"],
         "run a process / mass-action": ["ui_run_process (Process/ProcessAll to completion)",
             "manage_financial_periods, generate_master_calendar (GL recipes)"],
         "financial-foundation / GL setup": ["get_setup_guidance FIRST (per-screen prereqs, "
