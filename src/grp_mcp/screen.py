@@ -1663,6 +1663,54 @@ class ScreenClient:
                 })
         return out
 
+    @staticmethod
+    def _values_match(current: Any, sent: Any) -> bool:
+        """True if a field's CURRENT value equals what was sent — used ONLY to
+        tell a no-op re-set from a real refusal in reconcile_rejected_sets.
+
+        Conservative by design: exact match after a light normalize. A false
+        "no match" merely keeps a benign warning; a false "match" would HIDE a
+        real refusal, so this must never be loosened to fuzzy equality. Safe here
+        because it only ever sees clean->clean fields — those store the value
+        verbatim (keys/CDs), NOT the reformatted types (dates/selectors) that go
+        dirty and so never reach this path (that's why verify_sets forbids
+        value-equality but this may use it)."""
+        def norm(x: Any) -> str:
+            if isinstance(x, dict):           # selector {id, text}
+                return str(x.get("id") or x.get("text") or "").strip()
+            if isinstance(x, bool):
+                return "true" if x else "false"
+            return str(x).strip()
+        n = norm(sent)
+        return n != "" and n == norm(current)
+
+    async def reconcile_rejected_sets(
+            self, entries: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Split graph-net "rejected" sets into (genuine_refusals, no_ops).
+
+        The _rejected_sets net flags a set whose graph stayed clean->clean. That
+        is a REFUSAL only if the field does NOT already hold the sent value; if it
+        DOES, the set was a harmless no-op — e.g. re-setting a key to its current
+        value on an already-existing record (proven false-positive on CS101500 /
+        CS102000 `AcctCD` during a verify pass; the record was created fine, yet
+        the net cried "silently refused"). Reading the fields back distinguishes
+        the two in ONE round-trip. If the read-back itself fails, everything is
+        kept as genuine (never silently drop a real refusal)."""
+        if not entries:
+            return [], []
+        try:
+            live = await self.read_field_values(sorted({e["view"] for e in entries}))
+        except Exception:  # noqa: BLE001 — can't reconcile -> keep all (safe side)
+            return list(entries), []
+        genuine, no_ops = [], []
+        for e in entries:
+            cur = live.get((e["view"], e["field"]))
+            if cur is not None and self._values_match(cur, e.get("value")):
+                no_ops.append({**e, "current": cur})
+            else:
+                genuine.append(e)
+        return genuine, no_ops
+
     async def ui_resolve_selector(self, view: str, field: str, search: str,
                                    pick: dict | None = None) -> dict:
         """Resolve a lookup/selector FORM field to its `{id, text}` value — the modern

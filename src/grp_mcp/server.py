@@ -2130,7 +2130,16 @@ async def ui_screen_action(
         # without changing the field (nothing to read back, so the read-back is blind).
         rejected = list(read_back)
         seen = {(r["view"], r["field"]) for r in rejected}
-        rejected += [r for r in s._rejected_sets if (r["view"], r["field"]) not in seen]
+        graph_net = [r for r in s._rejected_sets if (r["view"], r["field"]) not in seen]
+        # GUARD against a clean->clean FALSE POSITIVE: that net fires when the graph
+        # never changed, which is a refusal ONLY if the field doesn't already hold
+        # the sent value. Re-setting a key to its current value on an existing
+        # record is a no-op, not a refusal (measured false positive on CS101500/
+        # CS102000 AcctCD during a verify pass — record created fine). Read the
+        # fields back and keep only the genuine refusals; report the no-ops
+        # separately so the observation isn't just swallowed.
+        genuine_rej, noop_sets = await s.reconcile_rejected_sets(graph_net)
+        rejected += genuine_rej
         saved = None
         if save_after and action != "Save":
             save_res = await s.ui_command("Save", answer=dialog_answer)
@@ -2169,6 +2178,12 @@ async def ui_screen_action(
             f"{len(rejected)} field value(s) were SILENTLY REFUSED by the screen and "
             f"never written — see rejected_fields. The action still ran, so any result "
             f"above reflects the record WITHOUT them. Fix the value(s) and re-run.")
+    if noop_sets:
+        # Informational, NOT a failure: these sets changed nothing because the field
+        # already held the value (e.g. re-setting a key on an existing record). They
+        # are NOT counted as rejected and do not affect ok — surfaced only so a
+        # clean->clean set isn't mistaken for either a refusal or a silent success.
+        out["noop_fields"] = noop_sets
     if unverifiable_fields:
         # NOT a failure signal (unlike rejected_fields) — genuinely unknown, not
         # confirmed-bad. Don't touch `ok`; just surface it so nobody mistakes silence

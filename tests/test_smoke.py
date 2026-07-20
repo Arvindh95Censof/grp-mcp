@@ -751,6 +751,67 @@ def test_set_field_cannot_see_refusal_once_graph_is_dirty():
     assert s._rejected_sets == []  # not a bug: the signal genuinely cannot discriminate
 
 
+# ---- reconcile_rejected_sets: the clean->clean FALSE-POSITIVE guard ----------
+#
+# The graphIsDirty net fires clean->clean even when the field ALREADY holds the
+# sent value (re-setting a key on an existing record is a no-op, not a refusal).
+# Measured false positive on CS101500/CS102000 AcctCD during a verify pass -- the
+# record was created fine, yet the net cried "silently refused". The reconcile
+# step reads the fields back and keeps only the genuine refusals.
+
+def _reconcile(entries, stored):
+    s = _client("CS101500")
+    s._http = _ReadBackHTTP(stored)
+    s._logged_in = True
+    s._ui_booted = True
+    return asyncio.run(s.reconcile_rejected_sets(entries))
+
+
+def test_reconcile_drops_key_reset_noop():
+    # THE reported false positive: AcctCD already holds "AI" -> no-op, not refused
+    genuine, noops = _reconcile(
+        [{"view": "BAccount", "field": "AcctCD", "value": "AI"}],
+        {("BAccount", "AcctCD"): "AI"})
+    assert genuine == []
+    assert len(noops) == 1 and noops[0]["field"] == "AcctCD" and noops[0]["current"] == "AI"
+
+
+def test_reconcile_keeps_genuine_refusal():
+    # field holds a DIFFERENT value than sent -> a real refusal, must survive
+    genuine, noops = _reconcile(
+        [{"view": "BAccount", "field": "AcctCD", "value": "NEW"}],
+        {("BAccount", "AcctCD"): "OLD"})
+    assert noops == []
+    assert len(genuine) == 1 and genuine[0]["value"] == "NEW"
+
+
+def test_reconcile_keeps_when_field_not_readable():
+    # can't read the field back -> conservatively KEEP (never silently drop a real refusal)
+    genuine, noops = _reconcile(
+        [{"view": "BAccount", "field": "AcctCD", "value": "AI"}], {})
+    assert noops == [] and len(genuine) == 1
+
+
+def test_reconcile_empty_makes_no_round_trip():
+    s = _client("CS101500")
+    s._http = _ReadBackHTTP({})
+    s._logged_in = True
+    s._ui_booted = True
+    assert asyncio.run(s.reconcile_rejected_sets([])) == ([], [])
+    assert s._http.posts == 0
+
+
+def test_values_match_is_conservative():
+    m = ScreenClient._values_match
+    assert m("AI", "AI")                                   # key re-set no-op
+    assert not m("OLD", "NEW")                             # real refusal
+    assert m("V1", {"id": "V1", "text": "Acme"})          # selector: id vs {id,text}
+    assert m({"id": "V1", "text": "Acme"}, {"id": "V1"})  # both selector shapes
+    assert m("true", True) and m(True, True)              # bool normalize
+    assert not m("", "")                                   # blank sent never matches
+    assert not m("AI", "")                                 # blank sent never matches
+
+
 # ---- relocated tool notes ---------------------------------------------------
 #
 # Trimming a docstring only saves tokens if the text it dropped is still REACHABLE.
@@ -3653,6 +3714,10 @@ class _FakeUIScreenClient:
 
     async def verify_sets(self, sets):
         return []
+
+    async def reconcile_rejected_sets(self, entries):
+        # no _rejected_sets are produced in these tests; keep all as genuine
+        return list(entries), []
 
     async def ui_command(self, action, answer=None):
         return {"graphIsDirty": self._dirty_after_action}
