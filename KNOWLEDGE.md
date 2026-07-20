@@ -174,13 +174,16 @@ instructions; honor it. Pure reads are exempt.
 
   **Reliable patterns:** INSERT = `new_row` + sets. TARGETED UPDATE/DELETE = `set <KEY field>` to
   select the row, then edit or `delete_row` (see the row-targeting bullet above — this works).
-  **You are only stuck on row 0 when the key is NOT exposed** as a settable field in that
-  container (`EmployeeBankDetailID` is absent from `BankDetails`), and then there is nothing to
-  address a row with at all. Fallback order there: modern plane (`ui_delete_grid_row`) → but that
-  needs `/structure` column metadata, which some grids omit (§11) → then the **browser UI is the
-  only path**. Last-resort workaround when the surrogate key isn't referenced by anything: delete
-  every row and re-insert — it **burns identity values every time** (EMP001's bank row went
-  14542 → 14547 → 14550 across two restores).
+  **The classic-SOAP plane is stuck on row 0 when the key is NOT a settable field in that
+  container** (`EmployeeBankDetailID` is absent from `BankDetails`). Escalation order for that
+  case: (1) modern `ui_delete_grid_row` — needs `/structure` column metadata, which some grids
+  omit (§11); (2) **`aspx_delete_grid_row` / `diagnose_save_error(operation="delete")` — the
+  classic ASPX grid often exposes the key even when BOTH of the above can't see it** (proven: the
+  ASPX plane addresses PY309000's bank rows by `EmployeeBankDetailID`, which is invisible to SOAP
+  and `/structure`); (3) browser UI only if even the ASPX grid lacks the key. See §11 for the
+  ASPX-delete mechanics + the FULL-KEY requirement. The old delete-every-row-and-reinsert
+  workaround is now a last resort — it **burns identity values every time** (EMP001's bank row
+  went 14542 → 14547 → 14550 → 14552 across restores).
 - **A delete of a REFERENCED row is refused SILENTLY — `ok:true`, no error, row survives.** This
   is the real "silent no-op delete" (re-confirmed 2026-07-20, see the `_verify_deletes` entry
   above): Acumatica blocks the delete because something else points at the row, but the classic
@@ -753,6 +756,31 @@ first — usually the richest per-field/per-row detail when the classic plane ca
 since insert in particular can still reach validation a read/update can't. Verify with
 `run_dac_odata` either way; revert any accidental real persist immediately (this was tested live,
 reverted, and re-verified — see the ASPX protocol memory for the exact repro/revert).
+
+**Escalation order to DELETE a specific grid row**: (1) modern `ui_delete_grid_row` (key-addressed,
+needs `/structure` column metadata); (2) classic `screen_submit` `delete_row` — only reaches a
+non-row-0 row if the key is a settable field in the container; (3) `aspx_delete_grid_row` — the
+ASPX grid usually exposes the key even when the other two can't (see the ASPX-delete paragraph
+below for the full-key requirement); (4) browser UI. Read back after any of them.
+
+**ASPX targeted DELETE — the plane can address a row that SOAP and `/structure` both can't
+(built + proven live 2026-07-20, v0.64.12).** The classic ASPX grid exposes its key as a real
+dataField even where the SOAP container schema AND the modern `/structure` omit it — so
+`aspx_delete_grid_row` (or `diagnose_save_error(operation="delete")`) can remove a specific row by
+key on those grids. Two facts proven live: (a) `row_key` genuinely BINDS on this plane — an update
+keyed to PY309000's 2nd bank row changed only that row, row 0 untouched; (b) a keyed `<Deleted>`
+RowChanges section PERSISTS and hits the right row — on CS205000 `AttributeDetails`, deleting the
+middle value by key left the other two. **HARD REQUIREMENT: `row_key` must be the row's FULL key
+— every key cell.** A single-column identity key needs one cell (`EmployeeBankDetailID`); a
+COMPOSITE key needs all parts — CS205000's `ValueID` alone SILENTLY no-op'd (`possibly_saved:true`,
+nothing deleted), `AttributeID`+`ValueID` worked. A `delete` with no `row_key` is refused up front
+(it would fall back to row 0). Caveat: on a grid with a cross-row invariant a standalone delete may
+still be rejected — PY309000's `EmployeeBankDetails` delete ENGAGES (sum drops, a row leaves the
+working set) but the 100%-sum rule rejects the Save; that's the same domain constraint a human
+hits, not a tool limit (rebalance in the same operation). **Two live over-claims this build, both
+caught by reading the DB back**: a partial-key delete that reported `possibly_saved:true` had
+changed nothing, and "engages" on PY309000 is not "persists". `possibly_saved`/`ok:true` prove
+nothing — always `run_dac_odata`.
 
 **`replay_grid_save`'s `operation="insert"` always targets `Row i="0"` — unreliable on a
 non-empty grid (external bug report, PY309000/EmployeeBankDetails, 2026-07-20, reproduced

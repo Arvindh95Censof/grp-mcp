@@ -2891,6 +2891,79 @@ async def diagnose_save_error(
 
 
 @mcp.tool()
+async def aspx_delete_grid_row(
+    screen_id: str,
+    record_key: dict,
+    grid_view: str,
+    row_key: dict,
+    page_url: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Delete ONE grid row by key over the classic ASPX plane — the last resort
+    when neither other plane can address the row.
+
+    PRECONDITION (KB-first policy): consult kb-mcp-dual for the screen's rules
+    before deleting; a row referenced elsewhere is refused SILENTLY (see below).
+
+    WHEN TO USE THIS — only after the normal routes fail:
+      1. `ui_delete_grid_row` (modern, key-addressed) — preferred, but it needs
+         the grid's `/structure` column metadata, which some grids omit entirely
+         (then `ui_read_grid` returns 0 rows and it cannot resolve the row);
+      2. `screen_submit` `delete_row` (classic SOAP) — but that always deletes
+         ROW 0, and it can only target another row if the grid's KEY is exposed
+         as a settable field in that container's schema;
+      3. THIS — the classic ASPX grid often exposes the key as a real dataField
+         even when BOTH of the above cannot see it. Proven on PY309000
+         `EmployeeBankDetails`, whose `EmployeeBankDetailID` is absent from the
+         SOAP container AND from `/structure`, yet is a live ASPX column.
+
+    row_key: the row's FULL key {keyField: value, ...} — get it from
+        `run_dac_odata`. REQUIRED: without it the delete falls back to row 0 and
+        removes the WRONG row, so it is refused up front. Must carry EVERY key
+        column: a single identity key needs one cell (PY309000
+        {"EmployeeBankDetailID": 14551}); a COMPOSITE key needs all parts
+        (CS205000 {"AttributeID": "COLOR", "ValueID": "RED"}) — a partial key
+        matches nothing and SILENTLY no-ops (`possibly_saved:true`, row survives).
+        Key names must be the CLASSIC grid's column dataFields (unknown keys are
+        refused with the real `grid_columns` list).
+    record_key: {keyField: value} loading the header record (e.g.
+        {"EmployeeCD": "EMP001"}); pass {} for a headerless list screen.
+
+    DESTRUCTIVE — requires allow_delete (stricter than allow_write). A row that
+    something else REFERENCES is refused SILENTLY: `ok` looks clean and the row
+    SURVIVES, with no error (Acumatica blocks it; the classic Submit doesn't
+    fault). The result therefore carries `deleted_verified` from a real
+    `run_dac_odata` read-back — trust THAT, not the absence of an error.
+    """
+    _require_delete(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    url = page_url
+    if not url:
+        sm = await run_dac_odata("SiteMap", filter=f"ScreenID eq '{_oq(sid)}'",
+                                 select="ScreenID,Url", top=1, instance=instance)
+        smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+        raw = smv[0].get("Url") if smv else None
+        if not raw or ".aspx" not in raw:
+            return {"ok": False, "screen_id": sid,
+                    "error": f"no classic ASPX page found for {sid} in the site map "
+                             f"(Url={raw!r}) — this screen has no classic plane; "
+                             f"pass page_url explicitly if the site map is wrong."}
+        url = inst.base_url.rstrip("/") + raw.lstrip("~")
+    async with ScreenClient(inst, sid) as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        dk = await d.navigate(record_key) if record_key else None
+        result = await d.replay_grid_save(grid_view, {}, row_key=row_key,
+                                          operation="delete")
+    return {"screen_id": sid, "page_url": url, "record_key": record_key,
+            "record_loaded": bool(dk) if record_key else "skipped (headerless)",
+            "grid_view": grid_view, "row_key": row_key,
+            "operation": "delete", **result}
+
+
+@mcp.tool()
 async def screen_submit(
     screen_id: str,
     commands: list[dict],
@@ -7071,7 +7144,12 @@ _GUIDE = {
             "ui_grid_row_action (select row + fire action)",
             "diagnose_save_error (a grid save failed with only the generic 'record "
             "raised at least one error'? — replay it on the classic ASPX plane to "
-            "recover the REAL validation message)"],
+            "recover the REAL validation message)",
+            "aspx_delete_grid_row (LAST RESORT delete-by-key: use when "
+            "ui_delete_grid_row can't resolve the row because /structure omits the "
+            "grid's columns, AND classic delete_row can't reach it because the key "
+            "isn't a settable field in that container — the ASPX grid often still "
+            "exposes the key. Requires allow_delete)"],
         "run a process / mass-action": ["ui_run_process (Process/ProcessAll to completion)",
             "manage_financial_periods, generate_master_calendar (GL recipes)"],
         "financial-foundation / GL setup": ["get_setup_guidance FIRST (per-screen prereqs, "

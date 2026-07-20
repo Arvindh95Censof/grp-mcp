@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from grp_mcp.aspx import (AspxDiagnostic, _grid_errors, _parse_control_blocks,
                           _parse_hidden_inputs, _row0_readonly_fields,
                           _xml_attr_escape)
@@ -272,6 +274,71 @@ def test_replay_grid_save_no_note_when_error_present():
         "GLTranModuleBatNbr", {"CuryCreditAmt": 50}))
     assert result["alert"] == "Boom"
     assert "note" not in result
+
+
+def test_replay_grid_save_delete_emits_deleted_section_with_row_key():
+    # operation="delete" must emit a <Deleted> RowChanges section carrying the
+    # row_key cells — that key is what targets a SPECIFIC row (binding proven
+    # live on PY309000: an update keyed to row 1 left row 0 untouched).
+    sent = {}
+
+    d = _diag_with_html(_GL301000_GRID_JS)
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        if cbparam.startswith("Refresh|"):
+            return _GL_REFRESH_BODY
+        sent["body"] = cbparam
+        return ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{}"/>'
+                ']]></ctl00_phDS_ds>')
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    asyncio.run(d.replay_grid_save("GLTranModuleBatNbr", {},
+                                   row_key={"LineNbr": 7}, operation="delete"))
+    assert "<Deleted>" in sent["body"]
+    assert "Inserted" not in sent["body"] and "Modified" not in sent["body"]
+    assert 'Key="LineNbr"' in sent["body"] and 'Value="7"' in sent["body"]
+
+
+def test_replay_grid_save_delete_emits_every_key_cell_for_composite_key():
+    # A COMPOSITE key must emit ALL its cells — a partial key matches nothing and
+    # the server silently no-ops (proven live on CS205000: ValueID alone did
+    # nothing; AttributeID+ValueID deleted the row). The XML builder is what has
+    # to carry every part; passing the full key is the caller's responsibility.
+    sent = {}
+    d = _diag_with_html(_GL301000_GRID_JS)
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        if cbparam.startswith("Refresh|"):
+            return _GL_REFRESH_BODY
+        sent["body"] = cbparam
+        return ('0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{}"/>'
+                ']]></ctl00_phDS_ds>')
+
+    d._callback = fake_callback  # type: ignore[method-assign]
+    asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {},
+        row_key={"Module": "GL", "BatchNbr": "GL0001"}, operation="delete"))
+    assert 'Key="Module"' in sent["body"] and 'Value="GL"' in sent["body"]
+    assert 'Key="BatchNbr"' in sent["body"] and 'Value="GL0001"' in sent["body"]
+
+
+def test_replay_grid_save_delete_without_row_key_is_refused():
+    # No key -> the Deleted section would carry nothing identifying and the
+    # server falls back to row 0, silently destroying the WRONG row. Must refuse
+    # BEFORE any network call.
+    from grp_mcp.screen import ScreenError
+
+    d = _diag_with_html(_GL301000_GRID_JS)
+
+    async def boom(cbid, cbparam, extra=None):  # must never be reached
+        raise AssertionError("no callback should be made without a row_key")
+
+    d._callback = boom  # type: ignore[method-assign]
+    with pytest.raises(ScreenError) as e:
+        asyncio.run(d.replay_grid_save("GLTranModuleBatNbr", {},
+                                       operation="delete"))
+    assert "requires row_key" in str(e.value)
+    assert "row 0" in str(e.value)
 
 
 def test_replay_grid_save_attaches_selector_hint_on_cannot_be_found():

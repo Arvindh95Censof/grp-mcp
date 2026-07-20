@@ -328,8 +328,25 @@ class AspxDiagnostic:
         operation "update": `cells` are the changed cells; `row_key` identifies
         the existing row (its cells ride along, e.g. {"EmployeeBankDetailID":
         14542}). "insert": `cells` are the new row's cells; row_key unused.
+        "delete": `row_key` identifies the row to REMOVE (`cells` may be empty);
+            it must carry the row's FULL key — ALL key cells, not just one. A
+            single-column identity key needs one cell (PY309000
+            EmployeeBankDetailID); a COMPOSITE key needs every part or the
+            server matches nothing and SILENTLY no-ops (proven live on CS205000
+            AttributeDetails: `ValueID` alone did nothing, `AttributeID`+`ValueID`
+            deleted the exact row). Always read back — a partial-key delete
+            returns a clean `possibly_saved:true` while changing nothing.
         old_values: optional {field: previousValue} — included as OldValue attrs
         (browser parity; not required for validation to fire).
+
+        ROW TARGETING (proven live 2026-07-20, PY309000 EmployeeBankDetails):
+        `row_key` genuinely binds to the named row on THIS plane — an update
+        keyed to the 2nd row changed only that row, leaving row 0 untouched.
+        That matters because the classic SOAP container schema and the modern
+        /structure can BOTH omit a grid's key while the classic ASPX grid still
+        exposes it (EmployeeBankDetailID is absent from the SOAP `BankDetails`
+        container and from /structure, but IS a real ASPX dataField) — so this
+        plane can address rows the other two cannot.
 
         Cell keys are validated against the grid's REAL column dataFields
         (harvested via a Refresh first — see _grid_columns): an unknown key is
@@ -340,6 +357,16 @@ class AspxDiagnostic:
         WARNING: this POSTS a real Save. If the change is actually VALID the
         server PERSISTS it. Use only to diagnose a change that already failed.
         """
+        if operation == "delete" and not row_key:
+            # Without a key the Deleted section carries no identifying cells and
+            # the server falls back to row 0 — silently destroying the WRONG row.
+            # Refuse before any network call rather than guess.
+            raise ScreenError(
+                "operation='delete' requires row_key identifying the row to "
+                "remove (e.g. {\"EmployeeBankDetailID\": 14551}); without it the "
+                "delete would fall back to row 0 and remove the wrong row. Get "
+                "the key from run_dac_odata.")
+
         grid_ctl, tab_ctl, tab_idx = self.find_grid_control(grid_view)
         if tab_ctl is not None:
             self._activate_tab(tab_ctl, tab_idx)
@@ -377,7 +404,13 @@ class AspxDiagnostic:
                 f'<Cell Value="{_xml_attr_escape(v)}"{oattr} Key="{f}"/>')
         for f, v in (row_key or {}).items():
             cell_xml.append(f'<Cell Value="{_xml_attr_escape(v)}" Key="{f}"/>')
-        section = "Inserted" if operation == "insert" else "Modified"
+        # "Deleted" removes the row identified by the row_key cells above. Unlike
+        # the classic SOAP plane — whose delete_row can only ever take ROW 0, and
+        # which on this grid has no key to address a row with at all — a keyed
+        # Deleted section targets a specific row (row_key binding proven live).
+        section = ("Inserted" if operation == "insert"
+                   else "Deleted" if operation == "delete"
+                   else "Modified")
         changes = (f'<RowChanges><{section}><Row i="0"><Cells>'
                    f'{"".join(cell_xml)}</Cells></Row></{section}></RowChanges>')
         inner = (f'<{grid_ctl}><![CDATA[{changes}]]></{grid_ctl}>')
