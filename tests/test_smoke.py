@@ -1288,6 +1288,42 @@ def test_topo_order_linear_and_cycle():
     assert set(cyclic) == {"P", "Q"}
 
 
+def test_selector_value_hint_matches_cannot_be_found():
+    from grp_mcp.screen import _selector_value_hint
+    hint = _selector_value_hint("'Employee Bank' cannot be found in the system.")
+    assert hint is not None
+    assert "SubstituteKey" in hint
+    assert "value_field" in hint
+    # case-insensitive
+    assert _selector_value_hint("X CANNOT BE FOUND IN THE SYSTEM") is not None
+
+
+def test_selector_value_hint_ignores_other_errors():
+    from grp_mcp.screen import _selector_value_hint
+    assert _selector_value_hint("Percent should be 100 for sum of all banks") is None
+    assert _selector_value_hint("'Employee Bank' cannot be empty.") is None
+    assert _selector_value_hint(None) is None
+    assert _selector_value_hint("") is None
+
+
+def test_parse_field_errors_attaches_selector_hint():
+    # A "cannot be found in the system" field error gets an actionable hint;
+    # an unrelated field error does not.
+    xml = (
+        "<Content><Value>"
+        "<FieldName>EmployeeBankID</FieldName><ObjectName>CSPYEmployeeBankDetail</ObjectName>"
+        "<Message>'Employee Bank' cannot be found in the system.</Message>"
+        "<IsError>true</IsError></Value>"
+        "<Value><FieldName>Percent</FieldName>"
+        "<Message>'Percent' cannot be empty.</Message><IsError>true</IsError></Value>"
+        "</Content>")
+    errs = ScreenClient._parse_field_errors(xml)
+    by_field = {e["field"]: e for e in errs}
+    assert "hint" in by_field["EmployeeBankID"]
+    assert "SubstituteKey" in by_field["EmployeeBankID"]["hint"]
+    assert "hint" not in by_field["Percent"]
+
+
 def test_leaf_class_name():
     from grp_mcp.screen import _leaf
     assert _leaf("Payroll.Graph.Entry.CSPYOvertimeRate") == "cspyovertimerate"

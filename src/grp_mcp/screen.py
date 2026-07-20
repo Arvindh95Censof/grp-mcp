@@ -398,6 +398,37 @@ def _lookup_meta(field_state: dict) -> dict | None:
     }
 
 
+# A selector that rejects a value it can't resolve reports "<X> cannot be found
+# in the system" — even when that value demonstrably exists in the target table.
+# The usual cause (proven live on PY309000's EmployeeBankID, whose selector is
+# PXSelector(..., SubstituteKey = CSPYEmployeeBank.name)) is a SubstituteKey: the
+# field accepts the record's DISPLAY name/description, NOT its code or numeric ID.
+# Sending "MBB" (the code) or 1148 (the id) fails; sending the bank's full name
+# resolves. This is invisible from the API — the SubstituteKey lives only in the
+# compiled DAC — so the value_form to send can't be auto-derived for a grid whose
+# /structure omits column metadata. The next best thing is to TELL the caller.
+_SELECTOR_NOT_FOUND_RE = re.compile(r"cannot be found in the system", re.IGNORECASE)
+
+
+def _selector_value_hint(message: str | None) -> str | None:
+    """If `message` is a selector rejecting an unresolvable value ('<X> cannot be
+    found in the system'), return actionable guidance that the field may be a
+    SubstituteKey selector expecting the display name/description (not the code or
+    id); None otherwise. Pure/unit-testable — used to annotate write-tool errors."""
+    if message and _SELECTOR_NOT_FOUND_RE.search(message):
+        return (
+            "this looks like a selector that couldn't resolve the value you sent. "
+            "Many selectors use a SubstituteKey — they accept the target record's "
+            "DISPLAY name/description, NOT its code or numeric id (proven live: "
+            "PY309000 'Employee Bank' rejects the code 'MBB' and the id 1148 but "
+            "accepts the bank's full name). To find the right value: read the "
+            "field's lookup.value_field from ui_get_structure and send THAT "
+            "column; if the grid exposes no column metadata, query the lookup's "
+            "target table with run_dac_odata and send its name/description value."
+        )
+    return None
+
+
 def _selector_grid_payload(sel: dict, field: str, data_view: str, search: str,
                             active_row_contexts: list | None = None) -> dict:
     """The POST body for a selector field's grid sub-endpoint (pure, unit-testable).
@@ -3293,12 +3324,17 @@ class ScreenClient:
             msg = el.find("Message")
             iserr = el.find("IsError")
             if msg is not None and msg.text and (iserr is None or iserr.text == "true"):
-                out.append({
+                text = re.sub(r"\s+", " ", msg.text).strip()
+                entry = {
                     "field": (el.findtext("FieldName") or None),
                     "object": (el.findtext("ObjectName") or None),
-                    "message": re.sub(r"\s+", " ", msg.text).strip(),
+                    "message": text,
                     "level": (el.findtext("ErrorLevel") or None),
-                })
+                }
+                hint = _selector_value_hint(text)
+                if hint:
+                    entry["hint"] = hint
+                out.append(entry)
         return out
 
     async def export(

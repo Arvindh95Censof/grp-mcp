@@ -274,6 +274,30 @@ def test_replay_grid_save_no_note_when_error_present():
     assert "note" not in result
 
 
+def test_replay_grid_save_attaches_selector_hint_on_cannot_be_found():
+    # A save whose alert is a selector "cannot be found" error gets a
+    # selector_hint pointing at the SubstituteKey gotcha; an unrelated alert
+    # (percent rule) does not.
+    found_body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;\'Employee Bank\' cannot be found in the system.&quot;,'
+        '&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+    d = _diag_stub(_GL301000_GRID_JS, found_body)
+    result = asyncio.run(d.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50}))
+    assert "selector_hint" in result
+    assert "SubstituteKey" in result["selector_hint"]
+
+    percent_body = (
+        '0|<ctl00_phDS_ds><![CDATA[<ctl00_phDS_ds Props="{&quot;alert&quot;:'
+        '&quot;Percent should be 100 for sum of all banks&quot;,'
+        '&quot;isDirty&quot;:1}"/>]]></ctl00_phDS_ds>')
+    d2 = _diag_stub(_GL301000_GRID_JS, percent_body)
+    result2 = asyncio.run(d2.replay_grid_save(
+        "GLTranModuleBatNbr", {"CuryCreditAmt": 50}))
+    assert "selector_hint" not in result2
+
+
 def test_replay_grid_save_insert_with_error_gets_row_collision_note():
     # operation="insert" always emits Row i="0" regardless of live row count
     # (external bug report 2026-07-20, reproduced independently on

@@ -45,7 +45,7 @@ from html import unescape
 from typing import Any
 from urllib.parse import quote
 
-from .screen import ScreenClient, ScreenError
+from .screen import ScreenClient, ScreenError, _selector_value_hint
 
 _CB_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -414,6 +414,15 @@ class AspxDiagnostic:
             "possibly_saved": saved,
             "response_len": len(body),
         }
+        # If a selector rejected a value it couldn't resolve, point the caller at
+        # the SubstituteKey gotcha (send the name/description, not the code/id).
+        # Check the alert + any per-row/per-cell error text this save surfaced.
+        _hint_src = " ".join(filter(None, [alert, *errs.get("rows_error_text", []),
+                                           *errs.get("row_errors", []),
+                                           *errs.get("cell_errors", [])]))
+        _sel_hint = _selector_value_hint(_hint_src)
+        if _sel_hint:
+            out["selector_hint"] = _sel_hint
         if operation == "insert" and (alert or any(errs.values())):
             # Row i="0" is hardcoded for EVERY insert regardless of how many
             # rows already exist in the live grid (see the RowChanges XML

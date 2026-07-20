@@ -656,18 +656,43 @@ non-empty grid, verify independently via `run_dac_odata`, or retest against a ge
 if available. Same discipline as `possibly_saved`'s uncertainty note — flag what's not known rather
 than present a fabricated-looking error as confirmed validation.
 
-**The same report also surfaced (not grp-mcp bugs, documented for reference):** (1) PY309000's
-`EmployeeBankID`/`TptEmployeeBankID`/`SchemeCD` selectors return a generic "cannot be found in the
-system" on BOTH classic SOAP and the ASPX diagnostic plane even for confirmed-valid values (e.g.
-`EmployeeBankID` CD `MBB`, verified to exist via `run_dac_odata` on `CSPYEmployeeBank`) — an
-Acumatica/customization-side `PXSelector` wiring gap, not something grp-mcp's client code can work
-around. (2) `ui_get_structure`'s `grids` section returns ONLY the key field for every grid on
-PY309000 (`EmployeeBankDetails`, `EmploymentHistories`, `EmpPayTransactions`,
-`EmployeeProjects`, `EmployeeInstitutions`, `EmployeeCashAward` — checked all six, all show
-`columns: [<key field only>]`) — confirmed this is grp-mcp faithfully parsing whatever Acumatica's
-own `/structure` response contains (`screen.py` does `cd.get("columns")` with no filtering), so
-the gap is server-side, not a grp-mcp extraction bug. Whether this is PY309000-specific or a
-broader custom-PY-module pattern is unconfirmed — not swept.
+**The "cannot be found in the system" selector error is a SubstituteKey — send the display
+name, NOT the code/id (root-caused from source + a live persisted write; CORRECTS an earlier
+wrong conclusion).** PY309000's `EmployeeBankID` and `TptEmployeeBankID` reject a confirmed-valid
+value with *"'Employee Bank' cannot be found in the system"* — the code `MBB` AND the numeric id
+`1148` both fail, even though the bank exists (`run_dac_odata` on `CSPYEmployeeBank`). An earlier
+version of this doc called that an "unresolvable Acumatica-side wiring gap grp-mcp can't work
+around." **That was wrong.** Reading the customization source (Payroll.dll's DAC, from the vendor
+source zip) showed the cause: `[PXSelector(... , SubstituteKey = typeof(CSPYEmployeeBank.name))]`.
+A `SubstituteKey` selector accepts the target record's DISPLAY value — here the bank's **name**
+(`"Malayan Banking Berhad (Maybank)"`), not its code or id. Sending the name **resolves**, proven
+by a real committed insert via `screen_submit` (a new `CSPYEmployeeBankDetail` row persisted, bank
+id 1148, verified in the DB). So these fields ARE writable through grp-mcp today — the whole
+failure was a value-form mismatch. General rule: for a selector, send the value of the column
+named by `ui_get_structure`'s `lookup.value_field`; when that's absent (see #2 below) or a
+known-good value gets "cannot be found," it's a SubstituteKey — query the target table and send
+its **name/description**. (Third field, `EmployeeInstitution.SchemeCD`, is a different shape — an
+aggregated `Search4<…GroupBy>` selector, no SubstituteKey — not retested with this understanding.)
+
+**Selector-hint annotation (shipped):** because the SubstituteKey can't be read from any runtime
+API (it lives only in the compiled DAC), grp-mcp can't auto-translate the value for a
+metadata-blind grid — but it now DETECTS the "cannot be found in the system" error and attaches an
+actionable `hint`/`selector_hint` to the result of `screen_submit` (per-field-error `hint`) and
+`diagnose_save_error` (`selector_hint`), telling the caller to send the name/description. Pure
+helper `_selector_value_hint` in `screen.py`. (An auto-translate for *exposed* selectors was
+considered and deferred: it only helps selectors whose `/structure` metadata is present — which
+mostly already work via `value_field` — and it's gated on verifying whether `value_field` reports
+the substitute key vs. the display code when they differ, which wasn't confirmable on an exposed
+field of that shape.)
+
+**Also (not a grp-mcp bug):** `ui_get_structure`'s `grids` section returns ONLY the key field for
+every grid on PY309000 (`EmployeeBankDetails`, `EmploymentHistories`, `EmpPayTransactions`,
+`EmployeeProjects`, `EmployeeInstitutions`, `EmployeeCashAward` — all six show
+`columns: [<key field only>]`) — grp-mcp faithfully parses whatever Acumatica's `/structure`
+returns (`cd.get("columns")`, no filtering), so the gap is server-side. This is also WHY the
+SubstituteKey can't be auto-resolved for this grid: with no column metadata there's no
+`lookup.value_field` and no target-DAC to translate against — hence the hint (above) rather than
+an auto-fix. Whether the metadata gap is PY309000-specific or broader is unconfirmed — not swept.
 
 ---
 
