@@ -366,14 +366,15 @@ def test_replay_grid_save_attaches_selector_hint_on_cannot_be_found():
     assert "selector_hint" not in result2
 
 
-def test_replay_grid_save_insert_with_error_gets_row_collision_note():
+def test_replay_grid_save_insert_with_error_gets_reliability_note():
     # An insert that errors must still be flagged as potentially unreliable:
     # PY309000/EmployeeBankDetails returned DIFFERENT error text across
     # IDENTICAL repeat inserts (external report 2026-07-20, reproduced), which
     # real validation of unchanged input would not do. The SYMPTOM stands; the
     # originally-blamed mechanism (a hardcoded row index colliding with row 0)
-    # was disproven live in 2026-07-20 testing and must not be reasserted here
-    # — see test_insert_error_note_does_not_blame_the_row_index. Update
+    # was disproven live and must not be reasserted (see
+    # test_insert_error_note_does_not_blame_the_row_index). The note now names
+    # the LEADING candidate (stale/sticky graph) without asserting it. Update
     # operations must NOT get this note (see
     # test_replay_grid_save_no_note_when_error_present above).
     body = (
@@ -384,7 +385,8 @@ def test_replay_grid_save_insert_with_error_gets_row_collision_note():
         "GLTranModuleBatNbr", {"CuryCreditAmt": 50}, operation="insert"))
     assert result["alert"] == "Boom"
     assert "PY309000" in result["note"]
-    assert "cause is unknown" in result["note"]
+    assert "STALE/STICKY GRAPH" in result["note"]
+    assert "run_dac_odata" in result["note"]
 
 
 # ---- replay_grid_save: unconfirmed "clean" no-op (GL301000, live re-probe) --

@@ -824,17 +824,40 @@ row's ordinal *within the RowChanges batch*; the server assigns the new row's po
 This is coherent with the rest of the plane: `delete` and `update` target rows through the
 `row_key` CELLS, never through `i`, so **nothing here uses the index to address a row**.
 
-What remains TRUE and unexplained: PY309000/`EmployeeBankDetails` returned DIFFERENT error text
-across IDENTICAL repeat inserts — `"'Employee Bank' cannot be found in the system"` once,
-`"'Employee Bank' cannot be empty"` the next, on the same valid input. Real validation of unchanged
-data does not do that, so the symptom is real; only the *explanation* was wrong. The cause is now
-genuinely unknown and PY309000 has not been retested since. `replay_grid_save` still attaches a
-`note` to any insert that returns error text — warning about the symptom, explicitly stating the
-index mechanism is ruled out. **Lesson: "root-caused to the exact line" was an inference from a
-plausible-looking code smell, never a test. A mechanism nobody has tested is a hypothesis.** The
-setup for this test was itself wrong twice before it was right — the first throwaway attribute was
-ControlType=Text (which legitimately has NO value list, so every insert was correctly dropped,
-on BOTH planes, silently); a `screen_submit` "ok:true" for those rows meant nothing.
+What remains TRUE: PY309000/`EmployeeBankDetails` returned DIFFERENT error text across IDENTICAL
+repeat inserts — `"'Employee Bank' cannot be found in the system"` once, `"'Employee Bank' cannot
+be empty"` the next, on the same valid input. Real validation of unchanged data does not do that,
+so the symptom is real; only the *explanation* (row-index collision) was wrong.
+
+**Leading candidate now (2026-07-20 reframe — NOT proven): stale/sticky graph state.** Acumatica's
+graph is sticky across sessions (§4d), and this session produced DIRECT evidence of stale artifacts
+on this exact grid: a `screen_submit` split of EMP001's bank rows spawned a PHANTOM row carrying an
+account number **never sent** — leftover uncommitted state flushed into the Save (and the grid was
+left at 200%, with the percent-sum invariant NOT firing on the SOAP plane; see §11a finding 1). If
+leftover rows from earlier attempts contaminate what the validator sees, the input is identical but
+the graph is not — which fits "different error each time" far better than anything about the request.
+**Honest caveat: this evidence is CROSS-PLANE** (the phantom row was on the SOAP `screen_submit`
+path; #4's symptom was ASPX-plane inserts), so it is a strong candidate, not a proven cause. Direct
+reproduction is impractical and low-value: PY309000's read-back is inert (columns, no rows — §11a
+finding 2), so grid state can't be observed between attempts without repeated real-employee
+mutations, and the tool already warns about the symptom. **Investigation parked here.**
+`replay_grid_save` attaches a `note` to any insert that returns error text — ruling out the index
+mechanism and naming the stale-graph candidate without asserting it. **Lesson: "root-caused to the
+exact line" was an inference from a plausible-looking code smell, never a test — and even the
+replacement is labelled a candidate, not a conclusion.** The setup for the *index* test was itself
+wrong twice before it was right — the first throwaway attribute was ControlType=Text (which
+legitimately has NO value list, so every insert was correctly dropped, on BOTH planes, silently); a
+`screen_submit` "ok:true" for those rows meant nothing.
+
+**Deferred investigation — headerless list-screen grid binding (GL202500).** RowChanges against the
+PRIMARY grid of a headerless list screen land with the graph dirty and never bind (see the "no error
+but graph dirty" note above). The earlier verdict "the browser uses a per-cell commit flow this tool
+does not emulate" was INFERRED, never captured — so it is a hypothesis, not a fact. Resolving it
+means driving GL202500 in a browser and capturing the actual save-callback traffic. **Consciously
+parked, not fixed:** low capability value (headerless list screens are normally written via contract
+REST or the modern UI, not this diagnostic plane), so the payoff is epistemic ("now we know") rather
+than a new capability. Revisit only if a real need to write a headerless list grid through this plane
+appears.
 
 **The "cannot be found in the system" selector error is a SubstituteKey — send the display
 name, NOT the code/id (root-caused from source + a live persisted write; CORRECTS an earlier

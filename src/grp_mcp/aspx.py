@@ -701,22 +701,31 @@ class AspxDiagnostic:
             # rows through the row_key CELLS, never through `i`, so nothing on
             # this plane uses the index to address a row.
             #
-            # What is NOT explained: PY309000/EmployeeBankDetails returned
-            # DIFFERENT error text across IDENTICAL repeat inserts ("cannot be
-            # found", then "cannot be empty") — real validation of unchanged
-            # input would not do that. The external bug report blamed the
-            # hardcoded index; that mechanism is now ruled out, so the cause of
-            # the nondeterminism is genuinely unknown and PY309000 has not been
-            # retested since. Keep warning about the SYMPTOM, drop the refuted
-            # explanation.
+            # PY309000/EmployeeBankDetails returned DIFFERENT error text across
+            # IDENTICAL repeat inserts ("cannot be found", then "cannot be
+            # empty") — real validation of unchanged input would not do that.
+            # The row-index-collision theory is RULED OUT (i is a batch ordinal,
+            # proven live on CS205000). LEADING CANDIDATE now: stale/sticky graph
+            # state — leftover uncommitted rows from earlier attempts contaminate
+            # what the validator sees, so the input is identical but the graph is
+            # not. Direct but CROSS-PLANE evidence: during a 2026-07-20
+            # screen_submit on this same grid a PHANTOM row appeared carrying an
+            # account number never sent (stale state flushed into the Save). Not
+            # proven for the ASPX insert path specifically, and hard to isolate
+            # (this grid's read-back is inert — columns but no rows). Keep warning
+            # about the SYMPTOM; name the candidate without asserting it.
             out["note"] = (
                 "an insert that reports an error is not always reporting real "
                 "business validation: on PY309000/EmployeeBankDetails the "
                 "IDENTICAL insert returned DIFFERENT error text across repeat "
-                "calls with no change in input. The cause is unknown — the "
-                "previously-suspected row-index collision has been RULED OUT "
-                "(the row index is a batch ordinal, not a row locator; proven "
-                "live on CS205000). Verify what actually happened with "
+                "calls with no change in input. The row-index-collision theory "
+                "is RULED OUT (the index is a batch ordinal, not a row locator; "
+                "proven live on CS205000). Leading candidate: STALE/STICKY GRAPH "
+                "state — leftover uncommitted rows from earlier attempts change "
+                "what the validator sees, so the input is identical but the graph "
+                "is not (cross-plane evidence: a phantom row carrying unsent data "
+                "appeared on this grid during a screen_submit; not proven for the "
+                "ASPX insert path). Verify what actually happened with "
                 "run_dac_odata rather than trusting this message.")
         if not alert and not any_err and out["graph_dirty"]:
             # Dirty graph + zero error text = the RowChanges never BOUND, so
