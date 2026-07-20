@@ -62,6 +62,19 @@ instructions; honor it. Pure reads are exempt.
   - `{"key":"<Friendly>","to":v}` — bare flat Key (unreliable for navigation on many screens).
   - `{"action":"<Friendly>"}` — e.g. `Save`; `{"new_row":"<Container>"}`, `{"delete_row":…}`,
     `{"answer":"<Container>","to":"Yes"}`.
+- **Friendly name ≠ DAC field name — a `set` using the DAC name SILENTLY no-ops (validated
+  2026-07-20).** The specs take the CONTAINER's FRIENDLY name (from `screen_get_schema`), which maps
+  to an underlying DAC field; sending the DAC field name is an unrecognized friendly command → it
+  no-ops and the field keeps its default. Worked example — ledger type on GL201500 is friendly
+  `Type` → DAC `BalanceType` (`screen_get_schema('GL201500')`: `LedgerSummary.Type →
+  LedgerRecords.BalanceType`; `get_dac_metadata('Ledger')` has `BalanceType` and NO `Type`). A
+  `set BalanceType` no-ops → `Type` defaults to **Actual**: the first ACTUAL ledger looks fine by
+  luck, the second STATISTICAL one fails *"actual ledger already associated."* `create_ledger`
+  already uses the friendly `Type`, so this bites only when hand-driving the screen — it is NOT a
+  tool defect. **Field names are PLANE-SPECIFIC: screen/friendly → `Type`; DAC/OData/contract
+  (`run_dac_odata`, `create_or_update_entity`) → `BalanceType`** (and the value there is a code like
+  `A`/`S`, not `"Actual"`). Corollary: a validation REJECTION proves the write path works and the
+  VALUE is wrong — not that the operation is impossible.
 - **The "no-bind" signal.** A **persisted** Submit echoes a small body (~335 bytes). A multi-KB
   full-screen echo = *nothing bound*. `screen_submit` flags `nobind_suspected` when `ok` but the
   body is large. **`ok` ≠ persisted — always read back** (via a different plane/session).
@@ -260,6 +273,31 @@ why grp-mcp runs both guards. Both are partial. **A read-back of the persisted r
 Metadata guards (`ui_coerce_validate`) catch read-only fields and invalid enums from `/structure`,
 but **cannot** catch an unparseable date — right field, right type name, not read-only. The two
 mechanisms are complementary and neither is sufficient alone.
+
+**The clean→clean dirty check FALSE-POSITIVES on a no-op re-set — now guarded by a read-back
+(v0.64.18, live-confirmed).** The graphIsDirty net flags any set that leaves the graph clean→clean
+as "silently refused". But clean→clean is a refusal ONLY if the field does not already hold the
+value: re-setting a key (or any field) to its CURRENT value on an existing record is a no-op, not a
+refusal. The net's earlier "no false positives" was only ever verified on GL101000/AP101000 with
+NON-key fields — a key field on an existing record is exactly the untested case, and it fails.
+`ui_screen_action` now runs `reconcile_rejected_sets`: one read-back that splits genuine refusals
+(field holds something else → stay in `rejected_fields`, `ok:false`) from no-ops (field already
+holds the sent value → moved to informational `noop_fields`, `ok` untouched). The equality compare
+lives ONLY here and is safe precisely because this path sees only clean→clean fields, which store
+verbatim (keys/CDs), never the reformatted types (dates/selectors) that go dirty and never reach it
+— which is why the read-back guard above still forbids value-equality but this may use it. A failed
+read-back keeps everything as genuine (never drop a real refusal).
+
+**LIVE-CONFIRMED before/after on CS102000 `BAccount.AcctCD` (branch MAIN, 2026-07-20):** navigate
+to the branch, re-set `AcctCD="MAIN"` (its own value) → `graphIsDirty` stayed false. OLD code:
+`rejected_fields:[AcctCD]`, `ok:false`, "SILENTLY REFUSED … Fix and re-run" — on a branch that was
+completely intact. NEW code (both a direct call and via the MCP): `noop_fields:[AcctCD]`, `ok:true`,
+no warning; branch unchanged (`run_dac_odata`). The live value arrived as a **space-padded selector
+dict** `{id:"MAIN      "}` and the normalize (strip + selector-id extraction) matched it against the
+sent `"MAIN"` — a shape the unit tests hadn't exercised that literally. (CS101500, named in the same
+report, could NOT be tested on csmdev: its `/structure` hits the duplicate-key server bug — §1/§the
+grid-500 note — so `ui_screen_action` can't run there at all; the original CS101500 observation was
+on an instance where `/structure` works.)
 
 **`/structure` exposes only ONE container per view name — fields on a "duplicate" tab are
 invisible to it, permanently.** A screen whose classic SOAP schema disambiguates several
