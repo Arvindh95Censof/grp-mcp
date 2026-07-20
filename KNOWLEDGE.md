@@ -154,14 +154,23 @@ instructions; honor it. Pure reads are exempt.
   to be reported as failure; "I can't tell, here's why, confirm with X" is a legitimate verifier
   outcome.
 
-  **OPEN DOUBT this fix raises about its own origin.** `_verify_deletes` was written 2026-07-15 on
-  the strength of a "silent no-op delete reproduced on GL202500". That observation was made with
-  the SAME non-empty-rows logic now proven to false-positive — so **it may itself have been a
-  false positive**, and the silent-no-op phenomenon may be rarer than assumed (or not real on
-  GL202500). Not re-tested: GL202500 is the Chart of Accounts and deleting an account there is not
-  a safe probe. This also weakens candidate (a) in the PY309000 undetermined-mechanism analysis
-  above, which cites that GL202500 precedent. Treat "classic DeleteRow silently no-ops" as
-  **plausible but no longer well-evidenced** until re-confirmed with a value-carrying read-back.
+  **DOUBT RAISED AND CLOSED — the silent-no-op phenomenon is REAL; only the guard's
+  implementation was wrong.** Because the guard was written 2026-07-15 on the strength of a
+  "silent no-op reproduced on GL202500", and that observation used the same non-empty-rows logic
+  now proven to false-positive, it was fair to suspect the original finding was itself a false
+  positive. **Re-tested safely** (throwaway account `Z99999`, Type E, zero transactions, created
+  and deleted on GL202500 — never touching a referenced account): `set Account` + `delete_row` +
+  Save **deleted it cleanly**, `delete_verified: true`, absence confirmed by `run_dac_odata`.
+  The decisive detail: `delete_verified: true` is only reachable when the verification Export
+  returns **nothing**, so **GL202500's Export filter DOES discriminate** (unlike CS205000's). The
+  old buggy logic would therefore have taken the same `else` branch and ALSO passed this delete —
+  **so the bug cannot explain the 2026-07-15 report.** That report stands: the row genuinely
+  survived. Most plausible cause is a legitimate refusal reported without an error — per the KB,
+  *"an account that has transactions posted cannot be deleted"* (deactivate instead), so a
+  DeleteRow on a referenced account is refused silently rather than faulting. Net: the guard's
+  PURPOSE is vindicated, its IMPLEMENTATION was broken, and the breakage only ever bit screens
+  whose Export doesn't discriminate. Candidate (a) in the PY309000 analysis above stands
+  unweakened.
 
   **Reliable patterns:** INSERT = `new_row` + sets. TARGETED UPDATE/DELETE = `set <KEY field>` to
   select the row, then edit or `delete_row` (see the row-targeting bullet above — this works).
