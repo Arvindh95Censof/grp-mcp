@@ -1397,6 +1397,75 @@ be written is precisely the one we cannot warn about. `screen_submit` reported `
 `field_errors` for every drop above. Until that is closed, **read back after every classic-plane
 write to this screen.**
 
+## 14. XML round-trip — clone a WHOLE record graph (`export_screen_xml` / `import_screen_xml`, v0.67.0)
+
+**Reach for this when a record's real content lives in structures no plane can address.** The proven
+case is **EP205015 (Approval Maps)**: its steps, rules, conditions and approvers hang off a
+PXTreeView with no modern-plane selection handler, so node-scoped edits are impossible (§11e) and the
+UI itself cannot copy a map. Acumatica's own **Clipboard > Export/Import as XML** carries the entire
+graph, so the round trip is the only full-fidelity path — and it makes such screens API-drivable.
+
+Availability is declared server-side by `App_Data/XmlExportDefinitions/<SCREENID>.xml`. That file is
+also the fastest way to see WHAT a screen's XML will carry, without exporting anything:
+
+```xml
+<relations format-version="4" main-table="EPAssignmentMap" file-name="(Name)">
+  <link from="EPRule (AssignmentMapID)"         to="EPAssignmentMap (AssignmentMapID)"/>
+  <link from="EPRuleCondition (RuleID)"         to="EPRule (RuleID)"/>
+  <link from="EPRuleEmployeeCondition (RuleID)" to="EPRule (RuleID)"/>
+  <link from="EPRuleApprover (RuleID)"          to="EPRule (RuleID)"/>
+</relations>
+```
+
+### Export is MODERN-plane only
+
+Two traps, both of which read as "not supported" if you stop early:
+
+- The command is the menu **SUB-command `CopyPaste@ExportXml`**. Plain `ExportXml` is silently inert
+  (200, command states echoed, nothing else), and `/structure` lists only the top-level `CopyPaste`
+  — so `ui_screen_action` REFUSES it and this must go through `ui_command`.
+- The **classic ASPX plane cannot do it at all**: the same command only repaints, and three postback
+  shapes returned no `Content-Disposition`. The modern plane instead answers with a `redirects`
+  block carrying the real URL — the whole trick, and invisible from classic:
+  `{"redirects":[{"url":"/Frames/GetFile.ashx?fileID=<guid>&..."}]}`.
+
+`Frames/GetFile.ashx` is ALSO the attachments handler (`filesMenuUrls.filesDisplayUrl` in the page
+config), so finding it there proves nothing about export — the `fileID` is what matters.
+
+### Import needs BOTH planes
+
+1. **Classic** multipart POSTBACK uploads the file to the page-level dialog. Control names are
+   template-level, so they are the same on every screen:
+   `ctl00$usrCaption$dlgUploadXml$upl$upl` + `__EVENTTARGET=ctl00$usrCaption$dlgUploadXml$btnUpload`.
+2. **Modern** `CopyPaste@ImportXml`, then `Save`.
+
+Skip step 1 and the import reports *"The file is not found, or you don't have enough rights to see
+the file"* — it reads a file the session must already hold.
+
+### The identity rule — one of its failure modes is SILENT
+
+Import always **INSERTS**; it never fills the current record (proven: `Insert` first gives
+`isNewEntry:true` and the same error). `xml_as_new_record()` encodes the shape:
+
+| payload | result |
+|---|---|
+| identity attribute REMOVED | *"Cannot insert explicit value for identity column … IDENTITY_INSERT is OFF"* — loud, harmless |
+| identity **`"0"`** | correct — server assigns the next id and children follow |
+| a NONZERO unused id (999999) | header imports, **every child row is SILENTLY DROPPED** |
+
+The last row is why the helper exists rather than leaving callers to hand-edit: children keep their
+uplink to the id you invented, and a header-only record looks perfectly healthy in the UI. **Always
+read the detail table back with `run_dac_odata`** — `import_screen_xml` returns a `verify` field
+saying exactly that, because the tool cannot detect this for you.
+
+Two more rules the helper applies: GUIDs are remapped per **distinct value** (so a child's parent
+pointer — `EPRule.StepID` → its step's `RuleID` — still resolves; remapping each occurrence
+independently orphans the tree), and only the **FIRST** `Name=` is the record name — on EP205015 the
+later ones are step/rule names, and renaming those rewrites the workflow's contents.
+
+Verified live end to end: map 15 cloned with step + 2 rules (parenting, sequences, ApproveType W/A,
+workgroups) and all 5 conditions incl. brackets/operators.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
