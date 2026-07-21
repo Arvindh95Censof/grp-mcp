@@ -3294,9 +3294,24 @@ async def import_screen_xml(
     xml / file_path: the document, inline or from disk (read_roots sandbox).
     as_new_record:   {"id_field": <identity column>, "new_name": <optional>} to
         rewrite the payload into a NEW record — fresh GUIDs (parent pointers kept
-        consistent), NoteID dropped, identity set to "0". Omit to import the file
-        verbatim, which UPDATES the record it came from.
+        consistent), NoteID dropped, identity set to "0". Only for INTEGER-identity
+        screens; a screen keyed by a string CODE (CS206000: ReportCode/RowSetCode/
+        ColumnSetCode) has no identity column, so clone it by rewriting the codes
+        yourself and omit this.
     save:            commit (default True).
+
+    IMPORT ONLY EVER *CREATES*. It cannot update, and it does not say so.
+    Re-importing a document whose key ALREADY EXISTS is a SILENT NO-OP: the result
+    still reads `imported: true, saved: true, save_error: null`, and nothing in the
+    database changes. Measured on CS206000 — a corrected report re-imported under
+    its own code left the record byte-identical (re-exported and diffed), and on
+    EP205015 an import after `Insert` created a second record rather than filling
+    the current one. (An earlier version of this docstring claimed a verbatim
+    import UPDATES the source record. That was never true.)
+
+    So to CHANGE an existing record: either delete it and import, or import under a
+    new key — and if you rely on this, read the record back, because the success
+    fields cannot distinguish "created" from "did nothing".
 
     THE IDENTITY RULE, measured on EP205015 — get this wrong and it fails in one
     of two ways, one of them silent:
@@ -3348,8 +3363,15 @@ async def import_screen_xml(
                                        filename=f"{sid}.xml", save=save)
     return {"screen_id": sid, "rewritten_as_new_record": rewritten,
             "source": "file" if file_path else "inline", **result,
-            "verify": "Read the DETAIL table back (run_dac_odata). A header-only "
-                      "import reports success and looks fine in the UI."}
+            "creates_only": True,
+            "verify": "Read the record back (run_dac_odata) — these success fields "
+                      "cannot tell you what happened. TWO measured silent failures "
+                      "they do not catch: (1) a header-only import (children dropped) "
+                      "looks fine in the UI, and (2) IMPORT CANNOT UPDATE — if the "
+                      "key already exists nothing changes at all, while this result "
+                      "still reads imported:true/saved:true (measured on CS206000: "
+                      "the re-exported record was byte-identical). To change an "
+                      "existing record, delete it first or import under a new key."}
 
 
 @mcp.tool()

@@ -1542,6 +1542,65 @@ XML button is disabled"*. That is "no record is loaded", NOT "this screen has no
 pass `record_key={"view":"Report","key":{"ReportCode":…}}`. Unlike EP205015, CS206000 exposes real
 navigation commands (First/Previous/Next/Last), so its record targeting is unproblematic.
 
+### 14b. Authoring a record from SCRATCH — `<relations>` and `<layout>` are MANDATORY
+
+You do not need an existing record to clone. A hand-authored document imports fine — verified live
+by building an 8-row ARM report (`AISCRATCH`) from nothing: 2 columns with merged A:B header spans
+and two header formulas, caption/GL/line/total rows, `=sum('0020','0030')` and `=@0050-@0070`, and
+per-row account ranges. **Confirmed RENDERED** in the report viewer: both header formulas evaluated
+(the org name via `Report.GetDefUI`, and `Format('{0:d MMMM yyyy}', Report.GetPeriodEndDate(...))`)
+and both total rows computed.
+
+Note the ARM viewer renders CLIENT-SIDE, so a headless fetch of `RmLauncher.aspx?id=<CODE>.rpx`
+returns the same ~51KB shell for any report. It confirms the definition is *accepted*, never that
+figures appeared — that check needs a browser, and it is worth doing, because two defects in the
+hand-authored design were invisible to every headless check that passed:
+
+- **`PrintControl="1"` SUPPRESSES the row from print.** Copied onto the three GL detail rows from
+  PKK's pattern (where it sits on rows that are range endpoints feeding a subtotal), it made them
+  vanish while the totals still rendered. Every DB read-back showed the rows present and correct.
+- **A merged header span swallows the cells it covers.** `'(RM)'` was placed on header row 2 of
+  column B while column A declared `StartColumn="A" EndColumn="B"` on that same row — the merge
+  wins and the caption never appears. Put such a caption on its OWN header row (PKK does).
+
+**But the two schema blocks are not optional.** Dropping them is the one thing that fails:
+
+| document | result |
+|---|---|
+| `<relations>` + `<layout>` + `<data>` | imports |
+| `<relations>` only (no `<layout>`) | **"Object reference not set to an instance of an object"** |
+| `<data>` only | same NRE |
+
+That NRE is the SERVER dereferencing a mapping it was never given — the same class of bare-NRE noted
+in §12, and not a bug on our side. Both failures rolled back cleanly (no partial header, no orphan
+sets), so a rejected import is safe to retry.
+
+So the recipe is: copy `<relations>` and `<layout>` VERBATIM from any export of that screen — they
+are the screen's schema, identical for every record — then author your own `<data>`. Get the enums
+right (`RMRow.RowType` 0=GL 1=Caption 2=Line 3=Total; `RMColumn.ColumnType` 2=description column,
+0=GL amount), set `RowCntr`/`HeaderCntr` to match the children you supply, and give the record a
+fresh `ReportUID`.
+
+### 14c. IMPORT CANNOT UPDATE — re-importing an existing key is a SILENT NO-OP
+
+`import_screen_xml` only ever **creates**. Feed it a document whose key already exists and *nothing
+happens*, while the result still reads `imported: true, saved: true, save_error: null,
+graph_is_dirty: false`.
+
+Measured on CS206000: `AISCRATCH` was re-imported under its own code with `PrintControl` flipped on
+three rows and an extra header row added. The tool reported success; the record was then re-exported
+and diffed against its pre-import state — **byte-identical, `after == before`**. `RMRow.PrintControl`
+was still `1` in the database for every row the file set to `0`.
+
+This lines up with EP205015, where an import after `Insert` created a SECOND record instead of
+filling the current one. One rule covers both: **import inserts; an existing key is a no-op.**
+Until v0.68.4 this tool's own docstring claimed the opposite ("import the file verbatim, which
+UPDATES the record it came from") — a documented promise that was never true, which is worse than an
+undocumented gap, because a caller has no reason to check.
+
+To change an existing record: **delete it and re-import, or import under a new key.** And read the
+record back either way — the success fields cannot distinguish "created" from "did nothing".
+
 ## 15. Modern-plane writes must NAME their record target (BREAKING, v0.68.0)
 
 **"No record specified" never meant "no record loaded".** The modern session is cached ACROSS CALLS

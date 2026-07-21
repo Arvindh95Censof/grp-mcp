@@ -4225,3 +4225,32 @@ def test_navigate_raises_on_wrong_record(monkeypatch):
     # and the RIGHT record passes, non-standard form id included
     ok = asyncio.run(d.navigate({"AssignmentMapID": 1}))
     assert ok.endswith("/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAIB")
+
+
+def test_import_screen_xml_result_warns_import_cannot_update(monkeypatch):
+    """import CREATES only — re-importing an existing key is a silent no-op
+    (measured on CS206000). The result must say so: callers were previously told
+    by the docstring that a verbatim import UPDATES the source record."""
+    import asyncio
+    from grp_mcp import server
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def ui_import_xml(self, xml, filename, save=True):
+            return {"uploaded_bytes": len(xml), "filename": filename,
+                    "imported": True, "saved": True, "save_error": None}
+
+    monkeypatch.setattr(server, "ScreenClient", lambda inst, sid: _Client())
+    monkeypatch.setattr(server, "_require_write", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_cfg", lambda: type("C", (), {
+        "default": "x", "get": lambda self, n: object()})())
+
+    out = asyncio.run(server.import_screen_xml("CS206000", xml="<data-set/>"))
+    assert out["creates_only"] is True
+    v = out["verify"]
+    assert "CANNOT UPDATE" in v
+    assert "delete it first or import under a new key" in v
+    # and the retired false claim must not have crept back into the docstring
+    assert "UPDATES the record it came from" not in server.import_screen_xml.__doc__
+    assert "IMPORT ONLY EVER *CREATES*" in server.import_screen_xml.__doc__
