@@ -1420,6 +1420,70 @@ def _tree_client(actions):
     return c, asyncio
 
 
+def _run_import_xml(monkeypatch, save_raises: bool):
+    """Drive the REAL ui_import_xml with only its network edges stubbed, so the
+    outcome reporting (where the bug was) is genuinely exercised."""
+    import asyncio, types
+    from grp_mcp import aspx as aspx_mod
+    from grp_mcp import screen as screen_mod
+    from grp_mcp.screen import ScreenClient, ScreenError
+
+    calls: list[str] = []
+    logged_out: list[str] = []
+
+    class _Diag:
+        def __init__(self, client, url): self._state = {}
+        async def open(self): return None
+    monkeypatch.setattr(aspx_mod, "AspxDiagnostic", _Diag)
+
+    async def _logout(key=None):
+        logged_out.append(key)
+        return [key]
+    monkeypatch.setattr(screen_mod, "logout_session_cache", _logout)
+
+    c = object.__new__(ScreenClient)
+    c.screen_id = "EP205015"
+    c.instance = types.SimpleNamespace(base_url="https://example.invalid/site",
+                                       username="u", tenant="T")
+
+    async def _cmd(name, answer="ok"):
+        calls.append(name)
+        if name == "Save" and save_raises:
+            raise ScreenError("Error: 'Name' cannot be empty.")
+        return {"graphIsDirty": False}
+
+    async def _noop(*a, **k): return None
+    async def _struct(): return {"views": {"AssigmentMap": []}, "actions": [], "grids": {}}
+    async def _post(url, data=None, files=None):
+        return types.SimpleNamespace(status_code=200)
+
+    c.ui_command, c.get_ui_structure, c.ui_bootstrap = _cmd, _struct, _noop
+    c._ensure_login = _noop
+    c._http = types.SimpleNamespace(post=_post)
+    out = asyncio.run(ScreenClient.ui_import_xml(c, b"<data-set/>"))
+    return out, calls, logged_out
+
+
+def test_import_xml_reports_a_failed_save_without_losing_the_import(monkeypatch):
+    # Measured live: the trailing Save failed validating a BLANK record left current
+    # by an earlier Delete, while the import had ALREADY committed. Raising there
+    # reports a successful import as a failure and invites a duplicate on retry.
+    out, calls, _ = _run_import_xml(monkeypatch, save_raises=True)
+    assert out["imported"] is True          # the import still happened
+    assert out["saved"] is False
+    assert "cannot be empty" in out["save_error"]
+    assert "read it back" in out["note"].lower()   # warns against the duplicate
+    assert "CopyPaste@ImportXml" in calls
+
+
+def test_import_xml_logs_out_first_so_it_inherits_no_record(monkeypatch):
+    # The cached modern session keeps the last record loaded; importing on top of it
+    # is what produced the bogus Save failure above.
+    out, calls, logged_out = _run_import_xml(monkeypatch, save_raises=False)
+    assert logged_out, "ui_import_xml must end the cached session before importing"
+    assert out["saved"] is True and out["save_error"] is None
+
+
 def test_xml_as_new_record_sets_identity_to_zero_not_absent():
     # Measured on EP205015: REMOVING the identity attribute fails with
     # "Cannot insert explicit value for identity column ... IDENTITY_INSERT is OFF".

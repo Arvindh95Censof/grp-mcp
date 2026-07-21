@@ -1945,8 +1945,24 @@ class ScreenClient:
         Insert first yields isNewEntry:true and the same identity error). To create
         a NEW record, shape the payload with xml_as_new_record() — in particular the
         identity attribute must be present and "0".
+
+        TWO THINGS THIS METHOD HAS TO DEFEND AGAINST, both measured live:
+
+        * The modern session is CACHED ACROSS CALLS, so whatever record the last
+          operation left current is still loaded. After a Delete that is a BLANK new
+          record, and the trailing Save then fails validating THAT ("'Name' cannot be
+          empty") — while the import itself has already committed. So we start from a
+          logged-out session: the graph is ours, not inherited.
+        * Even so, the import and the Save are SEPARATE outcomes. ImportXml commits on
+          its own, so a failed Save does NOT mean nothing was written. Raising on the
+          Save would report a successful import as a failure — the exact confusion
+          this returns `saved`/`save_error` for instead.
         """
         from .aspx import AspxDiagnostic
+        # Inherit nothing: end the cached session so the import runs on a graph that
+        # holds no record from an earlier call (see the docstring).
+        await logout_session_cache(self._session_key)
+        await self._ensure_login()
         page = f"{self.instance.base_url.rstrip('/')}/Pages/{self.screen_id[:2].upper()}/{self.screen_id.upper()}.aspx"
         d = AspxDiagnostic(self, page)
         await d.open()
@@ -1961,10 +1977,24 @@ class ScreenClient:
         struct = await self.get_ui_structure()
         await self.ui_bootstrap([next(iter(struct["views"]), None)])
         imported = await self.ui_command("CopyPaste@ImportXml")
-        saved = await self.ui_command("Save") if save else None
-        return {"uploaded_bytes": len(xml), "filename": filename,
-                "imported": True, "saved": bool(save),
-                "graph_is_dirty": (saved or imported).get("graphIsDirty")}
+        out: dict[str, Any] = {"uploaded_bytes": len(xml), "filename": filename,
+                               "imported": True, "saved": False, "save_error": None,
+                               "graph_is_dirty": imported.get("graphIsDirty")}
+        if not save:
+            return out
+        try:
+            saved = await self.ui_command("Save")
+            out["saved"] = True
+            out["graph_is_dirty"] = saved.get("graphIsDirty")
+        except ScreenError as e:
+            # The import already ran; a Save failure here is a SEPARATE outcome and
+            # frequently belongs to unrelated state, not to the imported data. Report
+            # both instead of raising a "failure" over a record that exists.
+            out["save_error"] = str(e)
+            out["note"] = ("The IMPORT ran; only the trailing Save failed. ImportXml "
+                           "commits on its own, so the record may well exist — read it "
+                           "back before retrying, or you will create a duplicate.")
+        return out
 
     async def ui_command(self, name: str, answer: str = "ok") -> dict:
         """Fire a modern UI-screen command; answers a confirmation dialog if one opens.

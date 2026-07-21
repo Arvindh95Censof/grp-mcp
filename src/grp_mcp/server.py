@@ -3250,6 +3250,15 @@ async def import_screen_xml(
     ALWAYS read the child table back (run_dac_odata) — a successful import with an
     empty detail set is the failure mode this tool cannot detect for you.
 
+    IMPORT AND SAVE ARE SEPARATE OUTCOMES. ImportXml commits on its own, so the
+    result reports them apart: `imported` plus `saved`/`save_error`. A failed Save
+    does NOT mean nothing was written — measured live, a Save failed validating a
+    BLANK record left current by an earlier Delete ("'Name' cannot be empty") while
+    the import had already created the record. Read it back before retrying, or you
+    will create a duplicate. (The session is logged out before importing so this
+    inherited-state case should no longer arise; the split reporting stays because
+    the two steps are genuinely independent.)
+
     Requires allow_write. KB-first: check the screen's prerequisites before writing.
     """
     _require_write(instance)
