@@ -1145,6 +1145,38 @@ modern-plane grid tools (`ui_read_grid` → `ui_delete_grid_row`/`ui_insert_grid
 find_grid_control's own messages, so an ordinary business/validation error is NOT swallowed as this
 case (unit-tested both ways).
 
+### 11g. `navigate()` can land on the WRONG record and say nothing — GUARDED (v0.68.2)
+
+On some screens the ASPX plane **cannot navigate at all**, and before v0.68.2 `navigate()` reported
+success anyway. Measured live on EP205015 (Approval Maps, csmdev 2025R1, 2026-07-21):
+
+- The datasource's `commandStates` list has **no navigation command** — no `First`/`Next`/`Prev`/
+  `Last`/`Refresh`; only `Cancel`/`Save`/`Insert`/`Delete` and the screen's tree actions. Read the
+  list from any callback response before assuming a command exists: an unknown command returns a
+  clean 2,300-byte no-op, not an error.
+- Every key-commit shape is IGNORED: the header selector's edit params (raw, `$text`, both),
+  `__EVENTTARGET`, the key in the URL query string, a key inside the envelope addressed to the
+  form control, and a **synthetic ObjectStateFormatter DataKey injected into all 97 `_state`
+  fields** (encoder byte-exact against the screen's own key — still ignored). The server rebuilds
+  the graph per callback and defaults to the FIRST record.
+- Root cause: the page is a 2025R1 **hybrid** — the Map selector renders as `qp-editor-wrapper`, a
+  modern web component. Its commit travels the modern JSON protocol, never the WebForms fields this
+  plane speaks. Expect the same on any header whose editor renders as `qp-*`.
+
+So `Cancel` answered with map 1 — carrying a perfectly well-formed dataKey — and `navigate()`
+returned it as success. Any subsequent grid write would have hit the wrong map: the same
+silent-wrong-target family as 11e and the modern session cache. Now `navigate()` **decodes the
+returned dataKey** (ASP.NET ObjectStateFormatter pair-list; string + Int32 tokens) and raises
+`"the key commit was IGNORED"` when the loaded key differs from the requested one. Key types the
+decoder doesn't cover (e.g. GUIDs) mean *cannot verify*, not *verified* — no exception is raised on
+those, so the read-back remains the authority. Bonus fix in the same release: the header form block
+is found by `phF` prefix scan, not the hardcoded `ctl00_phF_form` (EP205015 names it `mapForm`).
+
+Practical rule: a screen whose header selector is a `qp-*` component navigates only on the modern
+plane. For EP205015 that means `record_key` on the modern tools, or the §14 XML round-trip for
+whole-record work; the classic tree stays unreachable because you can never steer the classic graph
+off record 1.
+
 ---
 
 ## 12. Failure routing — errors that route you to the working plane (v0.66.0)

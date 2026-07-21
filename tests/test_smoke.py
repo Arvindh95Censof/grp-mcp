@@ -4160,3 +4160,68 @@ def test_build_company_tree_flat_list_needs_no_indent(cfg, monkeypatch):
     monkeypatch.setattr(server, "_client", lambda inst: _Dac())
     asyncio.run(server.build_company_tree(["X", "Y"], instance="rw"))
     assert client.ops == ["insert:X", "Save", "insert:Y", "Save"]
+
+
+# ---------------------------------------------------------------------------
+# _decode_data_key: the header dataKey verifier behind AspxDiagnostic.navigate.
+# The encoded fixtures are REAL keys captured live from EP205015 on csmdev
+# (2026-07-21) — map 1 as echoed by the screen, maps 15/1726 as round-tripped
+# through the same ObjectStateFormatter grammar.
+
+
+def test_decode_data_key_real_captures():
+    from grp_mcp.aspx import _decode_data_key
+    # exactly as the screen returns it: view-name prefix + comma + blob
+    assert _decode_data_key(
+        "assigmentmap,/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAIB") == {"AssignmentMapID": 1}
+    # bare blob (the ds block's dataKey has no prefix)
+    assert _decode_data_key(
+        "/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAIB") == {"AssignmentMapID": 1}
+    # multi-byte 7-bit int (1726 = 0xBE 0x0D)
+    assert _decode_data_key(
+        "/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAK+DQ==") == {"AssignmentMapID": 1726}
+
+
+def test_decode_data_key_unknown_shapes_return_none():
+    from grp_mcp.aspx import _decode_data_key
+    # empty pair list decodes to {} (still "decoded", just no pairs)
+    assert _decode_data_key("/wEWAA==") == {}
+    # not base64 / not the format -> None, never a guess
+    assert _decode_data_key("garbage!!") is None
+    assert _decode_data_key("AAAA") is None
+    # GUID-typed key values use a token the decoder does not cover -> None
+    import base64
+    guid_like = base64.b64encode(
+        b"\xff\x01\x16\x01\x0f\x05\x06RuleID\x28\x10" + b"\x00" * 16).decode()
+    assert _decode_data_key(guid_like) is None
+
+
+def test_navigate_raises_on_wrong_record(monkeypatch):
+    """EP205015 shape: key commit ignored, screen answers with its FIRST record
+    and a valid dataKey. navigate must RAISE, not hand that key back."""
+    import asyncio
+    from grp_mcp import aspx as aspx_mod
+
+    d = aspx_mod.AspxDiagnostic.__new__(aspx_mod.AspxDiagnostic)
+    d.page_url = "http://x/EP205015.aspx"
+    d._html = '<input name="ctl00$phF$mapForm$edAssignmentMapID$text" />'
+    d._state = {}
+
+    async def fake_callback(cbid, cbparam, extra=None):
+        return "irrelevant"
+
+    def fake_fold(body):
+        return {"ctl00_phF_mapForm":
+                {"dataKey": "assigmentmap,/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAIB"}}
+
+    d._callback = fake_callback
+    d._fold = fake_fold
+    try:
+        asyncio.run(d.navigate({"AssignmentMapID": 1726}))
+        raise AssertionError("navigate returned instead of raising")
+    except aspx_mod.ScreenError as e:
+        assert "IGNORED" in str(e)
+        assert "1726" in str(e)
+    # and the RIGHT record passes, non-standard form id included
+    ok = asyncio.run(d.navigate({"AssignmentMapID": 1}))
+    assert ok.endswith("/wEWAQ8FD0Fzc2lnbm1lbnRNYXBJRAIB")

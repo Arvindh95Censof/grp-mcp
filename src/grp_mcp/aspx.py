@@ -39,6 +39,7 @@ Protocol (reverse-engineered + headless-proven live on csmdev PY309000):
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from html import unescape
@@ -63,6 +64,77 @@ _DS_ENVELOPE = ('{cmd}|<ctl00_phDS_ds LoadedLevel="-1">'
                 '{inner}'
                 '<ctl00_phDS_ds OwnerData="1"><![CDATA[]]></ctl00_phDS_ds>'
                 '</ctl00_phDS_ds>')
+
+
+def _decode_data_key(data_key: str) -> dict[str, Any] | None:
+    """Decode a control's `dataKey` into {key_field: value}, or None if the
+    format isn't one this understands.
+
+    A dataKey is an ASP.NET ObjectStateFormatter pair-list, optionally prefixed
+    with the view name and a comma (`assigmentmap,/wEWAQ...`):
+
+        ff 01                     header
+        16 <n>                    pair list, n entries
+          0f                        entry marker
+          05 <len> <utf8>           field name  (string token)
+          02 <7-bit int>            value       (Int32 token)
+
+    Only the string and Int32 tokens are covered — enough for the integer and
+    string identity keys these screens use. Anything else returns None, which
+    callers must treat as "cannot verify", NOT as "verified fine".
+    """
+    blob = data_key.rsplit(",", 1)[-1] if "," in data_key else data_key
+    try:
+        raw = base64.b64decode(blob)
+    except Exception:
+        return None
+    if len(raw) < 4 or raw[0] != 0xFF or raw[1] != 0x01 or raw[2] != 0x16:
+        return None
+    pos, out = 4, {}
+
+    def read_7bit(p: int) -> tuple[int, int] | None:
+        val = shift = 0
+        while p < len(raw):
+            b = raw[p]
+            p += 1
+            val |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return val, p
+            shift += 7
+            if shift > 28:
+                return None
+        return None
+
+    def read_token(p: int) -> tuple[Any, int] | None:
+        if p >= len(raw):
+            return None
+        tok, p = raw[p], p + 1
+        if tok == 0x05:                       # string: 7-bit length, then utf8
+            r = read_7bit(p)
+            if not r:
+                return None
+            ln, p = r
+            if p + ln > len(raw):
+                return None
+            return raw[p:p + ln].decode("utf-8", "replace"), p + ln
+        if tok == 0x02:                       # Int32
+            r = read_7bit(p)
+            return (r[0], r[1]) if r else None
+        return None                           # unknown token — give up honestly
+
+    for _ in range(raw[3]):
+        if pos >= len(raw) or raw[pos] != 0x0F:
+            return None
+        pos += 1
+        name = read_token(pos)
+        if not name:
+            return None
+        value = read_token(name[1])
+        if not value:
+            return None
+        out[name[0]] = value[0]
+        pos = value[1]
+    return out
 
 
 def _parse_hidden_inputs(html: str) -> dict[str, str]:
@@ -625,17 +697,51 @@ class AspxDiagnostic:
 
     async def navigate(self, record_key: dict[str, Any]) -> str:
         """Load the record by key: ds `Cancel` commits the key fields (classic
-        SOAP-plane semantics). Returns the loaded header dataKey; raises if the
-        record didn't load."""
+        SOAP-plane semantics). Returns the loaded header dataKey.
+
+        Raises if the record didn't load — AND if it loaded the WRONG one. That
+        second check is not paranoia: on EP205015 (Approval Maps) every key-commit
+        shape is ignored and the screen answers `Cancel` with its FIRST record,
+        carrying a perfectly well-formed dataKey. Returning that key would report
+        a successful navigation while the graph sat on someone else's record, and
+        the caller's next write would land there. Measured live, 2026-07-21.
+
+        The verification decodes the returned dataKey and compares it to what was
+        asked for. When the key uses a type the decoder does not cover it cannot
+        conclude anything, so it says so rather than passing silently."""
         extra = {self._key_param(f): str(v) for f, v in record_key.items()}
         body = await self._callback(_DS_CTL, _DS_ENVELOPE.format(cmd="Cancel", inner=""),
                                     extra=extra)
         blocks = self._fold(body)
+        # The header form is NOT always `ctl00_phF_form` — the page template's
+        # name is a convention, not a rule (EP205015 calls it `mapForm`). Take the
+        # standard id when present, else any phF block that carries a dataKey.
         dk = (blocks.get(_FORM_BLOCK) or {}).get("dataKey") or ""
+        if not dk:
+            for cid, props in blocks.items():
+                if cid.startswith("ctl00_phF_") and props.get("dataKey"):
+                    dk = props["dataKey"]
+                    break
         if not dk:
             raise ScreenError(
                 f"aspx navigate: record {record_key} did not load (no header "
                 f"dataKey in Cancel response) — wrong key field name/value?")
+        loaded = _decode_data_key(dk)
+        if loaded is not None:
+            for field, want in record_key.items():
+                got = loaded.get(field)
+                if got is None:
+                    continue  # key not part of the header dataKey — nothing to check
+                if str(got) != str(want):
+                    raise ScreenError(
+                        f"aspx navigate: asked for {field}={want!r} but the screen "
+                        f"loaded {field}={got!r}. The key commit was IGNORED and the "
+                        f"screen answered with a different record — continuing would "
+                        f"read and write that record instead. Known on EP205015, "
+                        f"whose datasource exposes no navigation command at all "
+                        f"(no First/Next/Prev/Last/Refresh); such a screen has to be "
+                        f"reached another way (export_screen_xml / import_screen_xml "
+                        f"round-trip the whole record graph).")
         return dk
 
     def find_grid_control(self, grid_view: str) -> tuple[str, str | None, int | None]:
