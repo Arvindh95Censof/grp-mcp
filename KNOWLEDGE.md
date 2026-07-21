@@ -1105,6 +1105,34 @@ field is live; silence does not prove it is dead** — and here, silence did not
 where it was aimed. A protocol that ignores unknown commands cannot be driven by defaults borrowed
 from one captured screen.
 
+### 11f. Tree columns came from `grids` only → endpoint building was dead — FIXED (v0.66.7)
+
+A tree control is listed under `grids` on some screens and under **`views`** on others.
+`ui_select_tree_node` looked only in `grids`, so on SM207060 (whose `EntityTree` is in `views`)
+`columns` came back `None` and the control block went out with `columns: []`. **The server answers
+an empty column list with no data at all** — the response carries no `controlsData` key, so
+`_tree_row_by_title` found nothing and every caller reported *"entity `<X>` not found"*.
+
+That reads as a bad argument, which is why it hid: the real failure was a broken node lookup, and
+it took down the whole endpoint-building chain — `ui_tree_dialog_insert`,
+`ui_populate_entity_fields`, `generate_endpoint_entity`.
+
+Falling back to `views` for the column list fixes it: the SM207060 root select goes from **0 rows to
+591**, and `ui_populate_entity_fields` runs through node lookup, dialog open and fill to a genuine
+business refusal (*"The Populate button is disabled"* — correct for an INHERITED `↓` entity, which
+must be extended before its fields can be populated).
+
+Two diagnostic notes worth keeping:
+
+- A **bad root key hard-errors** (`"ROOT"` alone → *"Index was outside the bounds of the array"*)
+  while the correct one returns 200 with nothing. Same asymmetry §13 states: an error proves the
+  input reached live code; silence proves nothing. The silent case was the broken one.
+- A follow-up call carrying the same `controlsParams` returned the rows even while the select
+  response didn't — that was the symptom that located the empty-columns cause. It was briefly
+  implemented as a second round trip and then **removed**: once the columns are right the select
+  carries the data itself, and shipping a fallback whose necessity can't be demonstrated is how a
+  codebase accumulates cargo.
+
 ### 11b. No classic grid at all → routed to the modern plane (v0.64.15)
 
 Some grids render ONLY on the modern plane and emit no classic control config (observed: CA202000

@@ -1083,9 +1083,21 @@ class ScreenClient:
                 f"modern-plane selection handler and node-scoped edits need the classic "
                 f"ASPX plane (aspx_tree_node_action) or the browser."
             )
+        # A tree control is listed under `grids` on some screens and under `views` on
+        # others (SM207060's EntityTree is in VIEWS). Looking only in `grids` yielded
+        # columns=None -> the control block went out with `columns: []`, and the server
+        # answers an empty column list with NO DATA — the response comes back without a
+        # `controlsData` key at all, so every caller that reads the node list out of it
+        # (_tree_row_by_title) found nothing and reported "entity <X> not found".
+        # That looked like a bad argument and hid a broken lookup: it took down the
+        # whole endpoint-building flow. Same "trees live in views, not grids" fact the
+        # ui_screen_action preflight has to accept.
         tree_meta = struct["grids"].get(tree_view) or {}
+        columns = tree_meta.get("columns")
+        if not columns:
+            columns = [f["field"] for f in (struct["views"].get(tree_view) or [])] or None
         block = _tree_control_block(tree_view, node_key, ancestor_keys,
-                                     tree_meta.get("columns"), tree_meta.get("key_fields"))
+                                     columns, tree_meta.get("key_fields"))
         context_views = _tree_context_views(list(struct["views"]), tree_view, node_key)
         resp = await self._ui_post({
             "command": [{"name": select_command}], "data": [],

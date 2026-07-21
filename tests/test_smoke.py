@@ -1420,6 +1420,47 @@ def _tree_client(actions):
     return c, asyncio
 
 
+def test_tree_control_block_empty_columns_is_what_broke_the_endpoint_flow():
+    # The server answers an EMPTY column list with no data at all: the response comes
+    # back with no `controlsData` key, so _tree_row_by_title finds nothing and every
+    # caller reports "entity <X> not found". Pin the distinction the fix depends on.
+    from grp_mcp.screen import _tree_control_block
+    empty = _tree_control_block("EntityTree", {"Key": "ROOT#e"}, None, None, None)
+    assert empty["columns"] == []          # the broken shape
+    good = _tree_control_block("EntityTree", {"Key": "ROOT#e"}, None, ["Title", "Key"], ["Key"])
+    assert good["columns"] == ["Title", "Key"]
+
+
+def test_select_tree_node_falls_back_to_views_for_tree_columns():
+    """A tree listed in `views` (SM207060's EntityTree) not `grids` must still get
+    real columns. Looking only in `grids` sent columns=[] and the server returned no
+    tree data — which killed ui_tree_dialog_insert / ui_populate_entity_fields /
+    generate_endpoint_entity with a misleading "entity not found"."""
+    import asyncio
+    from grp_mcp.screen import ScreenClient
+
+    c = object.__new__(ScreenClient)
+    c.screen_id = "SM207060"
+    sent = {}
+
+    async def _struct():
+        return {"actions": [{"name": "EnablePopulate"}],
+                "views": {"EntityTree": [{"field": "Title"}, {"field": "Key"}]},
+                "grids": {}}   # deliberately NOT in grids — the real SM207060 shape
+
+    async def _post(payload):
+        sent.update(payload)
+        raise RuntimeError("stop after payload")   # no transport in the stub
+    c.get_ui_structure = _struct
+    c._ui_post = _post
+
+    try:
+        asyncio.run(c.ui_select_tree_node("EntityTree", {"Key": "ROOT#grp_mcp"}))
+    except RuntimeError:
+        pass
+    assert sent["controlsParams"]["EntityTree"]["columns"] == ["Title", "Key"]
+
+
 def test_select_tree_node_refuses_command_the_screen_does_not_have():
     # EP205015 has no "EnablePopulate" (that is SM207060's handler). Sending it
     # anyway selected nothing and the next write hit the CURRENT node and COMMITTED
