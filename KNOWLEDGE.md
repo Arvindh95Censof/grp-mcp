@@ -1136,6 +1136,116 @@ Enable command as `"in_progress"` (see §6 step 1), and its error text is no lon
 160 chars — the old cut landed mid-sentence at "…instance of ", discarding exactly the object name
 that identifies the null.
 
+## 13. ARM row sets (CS206010) — writing rows AND formulas headlessly
+
+Analytical Report Manager row sets are drivable end-to-end, but ONLY as a **two-step** write. Proven
+live on a 69-row Penyata Kedudukan Kewangan copy (2026-07-21, csmdev/AI MPM), every claim below
+DB-verified via `run_dac_odata('RMRow')`.
+
+### The recipe
+
+```
+1. screen_submit    insert the row: Rows.Code, Rows.Description, Rows.Type   -- NO formula
+2. aspx_grid_batch  update Formula, row_key = FULL key {RowSetCode, RowNbr}
+3. run_dac_odata    verify (ok:true on this screen proves nothing — see below)
+```
+
+Step 2 is the load-bearing one: `aspx_grid_batch` wrote `=sum('0030','0041')` onto a Total row and
+the DB confirmed it. Deletes work the same way (`operation:"delete"`, full key), also verified.
+
+### Why the formula CANNOT go in the insert (measured, not inferred)
+
+Sending `Rows.Value` in the same Submit as the row fails **two different ways**, and both are
+misleading:
+- A formula containing a **function call** hard-errors: *"The expression contains a call of an
+  undefined function sum()."* — and identically for `Sum()`, so **it is NOT a casing problem.** The
+  SOAP import processor validates with a GENERIC expression parser that has no ARM function library
+  loaded; the ASPX plane runs inside the real ARM graph, which is why the same string succeeds there.
+- A formula with only row references (`=@0130+@0232`) raises **nothing at all** and is **silently
+  dropped** — no error, no value, `ok:true`.
+
+Isolation test that settles it: one insert carrying `Description`, `Type`, `Height`, `Indent` and
+`Value` persisted the first FOUR and dropped only `Value`. So it is not a key-fields-only limit and
+not the wrong row type — `Formula` specifically is unwritable on the classic import path.
+
+### `Rows.Type` — the full enum, and why a wrong label is dangerous
+
+Valid labels (read off the live dropdown): **`GL`, `Caption`, `Line`, `Total`, `Header`, `Sort`**.
+Observed `RowType` ints: `0`=GL, `1`=Caption, `2`=Line, `3`=Total.
+
+An INVALID label is **silently coerced to `GL`(0)** under `ok:true` — `Calculation` and `Formula`
+both did this. That matters twice over: the row is quietly the wrong type, AND `Formula` is only
+applicable to `Total` rows, so a later formula write onto a mis-typed row **no-ops silently**. (My
+first ASPX formula update "failed" purely because it targeted a `Caption` row — the plane was fine.)
+
+### Formulas: what you can actually write
+
+Formulas are Excel-like, entered as plain text in the **Value** column (the magnifier opens the
+documented *Formula Editor* dialog, with a **Validate** button — but typing the text directly is
+equally valid). Reference: KB `Formula_Functions__00a69dbb`, `Formula_Operators__cb4ef681`,
+`Formula_Parameters__f3d27b0f`.
+
+- **Row/cell references** — `@0130` (a row code), `A11`/`B12` (column-letter + row cells).
+- **Interval functions — the ones that matter for financial statements:**
+  - `Sum(from, to)` — sums a **RANGE**, not a list: `=Sum('0030','0041')` covers every row code in
+    between. **This is the single most important gotcha**: a new row inserted inside an existing
+    range joins that subtotal silently, and a row added just outside it is silently excluded.
+  - `Sort(from, to, column)` / `SortD(...)` — ascending / descending over a range.
+- **Math**: `Abs`, `Floor`, `Ceiling`, `Round(x, decimals)`, `Min`, `Max`, `Pow`.
+- **Conditional / null**: `IIf(expr, truePart, falsePart)`, `IsNull(value, nullValue)`,
+  `NullIf(v1, v2)`, `Switch(expr1, val1, expr2, val2, …)`.
+- **Conversion**: `CBool CDate CStr CDbl CSng CDec CInt CShort CLong`.
+- **Text**: `LTrim RTrim Trim Format UCase LCase InStr InStrRev Len Left Right Replace PadLeft
+  PadRight`.
+- **Date/time**: `Today() Now() TodayUTC() NowUTC() DateAdd DateDiff Day Month Year DayOfWeek
+  DayOfYear DayOrdinal Hour Minute Second MonthName`.
+- **Acumatica-specific** (`Report.` prefix): `ExtToInt ExtToUI IntToExt IntToUI UIToExt UIToInt
+  GetDescription GetDefExt/Int/UI GetDisplayName GetFormat GetMask GetBranchText FormatPeriod
+  FormatYear`.
+- Comments inside a formula: `/* commented line */`.
+
+Note the live data uses **lowercase** `sum('0030','0041')` and works — the ARM runtime accepts it;
+only the SOAP validator is strict. Match the existing rows' style rather than "fixing" the case.
+
+### Data Source (the GL account behind a `GL` row) lives in a SEPARATE DAC
+
+The grid's `DataSourceID` is an FK auto-created per row. The account/mask is on **`RMDataSource`**:
+`StartAccount` + `EndAccount` (set BOTH to the same value for one account, or to the same wildcard
+mask — live examples: `A11201`, `A14???`, `A63???`), plus `Expand`, `AmountType`, `AccountClassID`,
+`LedgerID`, branch/period/project range fields. The modern plane cannot see the Data Source column
+at all, so read it via `run_dac_odata('RMDataSource')` keyed on the row's `DataSourceID`.
+
+### Two traps that cost real time here
+
+- **`screen_submit` CANNOT target an existing detail row — by design.** Setting a detail container's
+  key field does not select a row; the import processor treats it as a NEW row and errors "A record
+  with the same value of the Code field already exists". Positional `{"row": N}` is refused outright
+  (see §3) because it silently writes to row 1. To edit an existing grid row use the ASPX plane
+  (full key) or the modern grid tools — never a key-set on the classic plane.
+- **NEVER interleave API writes with an open browser page on the same record.** Acumatica records
+  carry a `tstamp`; API writes bump it, and the stale page then fails its Save with *"Another
+  process has updated the 'RMRowSet' record. Your changes will be lost."* That guard is protective
+  (it blocks a stale overwrite, nothing is lost) but it will silently waste a long manual edit.
+  Pick ONE plane per session; if you must switch, reload the page first.
+
+### Meta-lesson (cost three false negatives in one session)
+
+**A validation ERROR is proof the field is live; silence is not proof it is dead.** "undefined
+function sum()" meant the server had read the formula and understood it well enough to reject it —
+that was the moment to conclude "wrong context", not "unwritable". Every wrong verdict here came
+from an invalid fixture: a `Caption` row for the update test, a same-batch type change for the
+insert test, and an invented enum label. Same failure mode §11 already warns about; check the
+fixture is valid before believing a null result.
+
+### Known gap in our own guards
+
+`classify_writable` sources field metadata from the modern `/structure`, but classic-only fields
+(here `Formula`, `DataSourceID`) are **absent from the modern grid entirely** — unknown fields are
+treated as writable so nothing is silently dropped, which means the one field that genuinely cannot
+be written is precisely the one we cannot warn about. `screen_submit` reported `ok:true` with empty
+`field_errors` for every drop above. Until that is closed, **read back after every classic-plane
+write to this screen.**
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
