@@ -1281,6 +1281,56 @@ is describing a graph you did not build, and "the same call returned a different
 symptom you will chase. Always confirm what actually persisted with `run_dac_odata`, never with the
 error text.
 
+### Data Source (dialog-only cells) — protocol MAPPED, write NOT achieved (2026-07-21)
+
+The `Data Source` column is the one part of a row set this plane still cannot write. Recorded here
+because the next attempt should start from these facts rather than repeat the search.
+
+**Why no cell-level write can work.** The cell renders `class="editor ReadOnly GridEditorText"` —
+it is *read-only text plus a magnifier*. Measured, all four planes:
+`screen_submit` (`Rows.DataSource` and `RowsDataSourceID.DataSourceIDText`) drops it silently;
+`ui_insert_grid_row` cannot even insert on this grid (`'Type' cannot be empty` — the modern plane
+fails to bind `RowType`); `aspx_grid_batch` with `DataSourceID` is refused **and still committed a
+side effect** (the row's FK churned 31551→31553, orphaning the old record — proof that
+`save_verified:false` means *your field didn't take*, NOT *nothing happened*); the contract
+endpoint exposes only 2 fields for that container (`DataSourceID`, `DataSourceIDText`), so
+`generate_endpoint_entity` cannot reach `StartAccount` either.
+
+**The dialog protocol, captured live and confirmed working up to the Save:**
+```
+editor    ctl00_phG_grid_lv0_edDataSource         (from the column's formEditorID)
+panel     <editor>_pnlARmDataSet                   (a PXSmartPanel, EMPTY until loaded)
+form      <panel>_frmDataSet                       (materialises only in the Load response)
+open      __CALLBACKID=<panel as $-name>  param: Load|<panel LoadedLevel="-1"><![CDATA[]]></panel>
+save      __CALLBACKID=<form  as $-name>  param: Save|<form  LoadedLevel="-1"><![CDATA[]]></form>
+          + discrete params  <form$-name>$<Field>$text = value,  <form$-name>$edID = <fk>
+binding   the editor's hidden _state carries the record: <PXText Value="31556"/>
+```
+`formEditorID` is in the PAGE's `var _<grid> = {...}` config — a grid **Refresh response does NOT
+carry it** (that cost a live call returning "no dialog columns").
+
+**Five hypotheses tested, all rejected** — the Save returns clean and `RMDataSource.StartAccount`
+stays null: (1) bind→Load; (2) a following ds-level Save; (3) harvesting the Load HTML's hidden
+`_state` inputs (the Load body is RAW HTML, not Props blocks, so `_parse_control_blocks` finds
+nothing in it); (4) Load→bind; (5) selecting the row by constructing the grid `_state`
+`DataValues="<Row i=N>…"` from the GL202500 capture — that one broke the Load outright.
+
+**Traps found while probing, worth not rediscovering:**
+- A loose `<panel>_frm[A-Za-z0-9]*` match returns a **CSS class name**: the Load body opens with a
+  `<style>` block containing the same string. Anchor on `name="…_state"`.
+- Writing the editor `_state` BEFORE the Load makes the panel answer with a stunted body (3410
+  bytes, no form) instead of the full render (83026). Order is load-bearing, though neither order
+  persists.
+- Setting the field via JS in a browser does NOT work either — the framework serialises from its own
+  control state, so only `edID` reaches the wire. Do not use a browser DOM write to "confirm" a
+  field is settable.
+
+**Status: Data Source remains a manual browser step.** The tool built for this
+(`aspx_cell_dialog_set`) was **deliberately not shipped** — it returned `ok:true` while persisting
+nothing, which is the exact failure class §12 exists to remove. Next attempt should capture the
+browser's COMPLETE dialog exchange (every field, in order, with each `_state` at each step) rather
+than reconstructing from sampled pieces.
+
 ### Known gap in our own guards
 
 `classify_writable` sources field metadata from the modern `/structure`, but classic-only fields
