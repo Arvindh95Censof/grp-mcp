@@ -324,6 +324,52 @@ def _tree_context_views(view_names: list[str], tree_view: str, node_key: dict) -
             if v.startswith("Selected") and v != tree_view}
 
 
+_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                      r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def xml_as_new_record(xml: str, id_field: str, new_name: str | None = None,
+                      name_field: str = "Name") -> str:
+    """Rewrite a screen's exported XML so importing it CREATES a new record
+    instead of colliding with the one it came from (pure, unit-testable).
+
+    Proven live on EP205015 (approval maps), 2026-07-21. Three rules, each of
+    which was a failed attempt first:
+
+    1. `id_field` must be PRESENT and set to **"0"**. Deleting the attribute
+       fails with *"Cannot insert explicit value for identity column … when
+       IDENTITY_INSERT is set to OFF"*; "0" makes the server assign the next
+       identity. A NONZERO unused id (999999) is the dangerous case — the parent
+       imports fine and every CHILD row is SILENTLY DROPPED, because children
+       keep their uplink to the id you invented. Header-only results look
+       perfectly healthy in the UI, so always read the child table back.
+    2. Every GUID is replaced with a fresh one. Done as a distinct-value mapping,
+       so a child's parent-pointer (EPRule.StepID -> its step's RuleID) still
+       points at the same row after rewriting.
+    3. `NoteID` is dropped — it is a per-record note reference, not data.
+
+    `new_name` renames the record. Only the FIRST `<name_field>="…"` is touched:
+    on EP205015 the later ones are step/rule names, and renaming those would
+    quietly rewrite the workflow's contents.
+    """
+    mapping = {g: str(uuid.uuid4()) for g in set(_GUID_RE.findall(xml))}
+    for old, new in mapping.items():
+        xml = xml.replace(old, new)
+    xml = re.sub(rf'\s{re.escape(id_field)}="[^"]*"', "", xml)
+    xml = re.sub(r'\sNoteID="[^"]*"', "", xml)
+    # re-add the id as "0" on the main row (first element carrying the old attr)
+    xml = re.sub(r"(<row\b)", rf'\1 {id_field}="0"', xml, count=1)
+    if new_name is not None:
+        xml = re.sub(rf'{re.escape(name_field)}="[^"]*"',
+                     f'{name_field}="{_xml_attr(new_name)}"', xml, count=1)
+    return xml
+
+
+def _xml_attr(v: str) -> str:
+    return (str(v).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def _leaf(class_name: str | None) -> str | None:
     """Leaf class name of a dotted/nested .NET type, lowercased (pure, unit-testable).
 
@@ -1838,6 +1884,87 @@ class ScreenClient:
 
     # WebDialogResult values accepted as a dialog answer (public PX.Data enum).
     _DIALOG_ANSWERS = {"ok": 1, "cancel": 2, "yes": 6, "no": 7}
+
+    async def ui_export_xml(self) -> tuple[bytes, str]:
+        """Download the current record's Clipboard > "Export as XML" file.
+        Returns (bytes, filename). Navigate the record first.
+
+        The command is `CopyPaste@ExportXml` — the MENU SUB-COMMAND. Plain
+        "ExportXml" is silently inert (200, command states echoed, nothing else),
+        and /structure lists only the top-level "CopyPaste", which is why
+        ui_screen_action refuses it and this goes through ui_command.
+
+        Only the MODERN plane can do this. The identical command on the classic
+        ASPX plane just repaints the page, and three postback shapes returned no
+        Content-Disposition. The modern plane instead answers with a `redirects`
+        block holding the real URL — the whole trick, and invisible from classic:
+
+            {"redirects": [{"url": "/Frames/GetFile.ashx?fileID=<guid>&...`}]}
+
+        (`Frames/GetFile.ashx` is ALSO the attachments handler, so finding it in
+        the page config proves nothing about export — the fileID is what matters.)
+        """
+        resp = await self.ui_command("CopyPaste@ExportXml")
+        redirects = resp.get("redirects") or []
+        if not redirects or not redirects[0].get("url"):
+            raise ScreenError(
+                f"ui_export_xml on {self.screen_id}: the export command returned no "
+                f"download redirect. The screen may have no XML export definition "
+                f"(App_Data/XmlExportDefinitions/{self.screen_id.upper()}.xml), or no "
+                f"record is loaded — navigate to one first."
+            )
+        url = redirects[0]["url"]
+        r = await self._http.get(self.instance.base_url.rstrip("/") + url)
+        if r.status_code != 200 or not r.content:
+            raise ScreenError(
+                f"ui_export_xml on {self.screen_id}: download {url} -> "
+                f"HTTP {r.status_code}, {len(r.content)} bytes")
+        name = ""
+        cd = r.headers.get("content-disposition", "")
+        m = re.search(r'filename="?([^";]+)"?', cd)
+        if m:
+            name = m.group(1)
+        return r.content, name
+
+    async def ui_import_xml(self, xml: bytes, filename: str = "import.xml",
+                            save: bool = True) -> dict:
+        """Upload an XML file to this screen and run Clipboard > "Import from XML".
+
+        Two planes, in this order — neither can do it alone:
+          1. CLASSIC upload. A multipart POSTBACK to the .aspx page carrying the
+             page-level upload dialog's file input. Those control names are the
+             same on every screen (the dialog lives in the page template, keyed
+             "UploadImportedXml"), so this generalizes.
+          2. MODERN `CopyPaste@ImportXml`, then Save.
+
+        Without step 1 the import fails "The file is not found, or you don't have
+        enough rights to see the file" — the command reads a file the session must
+        already hold.
+
+        The import always INSERTS; it never fills the current record (proven: doing
+        Insert first yields isNewEntry:true and the same identity error). To create
+        a NEW record, shape the payload with xml_as_new_record() — in particular the
+        identity attribute must be present and "0".
+        """
+        from .aspx import AspxDiagnostic
+        page = f"{self.instance.base_url.rstrip('/')}/Pages/{self.screen_id[:2].upper()}/{self.screen_id.upper()}.aspx"
+        d = AspxDiagnostic(self, page)
+        await d.open()
+        form = dict(d._state)
+        form["__EVENTTARGET"] = "ctl00$usrCaption$dlgUploadXml$btnUpload"
+        form["__EVENTARGUMENT"] = ""
+        up = await self._http.post(page, data=form, files={
+            "ctl00$usrCaption$dlgUploadXml$upl$upl": (filename, xml, "text/xml")})
+        if up.status_code != 200:
+            raise ScreenError(
+                f"ui_import_xml on {self.screen_id}: upload -> HTTP {up.status_code}")
+        struct = await self.get_ui_structure()
+        await self.ui_bootstrap([next(iter(struct["views"]), None)])
+        imported = await self.ui_command("CopyPaste@ImportXml")
+        saved = await self.ui_command("Save") if save else None
+        return {"uploaded_bytes": len(xml), "filename": filename,
+                "imported": True, "saved": bool(save),
+                "graph_is_dirty": (saved or imported).get("graphIsDirty")}
 
     async def ui_command(self, name: str, answer: str = "ok") -> dict:
         """Fire a modern UI-screen command; answers a confirmation dialog if one opens.

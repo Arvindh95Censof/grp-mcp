@@ -1420,6 +1420,54 @@ def _tree_client(actions):
     return c, asyncio
 
 
+def test_xml_as_new_record_sets_identity_to_zero_not_absent():
+    # Measured on EP205015: REMOVING the identity attribute fails with
+    # "Cannot insert explicit value for identity column ... IDENTITY_INSERT is OFF".
+    # It must be present and "0" so the server assigns the next id.
+    from grp_mcp.screen import xml_as_new_record
+    src = '<data-set><data><EPAssignmentMap><row AssignmentMapID="15" Name="X" ' \
+          'NoteID="783038d0-305d-ea11-a2d1-02000a464602"/></EPAssignmentMap></data></data-set>'
+    out = xml_as_new_record(src, "AssignmentMapID")
+    assert 'AssignmentMapID="0"' in out
+    assert 'AssignmentMapID="15"' not in out
+    assert "NoteID" not in out          # per-record note ref, not data
+
+
+def test_xml_as_new_record_keeps_parent_child_guid_pairing():
+    # Children point at their parent by GUID (EPRule.StepID -> the step's RuleID).
+    # Rewriting each GUID independently would orphan them; the mapping must be
+    # per-DISTINCT-value so the pairing survives.
+    import re
+    from grp_mcp.screen import xml_as_new_record
+    step, other = "a10b88dc-305d-ea11-a2d1-02000a464602", "574bb7de-325d-ea11-a2d1-02000a464602"
+    src = (f'<row AssignmentMapID="15" Name="M">'
+           f'<EPRule RuleID="{step}" Name="Step"/>'
+           f'<EPRule RuleID="{other}" StepID="{step}" Name="Rule"/></row>')
+    out = xml_as_new_record(src, "AssignmentMapID")
+    new_step = re.search(r'RuleID="([^"]+)" Name="Step"', out).group(1)
+    new_link = re.search(r'StepID="([^"]+)"', out).group(1)
+    assert new_step == new_link          # still the same row
+    assert new_step != step              # but freshly generated
+
+
+def test_xml_as_new_record_renames_only_the_first_name():
+    # On EP205015 the later Name= attributes are STEP and RULE names — renaming
+    # those would quietly rewrite the workflow's contents, not its title.
+    from grp_mcp.screen import xml_as_new_record
+    src = '<row AssignmentMapID="15" Name="Work Indent Workflow">' \
+          '<EPRule Name="Disahkan"/><EPRule Name="Diluluskan"/></row>'
+    out = xml_as_new_record(src, "AssignmentMapID", new_name="Cloned")
+    assert 'Name="Cloned"' in out
+    assert 'Name="Disahkan"' in out and 'Name="Diluluskan"' in out
+    assert out.count('Name="Cloned"') == 1
+
+
+def test_xml_as_new_record_escapes_the_new_name():
+    from grp_mcp.screen import xml_as_new_record
+    out = xml_as_new_record('<row ID="1" Name="a"/>', "ID", new_name='A & "B"')
+    assert 'Name="A &amp; &quot;B&quot;"' in out
+
+
 def test_tree_control_block_empty_columns_is_what_broke_the_endpoint_flow():
     # The server answers an EMPTY column list with no data at all: the response comes
     # back with no `controlsData` key, so _tree_row_by_title finds nothing and every

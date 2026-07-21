@@ -25,7 +25,8 @@ from .config import Config, Instance, load_config, save_config
 from .customization import CustomizationClient, encode_zip
 from .loaders import map_row, read_rows
 from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
-                     clear_struct_cache, close_http_pool, logout_session_cache)
+                     clear_struct_cache, close_http_pool, logout_session_cache,
+                     xml_as_new_record)
 
 _KB_FIRST_POLICY = (
     "TOOL SELECTION: this server has ~95 tools across FIVE Acumatica planes (contract "
@@ -3157,6 +3158,128 @@ async def aspx_delete_grid_row(
             "record_loaded": bool(dk) if record_key else "skipped (headerless)",
             "grid_view": grid_view, "row_key": row_key,
             "operation": "delete", **result}
+
+
+@mcp.tool()
+async def export_screen_xml(
+    screen_id: str,
+    record_key: dict | None = None,
+    out_path: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Download a record as XML via a screen's Clipboard > "Export as XML" — the
+    WHOLE record graph in one document, including detail tables no other plane
+    can read or write.
+
+    Works on any screen with an XML export definition (server-side
+    App_Data/XmlExportDefinitions/<SCREENID>.xml). That file declares the record
+    graph; on EP205015 (Approval Maps) it is EPAssignmentMap -> EPRule (steps AND
+    rules) -> EPRuleCondition + EPRuleEmployeeCondition + EPRuleApprover, i.e.
+    everything the tree UI edits and the modern/SOAP planes cannot reach, because
+    node-scoped edits there need a tree selection this screen has no handler for.
+
+    So this is the read half of the ONLY full-fidelity path for such screens —
+    pair it with import_screen_xml to clone, template, or move a record between
+    tenants (the UI itself cannot copy a map).
+
+    record_key: {"view": <ViewName>, "key": {...}} — the record to export. Omit
+        only when the screen already holds the record you want; the export takes
+        whatever is current, and on a fresh session that is usually the FIRST
+        record, not an empty one.
+    out_path:   write the file here (respecting the instance's write_roots
+        sandbox); otherwise the XML is returned inline.
+
+    Read-only: no write gate, nothing is modified.
+    """
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    async with ScreenClient(inst, sid) as s:
+        struct = await s.get_ui_structure()
+        primary = next(iter(struct["views"]), None)
+        await s.ui_bootstrap([primary] + ([record_key["view"]] if record_key else []))
+        if record_key:
+            await s.ui_navigate_record(record_key["view"], record_key["key"])
+        data, filename = await s.ui_export_xml()
+    out: dict[str, Any] = {"screen_id": sid, "record_key": record_key,
+                           "filename": filename, "bytes": len(data)}
+    if out_path:
+        p = _check_write_path(out_path, instance)
+        with open(p, "wb") as fh:
+            fh.write(data)
+        out["written_to"] = str(p)
+    else:
+        out["xml"] = data.decode("utf-8-sig", errors="replace")
+    return out
+
+
+@mcp.tool()
+async def import_screen_xml(
+    screen_id: str,
+    xml: str | None = None,
+    file_path: str | None = None,
+    as_new_record: dict | None = None,
+    save: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Create/replace a record by importing a screen's XML (Clipboard > "Import
+    from XML") — the write half of the full-fidelity path, and the only way to
+    populate detail structures the other planes cannot address.
+
+    Uploads the file through the page-level upload dialog (classic postback), then
+    runs the modern import command and Saves. Both planes are required: the modern
+    command reads a file the session must already hold, and the classic plane
+    cannot run the import itself.
+
+    xml / file_path: the document, inline or from disk (read_roots sandbox).
+    as_new_record:   {"id_field": <identity column>, "new_name": <optional>} to
+        rewrite the payload into a NEW record — fresh GUIDs (parent pointers kept
+        consistent), NoteID dropped, identity set to "0". Omit to import the file
+        verbatim, which UPDATES the record it came from.
+    save:            commit (default True).
+
+    THE IDENTITY RULE, measured on EP205015 — get this wrong and it fails in one
+    of two ways, one of them silent:
+      * attribute REMOVED  -> "Cannot insert explicit value for identity column
+        … when IDENTITY_INSERT is set to OFF"  (loud, harmless)
+      * identity "0"       -> correct: server assigns the next id, children follow
+      * a NONZERO unused id -> header imports, EVERY CHILD ROW IS SILENTLY DROPPED
+        (children keep their uplink to the invented id). A header-only record looks
+        healthy in the UI — this is why as_new_record exists rather than leaving
+        callers to hand-edit.
+
+    ALWAYS read the child table back (run_dac_odata) — a successful import with an
+    empty detail set is the failure mode this tool cannot detect for you.
+
+    Requires allow_write. KB-first: check the screen's prerequisites before writing.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    sid = screen_id.upper()
+    if not xml and not file_path:
+        raise ScreenError("import_screen_xml: pass xml= or file_path=")
+    if file_path:
+        p = _check_read_path(file_path, instance)
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8-sig", errors="replace")
+    else:
+        text = xml or ""
+    rewritten = False
+    if as_new_record:
+        if not as_new_record.get("id_field"):
+            raise ScreenError(
+                "import_screen_xml: as_new_record needs id_field (the main table's "
+                "identity column, e.g. 'AssignmentMapID' on EP205015)")
+        text = xml_as_new_record(text, as_new_record["id_field"],
+                                 as_new_record.get("new_name"))
+        rewritten = True
+    async with ScreenClient(inst, sid) as s:
+        result = await s.ui_import_xml(text.encode("utf-8"),
+                                       filename=f"{sid}.xml", save=save)
+    return {"screen_id": sid, "rewritten_as_new_record": rewritten,
+            "source": "file" if file_path else "inline", **result,
+            "verify": "Read the DETAIL table back (run_dac_odata). A header-only "
+                      "import reports success and looks fine in the UI."}
 
 
 @mcp.tool()
@@ -7651,6 +7774,18 @@ _GUIDE = {
             "screen_record / screen_submit (context/master-detail screen)",
             "ui_screen_action (modern form field / dialog action)",
             "ui_preflight (dry-run validate a modern write first)"],
+        "clone / move a whole record graph (XML)": [
+            "export_screen_xml (download a record + ALL its detail tables as one "
+            "document — works on any screen with an XmlExportDefinitions entry)",
+            "import_screen_xml (create or replace a record from that document; "
+            "as_new_record={'id_field':..,'new_name':..} makes it a NEW record)",
+            "WHEN: the record has detail structures the other planes cannot address "
+            "— the proven case is EP205015 Approval Maps, whose steps/rules/conditions "
+            "hang off a tree with no modern selection handler, so the XML round-trip "
+            "is the ONLY full-fidelity path (and the only way to copy a map at all).",
+            "TRAP: the identity attribute must be PRESENT and '0'. Removing it errors "
+            "loudly; a nonzero unused id imports the header and SILENTLY DROPS every "
+            "child row. Always read the detail table back with run_dac_odata."],
         "grid rows": ["screen_insert_rows (bulk append, classic)",
             "ui_insert_grid_row / ui_update_grid_row / ui_delete_grid_row (modern, "
             "key-addressed, cell-validated)",
