@@ -1498,6 +1498,50 @@ later ones are step/rule names, and renaming those rewrites the workflow's conte
 Verified live end to end: map 15 cloned with step + 2 rules (parenting, sequences, ApproveType W/A,
 workgroups) and all 5 conditions incl. brackets/operators.
 
+### 14a. STRING-keyed screens clone by RENAMING CODES — and ARM (CS206000) is the big win
+
+`as_new_record` is built for an INTEGER identity (`id_field` → `"0"`). A screen whose key is a
+string CODE has no identity column, so that helper does not apply — you clone by rewriting the codes
+and regenerating the record UID. **CS206000 (Report Definitions)** is the case that matters, because
+its export carries the ENTIRE Analytical Report Manager graph in one document:
+
+```
+RMReport ─ RMDataSource, RMStyle
+RMColumnSet ─ RMColumn ─ RMColumnHeader (formulas + styles)
+RMRowSet ─ RMRow (RowCode, RowType, Formula, LineStyle, Indent) ─ RMDataSource
+RMUnitSet ─ RMUnit           + Ledger (reference, do-not-change)
+```
+
+That **supersedes the two-step ARM recipe** in §13 for whole-set work: row `Formula` no longer needs
+a second `aspx_grid_batch` pass, and the per-row `RMDataSource` (StartAccount/EndAccount/
+AccountClassID/StartSub/EndSub) rides along in the same file.
+
+Only THREE rows need editing — child rows carry no parent code at all, they uplink positionally by
+XML nesting:
+
+| element | edit |
+|---|---|
+| `RMReport` row | `ReportCode`, `ReportUID` (fresh GUID), `Description`, `RowSetCode`, `ColumnSetCode` |
+| `RMColumnSet` row | `ColumnSetCode`, `Description` |
+| `RMRowSet` row | `RowSetCode`, `Description` |
+| `RMRow` / `RMColumn` / `RMColumnHeader` | **nothing** — nested uplink |
+
+**The trap: row sets and column sets are SHARED system-wide** (KB: the code must be unique across
+the whole system, and one set is reused by many reports). Import a file that keeps `RowSetCode="PKK"`
+and you do not create anything — you **UPDATE the live shared set**, silently changing every other
+report that uses it. Rename all three codes, or know exactly which set you are rewriting. Codes are
+max 10 alphanumeric.
+
+Verified live end to end on csmdev (2026-07-21): `PKK` → `AITESTRPT` imported, then RE-EXPORTED and
+diffed against the source. After normalising only the intended renames the two files are **identical,
+453/453 lines** — 69 rows, 4 columns, 24 column headers, 27 account ranges, 17 row formulas, 6 header
+formulas, all styles. Source report untouched (same `ReportUID`).
+
+One gotcha worth naming: `export_screen_xml` without `record_key` failed here with *"The Export as
+XML button is disabled"*. That is "no record is loaded", NOT "this screen has no XML definition" —
+pass `record_key={"view":"Report","key":{"ReportCode":…}}`. Unlike EP205015, CS206000 exposes real
+navigation commands (First/Previous/Next/Last), so its record targeting is unproblematic.
+
 ## 15. Modern-plane writes must NAME their record target (BREAKING, v0.68.0)
 
 **"No record specified" never meant "no record loaded".** The modern session is cached ACROSS CALLS
