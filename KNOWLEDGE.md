@@ -1466,6 +1466,47 @@ later ones are step/rule names, and renaming those rewrites the workflow's conte
 Verified live end to end: map 15 cloned with step + 2 rules (parenting, sequences, ApproveType W/A,
 workgroups) and all 5 conditions incl. brackets/operators.
 
+## 15. Modern-plane writes must NAME their record target (BREAKING, v0.68.0)
+
+**"No record specified" never meant "no record loaded".** The modern session is cached ACROSS CALLS
+(keyed `base_url|user|tenant`, and it survives across PROCESSES), so a write with no target acts on
+whatever the PREVIOUS operation left current. That is not theoretical: it renamed a live approval map
+(EP205015 map 15) when an `Insert` silently didn't apply and the following field-set + Save landed on
+the inherited record. Same shape as §11e — something quietly doesn't apply, then a write lands
+somewhere else.
+
+```
+record_key=… / parent=…   act on THIS record            (preferred)
+target="current"          act on whatever is loaded     (explicit opt-in)
+```
+
+Enforced on `ui_screen_action`, `ui_update_grid_row(s)`, `ui_insert_grid_row`, `ui_delete_grid_row`,
+`ui_grid_row_action`. The refusal names the parameter THAT tool takes (`parent` for grid tools,
+`record_key` for `ui_screen_action`), and fires before login — a mis-targeted call cannot reach the
+network.
+
+**Exempt, each for a reason:** `Insert` CREATES the record so it cannot name one; `Cancel`/`Repaint`
+discard or redraw rather than write; `ui_run_process` has no record parameter at all (it drives a
+filter) — no ceremony was added where there is no target.
+
+### Why this is caller-facing instead of a heuristic
+
+Inferring which screens are keyed was tried and **measured wrong**:
+
+| screen | actually keyed? | `urlFieldNames` |
+|---|---|---|
+| EP205015 approval maps | **yes** | `None` |
+| SM207060 endpoint | yes | `['InterfaceName','GateVersion']` |
+| CS100000 Features | **no** (singleton) | `['Status']` |
+
+A guard built on that signal would have REFUSED the screen that caused the damage and WAVED THROUGH
+the singleton. The plane cannot tell, so the caller must say. Singleton setup screens (GL102000,
+CS100000) genuinely have no key and pass `target="current"` — accurate, not a workaround.
+
+**The escape hatch is real, and that is the risk.** `target="current"` restores exactly the behaviour
+that caused the incident. It is correct for keyless singletons; anywhere else it deserves a moment's
+thought rather than a reflex when a refusal is inconvenient.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
