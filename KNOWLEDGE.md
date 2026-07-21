@@ -1076,6 +1076,35 @@ structure builds `verified:true` (3 levels + an outdent, parents confirmed again
 The tool's own parent read-back is what caught this — a builder that verifies is worth more than one
 that assumes.
 
+### 11e. Modern-plane `tree_select` wrote to the WRONG NODE, silently — FIXED (v0.66.6)
+
+`ui_select_tree_node`'s `select_command` defaults to `"EnablePopulate"`, the selection-changed
+handler captured from **SM207060**. It is that graph's own action, not a framework primitive — so
+on any other tree screen the server simply **ignores** the command: HTTP 200, no message,
+`activeRowContexts` echoed back. The selection never takes, and every subsequent `set_field` lands
+on whatever node is **current**.
+
+Measured live on **EP205015** (Approval Maps, 2026-07-21): selecting rule `fb88…` and setting
+`CurrentNode.Name` renamed the **step** `fa88…` instead — and it **committed**, under `ok:true`
+with no notice. Nothing short of reading the DB back would have caught it, which is precisely the
+check nobody runs after a clean success. The docstring already warned the command "likely differs
+on OTHER tree screens"; the code never checked.
+
+Two fixes:
+
+- **Refuse up front.** `ui_select_tree_node` now validates `select_command` against the screen's own
+  `/structure` actions and raises before posting, listing the screen's real actions and pointing at
+  `aspx_tree_node_action` (§11c) when a tree has no modern-plane selection handler at all.
+- **Let callers override it.** `ui_screen_action` never forwarded `select_command` (or
+  `ancestor_keys`), so there was no way to pass a screen's own handler even if you knew it.
+  `tree_select` now accepts `{"view", "key", "parent_key"?, "ancestor_keys"?, "select_command"?}`,
+  and an unknown tree view is rejected like an unknown grid.
+
+The general lesson is the one §13 states from the other direction: **a validation error proves the
+field is live; silence does not prove it is dead** — and here, silence did not prove the write went
+where it was aimed. A protocol that ignores unknown commands cannot be driven by defaults borrowed
+from one captured screen.
+
 ### 11b. No classic grid at all → routed to the modern plane (v0.64.15)
 
 Some grids render ONLY on the modern plane and emit no classic control config (observed: CA202000

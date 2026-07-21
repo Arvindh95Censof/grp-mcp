@@ -1051,6 +1051,17 @@ class ScreenClient:
             OTHER tree screens). If a tree on a different screen doesn't respond,
             check that screen's `actions` (ui_get_structure) for its own
             selection-handler name and pass it here.
+
+        REFUSED when `select_command` is not one of the screen's own actions. A
+        command this graph doesn't implement is IGNORED by the server — 200, no
+        message, `activeRowContexts` echoed back — so the selection never takes and
+        every following set_field silently lands on whatever node is CURRENT.
+        Measured live on EP205015 (Approval Maps, 2026-07-21): selecting rule
+        `fb88…` and setting CurrentNode.Name renamed the STEP `fa88…` instead, under
+        ok:true, and the wrong-node write COMMITTED. The default is SM207060's
+        handler, so every other tree screen hits this unless it happens to share the
+        name — the failure had to be caught by reading the DB back, which is exactly
+        the check a caller has no reason to run after a clean success.
         """
         if ancestor_keys is None:
             ancestor_keys = [parent_key] if parent_key else []
@@ -1059,6 +1070,19 @@ class ScreenClient:
         # controlsParams echo below (cached and auto-attached to every later
         # command in this selection by _ui_post, alongside `ctx`).
         struct = await self.get_ui_structure()
+        actions = {a["name"] for a in struct.get("actions") or []}
+        if select_command not in actions:
+            raise ScreenError(
+                f"ui_select_tree_node {tree_view} on {self.screen_id}: "
+                f"select_command {select_command!r} is not an action on this screen, so "
+                f"the server would IGNORE it and the node would never be selected — "
+                f"subsequent field writes would silently hit the CURRENT node instead "
+                f"(measured live on EP205015). Pass this screen's own "
+                f"selection-changed handler via select_command. Actions here: "
+                f"{sorted(actions)}. If none of them selects a node, this tree has no "
+                f"modern-plane selection handler and node-scoped edits need the classic "
+                f"ASPX plane (aspx_tree_node_action) or the browser."
+            )
         tree_meta = struct["grids"].get(tree_view) or {}
         block = _tree_control_block(tree_view, node_key, ancestor_keys,
                                      tree_meta.get("columns"), tree_meta.get("key_fields"))

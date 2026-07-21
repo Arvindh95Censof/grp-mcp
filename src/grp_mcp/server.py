@@ -2020,6 +2020,13 @@ async def ui_screen_action(
         a DATA-GRID row before the action. Each is REQUIRED on some screens and the
         failure mode without it is a SILENT no-op or an opaque later error, not a clear
         one — see the notes before driving an unfamiliar screen.
+        tree_select = {"view", "key", "parent_key"?, "ancestor_keys"?, "select_command"?}.
+        `select_command` defaults to SM207060's "EnablePopulate"; on any other tree screen
+        pass that screen's own selection-changed handler (from this screen's `actions`).
+        A command the graph doesn't implement is IGNORED server-side, so the node is never
+        selected and later set_fields hit whatever node is CURRENT — a wrong-node write
+        that COMMITS under ok:true (measured on EP205015). That case is now REFUSED up
+        front rather than discovered by reading the DB back.
     save_after:  commit a "fill"-type action that only stages changes (else they are lost).
     dialog_answer: "ok"|"yes"|"no"|"cancel"|"none" ("none" returns the dialog unanswered).
     skip_validation / verify: bypass the write guard, or re-read after the action.
@@ -2132,6 +2139,16 @@ async def ui_screen_action(
                 f"expose — e.g. a numbered-duplicate view like 'ViewName: 2' — retry with "
                 f"skip_validation=true; it will be set but reported as unverifiable)."
             )
+        # A tree control shows up in `views` on some screens (EP205015 NodesTree,
+        # SM207060 EntityTree) and in `grids` on others — accept either, reject
+        # neither-of-both rather than letting a typo'd view select nothing quietly.
+        if tree_select and tree_select["view"] not in struct["views"] \
+                and tree_select["view"] not in struct["grids"]:
+            raise ScreenError(
+                f"ui_screen_action: unknown tree view {tree_select['view']!r} on "
+                f"{screen_id.upper()} (tree_select). Views: {sorted(struct['views'])}; "
+                f"grids: {sorted(struct['grids'])}"
+            )
         if grid_select and grid_select["view"] not in struct["grids"]:
             raise ScreenError(
                 f"ui_screen_action: unknown grid {grid_select['view']!r} on "
@@ -2151,8 +2168,16 @@ async def ui_screen_action(
         if record_key:
             await s.ui_navigate_record(record_key["view"], record_key["key"])
         if tree_select:
-            await s.ui_select_tree_node(tree_select["view"], tree_select["key"],
-                                         tree_select.get("parent_key"))
+            # select_command / ancestor_keys were previously NOT forwarded, so every
+            # tree screen got SM207060's "EnablePopulate" with no way to override it
+            # from the tool — and a screen without that action selects nothing while
+            # still returning ok:true (see ui_select_tree_node).
+            await s.ui_select_tree_node(
+                tree_select["view"], tree_select["key"],
+                parent_key=tree_select.get("parent_key"),
+                ancestor_keys=tree_select.get("ancestor_keys"),
+                **({"select_command": tree_select["select_command"]}
+                   if tree_select.get("select_command") else {}))
         if grid_select:
             s.ui_select_grid_row(grid_select["view"], grid_select["key"])
         for f in (set_fields or []):

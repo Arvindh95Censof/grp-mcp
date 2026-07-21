@@ -1399,6 +1399,53 @@ def test_leaf_class_name():
     assert _leaf("") is None
 
 
+def _tree_client(actions):
+    """A ScreenClient stub with just enough for ui_select_tree_node's preflight.
+
+    The guard has to run BEFORE any network call, so the stub deliberately has no
+    transport: if the refusal path ever regresses into posting first, these tests
+    fail with AttributeError rather than passing quietly.
+    """
+    import asyncio
+    from grp_mcp.screen import ScreenClient
+
+    c = object.__new__(ScreenClient)
+    c.screen_id = "EP205015"
+    struct = {"actions": [{"name": a} for a in actions],
+              "views": {"NodesTree": [], "CurrentNode": []}, "grids": {}}
+
+    async def _struct():
+        return struct
+    c.get_ui_structure = _struct
+    return c, asyncio
+
+
+def test_select_tree_node_refuses_command_the_screen_does_not_have():
+    # EP205015 has no "EnablePopulate" (that is SM207060's handler). Sending it
+    # anyway selected nothing and the next write hit the CURRENT node and COMMITTED
+    # — ok:true, wrong row. Refuse before the post, not after the DB read-back.
+    import pytest
+    from grp_mcp.screen import ScreenError
+    c, aio = _tree_client(["Save", "Cancel", "AddStep", "AddRule", "DeleteRoute"])
+    with pytest.raises(ScreenError) as e:
+        aio.run(c.ui_select_tree_node("NodesTree", {"RuleID": "fb884e75"}))
+    msg = str(e.value)
+    assert "EnablePopulate" in msg
+    assert "CURRENT node" in msg          # says WHY silence is dangerous
+    assert "AddStep" in msg               # lists what this screen does have
+    assert "aspx_tree_node_action" in msg  # points at the plane that can do it
+
+
+def test_select_tree_node_allows_a_command_the_screen_does_have():
+    # SM207060 really does expose EnablePopulate — the guard must not break it.
+    # It gets past the preflight and only then needs transport (which the stub
+    # lacks), so reaching AttributeError proves the guard let it through.
+    import pytest
+    c, aio = _tree_client(["Save", "InsertNew", "EnablePopulate"])
+    with pytest.raises(AttributeError):
+        aio.run(c.ui_select_tree_node("EntityTree", {"Key": "ROOT#GRPMCP"}))
+
+
 def test_tree_active_row_context_root_node():
     from grp_mcp.screen import _tree_active_row_context
     ctx = _tree_active_row_context("EntityTree", {"Key": "ROOT#GRPMCP"}, None)
