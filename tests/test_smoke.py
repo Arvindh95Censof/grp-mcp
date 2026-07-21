@@ -1420,6 +1420,44 @@ def _tree_client(actions):
     return c, asyncio
 
 
+def test_explicit_target_required_names_both_ways_out():
+    from grp_mcp.server import _require_explicit_target
+    from grp_mcp.screen import ScreenError
+    with pytest.raises(ScreenError) as e:
+        _require_explicit_target("ui_screen_action", "record_key", None, None)
+    m = str(e.value)
+    assert "record_key" in m and 'target="current"' in m   # both routes offered
+    assert "cached ACROSS CALLS" in m                       # says WHY it refuses
+    assert "GL102000" in m                                  # tells singletons what to do
+
+
+def test_explicit_target_accepts_a_key_or_an_explicit_current():
+    from grp_mcp.server import _require_explicit_target
+    # a real target
+    _require_explicit_target("t", "record_key", {"view": "V", "key": {"K": "1"}}, None)
+    # deliberate opt-in (singleton setup screens, or genuinely "whatever is loaded")
+    _require_explicit_target("t", "record_key", None, "current")
+
+
+def test_insert_is_exempt_because_it_has_no_record_yet():
+    # Requiring a key to CREATE a record would make Insert unusable; Cancel/Repaint
+    # discard or redraw rather than write.
+    from grp_mcp.server import _TARGETLESS_ACTIONS
+    assert {"Insert", "Cancel", "Repaint"} <= _TARGETLESS_ACTIONS
+
+
+def test_modern_write_tools_all_expose_target():
+    # The rule is only trustworthy if it is uniform — a tool missing `target` would be
+    # a silent hole in exactly the guard we just added.
+    import inspect
+    from grp_mcp import server
+    for name in ("ui_screen_action", "ui_update_grid_row", "ui_update_grid_rows",
+                 "ui_insert_grid_row", "ui_delete_grid_row", "ui_grid_row_action"):
+        fn = getattr(server, name)
+        fn = getattr(fn, "fn", fn)          # unwrap the MCP tool decorator if present
+        assert "target" in inspect.signature(fn).parameters, f"{name} lacks target"
+
+
 def _run_import_xml(monkeypatch, save_raises: bool):
     """Drive the REAL ui_import_xml with only its network edges stubbed, so the
     outcome reporting (where the bug was) is genuinely exercised."""
@@ -3938,7 +3976,7 @@ def test_ui_screen_action_unknown_field_raises_by_default(cfg, monkeypatch):
         asyncio.run(server.ui_screen_action(
             "PY309000", "Save",
             set_fields=[{"view": "Employments", "field": "PayMode", "value": "C"}],
-            instance="rw"))
+            target="current", instance="rw"))
 
 
 def test_ui_screen_action_skip_validation_allows_unstructured_field(cfg, monkeypatch):
@@ -3947,7 +3985,7 @@ def test_ui_screen_action_skip_validation_allows_unstructured_field(cfg, monkeyp
     out = asyncio.run(server.ui_screen_action(
         "PY309000", "Save",
         set_fields=[{"view": "Employments", "field": "PayMode", "value": "C"}],
-        skip_validation=True, instance="rw"))
+        skip_validation=True, target="current", instance="rw"))
     assert out["ok"] is True
     assert ("Employments", "PayMode", "C") in client.set_calls  # actually attempted
     assert len(out["unverifiable_fields"]) == 1
@@ -3966,7 +4004,7 @@ def test_ui_screen_action_skip_validation_still_blocks_grid_column(cfg, monkeypa
         asyncio.run(server.ui_screen_action(
             "PY309000", "Save",
             set_fields=[{"view": "EmpPayTransactions", "field": "Amount", "value": 5}],
-            skip_validation=True, instance="rw"))
+            skip_validation=True, target="current", instance="rw"))
 
 
 def test_ui_screen_action_known_field_has_no_unverifiable_fields(cfg, monkeypatch):
@@ -3975,7 +4013,7 @@ def test_ui_screen_action_known_field_has_no_unverifiable_fields(cfg, monkeypatc
     out = asyncio.run(server.ui_screen_action(
         "PY309000", "Save",
         set_fields=[{"view": "Employments", "field": "BasicPay", "value": 1000}],
-        instance="rw"))
+        target="current", instance="rw"))
     assert out["ok"] is True
     assert "unverifiable_fields" not in out
     assert ("Employments", "BasicPay", 1000) in client.set_calls

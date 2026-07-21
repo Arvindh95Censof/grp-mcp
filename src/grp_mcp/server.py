@@ -348,6 +348,47 @@ def _require_write(instance: str | None) -> None:
 _DESTRUCTIVE_ACTIONS = frozenset({"Delete", "DeleteRow", "DeleteDetail", "DeleteAll"})
 
 
+_CURRENT = "current"
+
+# Actions that cannot have a record target by definition: Insert CREATES the record,
+# and Cancel/Repaint discard or redraw rather than write to one.
+_TARGETLESS_ACTIONS = {"Insert", "Cancel", "Repaint"}
+
+
+def _require_explicit_target(tool: str, param: str, value: Any,
+                             target: str | None) -> None:
+    """Refuse a modern-plane write that names no record.
+
+    The modern session is CACHED ACROSS CALLS, so "no record specified" does not mean
+    "no record loaded" — it means *whatever the previous operation left current*. That
+    is not a theoretical hazard: it renamed a live approval map (EP205015 map 15) when
+    an `Insert` silently didn't apply and the following field-set + Save landed on the
+    inherited record instead.
+
+    Inferring which screens are keyed does NOT work — measured live, `urlFieldNames` is
+    empty on EP205015 (keyed) and populated on CS100000 (a singleton), so a guard built
+    on it would refuse the dangerous screen and wave through the safe one. The only
+    reliable signal is the caller's intent, so require it to be stated:
+
+        {param}=...        act on THIS record          (preferred)
+        target="current"   act on whatever is loaded   (explicit opt-in)
+
+    Singleton setup screens (GL102000, CS100000) genuinely have no key — they pass
+    target="current", which is accurate rather than a workaround.
+    """
+    if value is not None or target == _CURRENT:
+        return
+    raise ScreenError(
+        f"{tool}: no record target. Pass {param}=... to act on a SPECIFIC record, or "
+        f'target="{_CURRENT}" to act on whatever the session currently holds.\n'
+        f"Refused because the modern session is cached ACROSS CALLS: with no target "
+        f"this would act on the record left current by an earlier operation, not on a "
+        f"clean graph. That silently renamed a live record once (EP205015 map 15).\n"
+        f'Singleton setup screens with no key (GL102000, CS100000) should pass '
+        f'target="{_CURRENT}".'
+    )
+
+
 def _require_delete(instance: str | None) -> None:
     """Block record deletes unless the instance opted in (allow_delete)."""
     cfg = _cfg()
@@ -2005,6 +2046,7 @@ async def ui_screen_action(
     verify: bool = False,
     save_after: bool = False,
     dialog_answer: str = "ok",
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Drive a screen via the MODERN UI-screen API — set fields, then fire an action.
@@ -2021,6 +2063,12 @@ async def ui_screen_action(
         a DATA-GRID row before the action. Each is REQUIRED on some screens and the
         failure mode without it is a SILENT no-op or an opaque later error, not a clear
         one — see the notes before driving an unfamiliar screen.
+        RECORD TARGET IS REQUIRED (except for Insert/Cancel/Repaint): pass `record_key`,
+        or `target="current"` to act deliberately on whatever the session holds. The
+        modern session is cached ACROSS CALLS, so omitting both does not mean "no record
+        loaded" — it means the record the LAST operation left current, which is how a
+        live approval map got renamed. Singleton setup screens with no key (GL102000,
+        CS100000) pass target="current".
         tree_select = {"view", "key", "parent_key"?, "ancestor_keys"?, "select_command"?}.
         `select_command` defaults to SM207060's "EnablePopulate"; on any other tree screen
         pass that screen's own selection-changed handler (from this screen's `actions`).
@@ -2066,6 +2114,9 @@ async def ui_screen_action(
 
     Arg shapes, live-proven traps + worked examples: guide(topic="ui_screen_action").
     """
+    if action not in _TARGETLESS_ACTIONS:
+        _require_explicit_target("ui_screen_action", "record_key",
+                                 record_key, target)
     _require_write(instance)
     # A destructive action deletes data — hold it to the stricter allow_delete gate,
     # so the modern plane can't sidestep it (parity with delete_entity).
@@ -2400,6 +2451,7 @@ async def ui_grid_row_action(
     action: str,
     parent: dict | None = None,
     confirm: bool = True,
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Select an EXISTING grid row by key, then fire a screen-level ACTION on it —
@@ -2432,6 +2484,7 @@ async def ui_grid_row_action(
 
     Live proof of the SOAP gap + a worked example: guide(topic="ui_grid_row_action").
     """
+    _require_explicit_target("ui_grid_row_action", "parent", parent, target)
     if confirm:
         _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
@@ -2768,6 +2821,7 @@ async def ui_update_grid_row(
     values: dict,
     parent: dict | None = None,
     skip_validation: bool = False,
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Edit ONE existing GRID row in place, on the MODERN UI-screen plane.
@@ -2801,6 +2855,7 @@ async def ui_update_grid_row(
 
     Capture provenance + example: guide(topic="ui_update_grid_row").
     """
+    _require_explicit_target("ui_update_grid_row", "parent", parent, target)
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -2819,6 +2874,7 @@ async def ui_update_grid_rows(
     parent: dict | None = None,
     skip_validation: bool = False,
     chunk_size: int = 100,
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Edit MANY existing GRID rows in ONE pass — the bulk peer of ui_update_grid_row.
@@ -2853,6 +2909,7 @@ async def ui_update_grid_rows(
                      for n in (479, 481, 482)],
             parent={"view": "MappingsSingle", "key": {"Name": "My Scenario"}})
     """
+    _require_explicit_target("ui_update_grid_rows", "parent", parent, target)
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -2869,6 +2926,7 @@ async def ui_insert_grid_row(
     values: dict,
     parent: dict | None = None,
     skip_validation: bool = False,
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Append a NEW row to a GRID on the MODERN UI-screen plane.
@@ -2903,6 +2961,7 @@ async def ui_insert_grid_row(
 
     Live-proven mangle cases + examples: guide(topic="ui_insert_grid_row").
     """
+    _require_explicit_target("ui_insert_grid_row", "parent", parent, target)
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
@@ -2925,6 +2984,7 @@ async def ui_delete_grid_row(
     grid_view: str,
     key: dict,
     parent: dict | None = None,
+    target: str | None = None,
     instance: str | None = None,
 ) -> Any:
     """Delete an existing GRID row (matched by key) on the MODERN UI-screen plane.
@@ -2943,6 +3003,7 @@ async def ui_delete_grid_row(
     can't be deleted once referenced (e.g. a posted GL account) — the screen's own
     validation surfaces as a clear error. Verify with run_dac_odata.
     """
+    _require_explicit_target("ui_delete_grid_row", "parent", parent, target)
     _require_delete(instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
