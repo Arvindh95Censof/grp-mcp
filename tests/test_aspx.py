@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from grp_mcp.aspx import (AspxDiagnostic, _grid_column_slots, _grid_errors,
+                          _grid_selector_text_fields, _preflight_op,
                           _tree_node_dom_id,
                           _grid_rows, _parse_control_blocks,
                           _parse_hidden_inputs, _row_matches,
@@ -22,6 +23,9 @@ def _diag_with_html(html: str) -> AspxDiagnostic:
     d = AspxDiagnostic.__new__(AspxDiagnostic)  # no ScreenClient needed for parsing
     d._html = html
     d._state = {}
+    # mirror __init__: bypassing it means every instance attribute must be set
+    # here too, or a code path that reads one blows up only in the tests.
+    d._selector_text = {}
     return d
 
 
@@ -996,3 +1000,66 @@ def test_tree_action_saves_when_it_stages():
     d._callback = fake_callback  # type: ignore[method-assign]
     r = asyncio.run(d.tree_node_action("Up"))
     assert r["staged"] is True and r["saved"] is True
+
+
+# --- selector display-twin columns (CS206010 Data Source, live capture) -------
+#
+# VERBATIM from the CS206010 grid Props (captured 2026-07-21 via DOM read): the
+# Data Source column is a PAIR — the stored FK in `dataField` plus a display twin
+# named by `textFieldColumn`. Entity-escaped exactly as it arrives inside CDATA.
+_CS206010_COLS = (
+    '{&quot;levels&quot;:[{&quot;columns&quot;:['
+    '{},{},'
+    '{&quot;dataField&quot;:&quot;RowCode&quot;,&quot;formEditorID&quot;:&quot;edRowCode&quot;},'
+    '{&quot;dataField&quot;:&quot;Description&quot;,&quot;maxLength&quot;:60},'
+    '{&quot;type&quot;:3,&quot;dataType&quot;:7,&quot;dataField&quot;:&quot;RowType&quot;,'
+    '&quot;defaultValue&quot;:0,&quot;allowNull&quot;:0},'
+    '{&quot;dataField&quot;:&quot;Formula&quot;,&quot;maxLength&quot;:4000},'
+    '{&quot;textFieldColumn&quot;:&quot;DataSourceIDText&quot;,&quot;dataType&quot;:9,'
+    '&quot;dataField&quot;:&quot;DataSourceID&quot;,&quot;textField&quot;:&quot;DataSourceIDText&quot;,'
+    '&quot;formEditorID&quot;:&quot;edDataSource&quot;},'
+    '{&quot;textFieldColumn&quot;:&quot;StyleIDText&quot;,&quot;dataType&quot;:9,'
+    '&quot;dataField&quot;:&quot;StyleID&quot;,&quot;textField&quot;:&quot;StyleIDText&quot;}'
+    ']}]}'
+)
+
+
+def test_selector_text_fields_maps_twin_to_datafield():
+    sel = _grid_selector_text_fields(_CS206010_COLS)
+    assert sel == {"DataSourceIDText": "DataSourceID", "StyleIDText": "StyleID"}
+
+
+def test_selector_twins_stay_out_of_positional_slots():
+    # The twin is NOT its own <Cell> position — adding it would misalign every
+    # row parse. Slots must still be the dataField sequence, empties preserved.
+    assert _grid_column_slots(_CS206010_COLS) == [
+        None, None, "RowCode", "Description", "RowType", "Formula",
+        "DataSourceID", "StyleID"]
+
+
+def test_preflight_names_selector_twin_instead_of_calling_it_unknown():
+    cols = ["RowCode", "Description", "RowType", "Formula", "DataSourceID", "StyleID"]
+    sel = {"DataSourceIDText": "DataSourceID", "StyleIDText": "StyleID"}
+    r = _preflight_op("update", {"DataSourceIDText": "A11201"},
+                      {"RowSetCode": "X", "RowNbr": "1"}, cols, [], sel)
+    assert r is not None
+    assert "DISPLAY TWIN" in r["refused"]
+    assert "DataSourceID" in r["refused"]          # points at the writable field
+    assert r["selector_text_fields"] == {"DataSourceIDText": "DataSourceID"}
+    # and it must NOT be reported with the misleading "not columns" wording
+    assert "are not columns of this grid" not in r["refused"]
+
+
+def test_preflight_still_refuses_a_genuinely_unknown_field():
+    cols = ["RowCode", "Description", "DataSourceID"]
+    sel = {"DataSourceIDText": "DataSourceID"}
+    r = _preflight_op("update", {"Nonsense": 1}, None, cols, [], sel)
+    assert r is not None and "are not columns of this grid" in r["refused"]
+    assert r["unknown_fields"] == ["Nonsense"]
+
+
+def test_preflight_selector_map_is_optional_backwards_compatible():
+    # Older call sites pass no selector map; behaviour must be unchanged.
+    cols = ["RowCode", "DataSourceID"]
+    r = _preflight_op("update", {"DataSourceIDText": "A11201"}, None, cols, [])
+    assert r is not None and "are not columns of this grid" in r["refused"]

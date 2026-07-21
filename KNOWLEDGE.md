@@ -1237,6 +1237,50 @@ from an invalid fixture: a `Caption` row for the update test, a same-batch type 
 insert test, and an invented enum label. Same failure mode §11 already warns about; check the
 fixture is valid before believing a null result.
 
+### Selector columns are a PAIR — and the display twin is not writable (v0.66.3)
+
+A classic grid's selector cell (`"dataType":9`) is two things: the stored FK in `dataField`, and a
+display twin named by `textFieldColumn`/`textField`. Live CS206010 Data Source column:
+
+```json
+{"textFieldColumn":"DataSourceIDText","dataType":9,"dataField":"DataSourceID",
+ "textField":"DataSourceIDText","formEditorID":"edDataSource"}
+```
+
+`_grid_column_slots` reads only `dataField` (it must — the twin is NOT its own `<Cell>` position,
+and adding it would misalign every row parse), so the twin used to be reported as "not a column of
+this grid", sending callers hunting for a typo that didn't exist. `_grid_selector_text_fields` now
+harvests the pairs separately and the pre-flight names the real constraint instead.
+
+**What the wire actually carries** (captured live, browser DOM + XHR hook): committing the Data
+Source cell sends `<Cell Value="31555" Key="DataSourceID"/>` — the RESOLVED id — and **no text cell
+at all**. So the twin is not merely unlisted, it is never sent; a selector needs the id. Some
+selectors resolve only through their own editor dialog (CS206010's Data Source Editor is the
+`ctl00_phG_grid_lv0_edDataSource_pnlARmDataSet` PXSmartPanel), and for those this plane cannot set
+the value at all until that panel's protocol is driven the way §11c drives the classic tree.
+
+### Failed writes STAGE PHANTOM ROWS that outlive the session (issue #4 — reproduced on demand)
+
+The long-parked PY309000 mystery — *identical input, different error text on each retry* — is a
+**sticky graph**, and CS206010 reproduces it deterministically:
+
+1. `ui_insert_grid_row` fails validation → the row is **left staged in the graph**.
+2. A retry then fails with *"A record with the same value of the Code field already exists"* — while
+   `run_dac_odata` shows **no such row in the DB**.
+3. The phantom is visible to *other planes*: the ASPX `diagnose_save_error` reported the same
+   duplicate error for a row that exists only in the graph.
+4. Each further failed attempt stacks another phantom, so error messages accumulate and contradict
+   each other (`['Code already exists', "'Type' cannot be empty"]` from one insert).
+
+**`release_sessions` does NOT clear it** (it drops logins; the graph is server-side and sticky per
+§4d). **`ui_screen_action(screen_id, action="Cancel")` DOES** — it returns `graphIsDirty:false` and
+the next attempt starts clean.
+
+Practical rule: **after any failed grid write, Cancel before retrying.** Otherwise the second error
+is describing a graph you did not build, and "the same call returned a different error" is the
+symptom you will chase. Always confirm what actually persisted with `run_dac_odata`, never with the
+error text.
+
 ### Known gap in our own guards
 
 `classify_writable` sources field metadata from the modern `/structure`, but classic-only fields

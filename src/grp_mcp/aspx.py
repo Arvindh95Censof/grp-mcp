@@ -130,6 +130,50 @@ def _grid_column_slots(body: str) -> list[str | None]:
     return []
 
 
+def _grid_selector_text_fields(body: str) -> dict[str, str]:
+    """{textFieldColumn: dataField} for the grid's SELECTOR columns.
+
+    A selector cell (`"dataType":9`) is a PAIR: the stored value lives in
+    `dataField` (an int FK) and its human text in a twin column named by
+    `textFieldColumn`/`textField` — captured live on CS206010:
+    `{"textFieldColumn":"DataSourceIDText","dataType":9,"dataField":
+    "DataSourceID","textField":"DataSourceIDText","formEditorID":"edDataSource"}`.
+
+    The twin is NOT a `<Cell>` position of its own, so it deliberately does not
+    enter _grid_column_slots (that list must stay positionally exact or row
+    parsing misaligns). It is harvested separately so the pre-flight can tell
+    "you named the display twin of a selector" apart from "you named something
+    that does not exist" — those need OPPOSITE advice and the old code gave the
+    wrong one for the former.
+    """
+    plain = unescape(body)
+    i = plain.find('"columns":[')
+    if i < 0:
+        return {}
+    start = i + len('"columns":')
+    depth = 0
+    for j in range(start, len(plain)):
+        if plain[j] == "[":
+            depth += 1
+        elif plain[j] == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    cols = json.loads(plain[start:j + 1])
+                except Exception:  # noqa: BLE001 — malformed Props; caller degrades
+                    return {}
+                out: dict[str, str] = {}
+                for c in cols:
+                    if not isinstance(c, dict):
+                        continue
+                    df = c.get("dataField")
+                    tf = c.get("textFieldColumn") or c.get("textField")
+                    if df and tf and tf != df:
+                        out[str(tf)] = str(df)
+                return out
+    return {}
+
+
 def _grid_rows(body: str, grid_ctl: str) -> list[dict[str, str]]:
     """Every row of the grid as {dataField: value}, from a Refresh/Save echo.
 
@@ -277,7 +321,8 @@ def _cells_xml(cells: dict[str, Any] | None, row_key: dict[str, Any] | None,
 
 
 def _preflight_op(operation: str, cells: dict[str, Any], row_key: dict[str, Any] | None,
-                  columns: list[str], rows_before: list[dict[str, str]]) -> dict | None:
+                  columns: list[str], rows_before: list[dict[str, str]],
+                  selector_text: dict[str, str] | None = None) -> dict | None:
     """Validate ONE row change against the grid's real columns and current rows
     before it is sent. Returns a refusal dict (reason + supporting data) or None
     if the op is safe to send. Shared by the single-op and batch paths so both
@@ -289,8 +334,31 @@ def _preflight_op(operation: str, cells: dict[str, Any], row_key: dict[str, Any]
     read-back in _verify_one_op catches that — the two checks are layered."""
     if columns:
         colset = set(columns)
-        unknown = [f for f in list(cells or {}) + list(row_key or {})
-                   if f not in colset]
+        sel = selector_text or {}
+        named = list(cells or {}) + list(row_key or {})
+        unknown = [f for f in named if f not in colset]
+        # A name that is the DISPLAY TWIN of a selector column is not "unknown" —
+        # it is real, just not what the wire wants. Captured live on CS206010: the
+        # browser commits the Data Source cell as <Cell Value="31555"
+        # Key="DataSourceID"/> — the RESOLVED id — and sends no text cell at all.
+        # Refusing it as "not a column" sent callers hunting for a typo that
+        # doesn't exist, so name the real constraint instead.
+        twins = [f for f in unknown if f in sel]
+        if twins:
+            mapping = {f: sel[f] for f in twins}
+            return {
+                "refused": (
+                    f"field(s) {twins} are the DISPLAY TWIN of a selector column, "
+                    f"not a writable cell: the classic grid commits the RESOLVED "
+                    f"id via {sorted(set(mapping.values()))}, never the display "
+                    f"text (captured live). Look the value up first and send the "
+                    f"id — e.g. read the target row's id with run_dac_odata, then "
+                    f"send {{'{mapping[twins[0]]}': <id>}}. Some selectors resolve "
+                    f"ONLY through their editor dialog, in which case this plane "
+                    f"cannot set them at all."),
+                "selector_text_fields": mapping,
+                "unknown_fields": twins, "suggestions": mapping,
+                "grid_columns": columns}
         if unknown:
             suggestions = {f: f"Cury{f}" for f in unknown if f"Cury{f}" in colset}
             return {
@@ -483,6 +551,10 @@ class AspxDiagnostic:
         self.page_url = page_url
         self._state: dict[str, str] = {}
         self._html = ""
+        # {textFieldColumn: dataField} for SELECTOR columns, filled by the grid
+        # Refresh in _grid_snapshot. Lets the pre-flight distinguish a selector's
+        # display twin from a genuinely unknown field name.
+        self._selector_text: dict[str, str] = {}
 
     # -- plumbing ---------------------------------------------------------
 
@@ -640,6 +712,7 @@ class AspxDiagnostic:
         body = await self._grid_refresh(grid_ctl)
         if not body:
             return [], []
+        self._selector_text = _grid_selector_text_fields(body)
         return ([c for c in _grid_column_slots(body) if c],
                 _grid_rows(body, grid_ctl))
 
@@ -719,7 +792,8 @@ class AspxDiagnostic:
         # real (nothing-sent) result. NOTE this guard is layered, not complete —
         # a partial key unique within the grid slips through and is caught only by
         # the post-Save read-back below (see _preflight_op / _verify_one_op).
-        refusal = _preflight_op(operation, cells, row_key, columns, rows_before)
+        refusal = _preflight_op(operation, cells, row_key, columns, rows_before,
+                                self._selector_text)
         if refusal:
             return {**refusal, **_EMPTY_SAVE_FIELDS}
 
@@ -1007,7 +1081,8 @@ class AspxDiagnostic:
         refusals = []
         for i, op in enumerate(operations):
             r = _preflight_op(op["operation"], op.get("cells") or {},
-                              op.get("row_key"), columns, rows_before)
+                              op.get("row_key"), columns, rows_before,
+                              self._selector_text)
             if r:
                 refusals.append({"op_index": i, **r})
         if refusals:
