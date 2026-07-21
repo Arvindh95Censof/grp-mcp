@@ -20,12 +20,20 @@ from grp_mcp.aspx import (AspxDiagnostic, _grid_column_slots, _grid_errors,
 
 
 def _diag_with_html(html: str) -> AspxDiagnostic:
-    d = AspxDiagnostic.__new__(AspxDiagnostic)  # no ScreenClient needed for parsing
+    """A parsing-only AspxDiagnostic, built through the REAL constructor.
+
+    Deliberately not `__new__`: bypassing __init__ meant every new instance
+    attribute had to be duplicated here, and forgetting one broke unrelated
+    tests with an AttributeError that existed nowhere in production (measured —
+    `_selector_text` did exactly that). Going through __init__ keeps the scaffold
+    honest: any attribute the class gains is present here automatically.
+
+    `screen` is None because none of these tests touch the transport — every
+    method exercised parses `_html` or `_state`. A test that DOES need the client
+    should pass a stub rather than reaching for __new__ again.
+    """
+    d = AspxDiagnostic(None, "https://example.invalid/Pages/XX/XX000000.aspx")  # type: ignore[arg-type]
     d._html = html
-    d._state = {}
-    # mirror __init__: bypassing it means every instance attribute must be set
-    # here too, or a code path that reads one blows up only in the tests.
-    d._selector_text = {}
     return d
 
 
@@ -1063,3 +1071,18 @@ def test_preflight_selector_map_is_optional_backwards_compatible():
     cols = ["RowCode", "DataSourceID"]
     r = _preflight_op("update", {"DataSourceIDText": "A11201"}, None, cols, [])
     assert r is not None and "are not columns of this grid" in r["refused"]
+
+
+def test_test_helper_matches_real_constructor_attributes():
+    """Guard the scaffold itself: _diag_with_html must expose exactly what a
+    real AspxDiagnostic does.
+
+    This exists because the helper used to bypass __init__ via __new__, so a new
+    instance attribute (_selector_text) blew up two unrelated tests with an
+    AttributeError that could never happen in production. If someone reverts to
+    __new__ and forgets a field, this fails immediately and points at the cause
+    rather than at whichever test happened to read the missing attribute.
+    """
+    real = AspxDiagnostic(None, "https://example.invalid/x.aspx")  # type: ignore[arg-type]
+    helper = _diag_with_html("<html></html>")
+    assert set(vars(helper)) == set(vars(real))
