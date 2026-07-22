@@ -1057,27 +1057,44 @@ class AspxDiagnostic:
         `dom_id` MUST be exact — derive it with _tree_node_dom_id; a wrong or
         missing one silently fails to select (measured). `parent_value` is
         optional (works with or without it).
+
+        RETRIES the ReloadPage on a non-echoing response. The select is
+        occasionally FLAKY server-side: the same exact dom_id that selects fine
+        will now and then answer with a near-empty (~147-byte) body and no form
+        echo — measured live on EP204061 (a node failed twice, then selected on
+        every subsequent try, dom_id unchanged). A wrong dom_id fails EVERY time;
+        this transient fails intermittently, so a couple of retries clears it.
         """
         attrs = f'SelectedNodeID="{dom_id}" SelectedValue="{_xml_attr_escape(value)}"'
         if parent_value is not None:
             attrs += f' ParentValue="{_xml_attr_escape(parent_value)}"'
-        self._state[f"{tree_ctl}_state"] = quote(f"<PXTreeView {attrs}/>", safe="")
-        body = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd="ReloadPage"))
+        panel = quote(f"<PXTreeView {attrs}/>", safe="")
+        body = ""
+        m = None
+        attempts = 0
+        for attempts in range(1, 4):
+            self._state[f"{tree_ctl}_state"] = panel
+            body = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd="ReloadPage"))
+            # The detail form echoes the selected record's descriptor field. Read it
+            # from the RAW body: that Props JSON is entity-escaped while the tree
+            # markup beside it is literal — the same two-level escaping as the grids.
+            m = re.search(r'_form_ed[A-Za-z0-9_]*" Props="\{&quot;value&quot;:&quot;([^&]*)',
+                          body)
+            if m:
+                break
         ds = _parse_control_blocks(body).get(_DS_BLOCK) or {}
-        # The detail form echoes the selected record's descriptor field. Read it
-        # from the RAW body: that Props JSON is entity-escaped while the tree
-        # markup beside it is literal — the same two-level escaping as the grids.
-        m = re.search(r'_form_ed[A-Za-z0-9_]*" Props="\{&quot;value&quot;:&quot;([^&]*)',
-                      body)
         return {"selected_name": m.group(1) if m else None,
                 "alert": ds.get("alert"),
                 "graph_dirty": bool(ds.get("isDirty")),
                 "response_len": len(body),
+                "select_attempts": attempts,
                 "select_verified": bool(m),
                 "note": None if m else (
-                    "the detail form did not echo a record — the select did NOT "
-                    "land. Almost always a wrong SelectedNodeID (it must be the "
-                    "exact sibling-index path); re-derive it from the tree rows.")}
+                    "the detail form did not echo a record after 3 tries — the "
+                    "select did NOT land. A WRONG SelectedNodeID fails every time "
+                    "(re-derive it from the tree rows, ordered by SortOrder); a "
+                    "transient server flake usually clears within these retries, so "
+                    "persistent failure points at the dom_id.")}
 
     async def tree_node_action(self, action: str, save: bool = True) -> dict[str, Any]:
         """Fire a NODE-SCOPED action (Up/Down/AddWorkGroup/DeleteWorkGroup/…) on

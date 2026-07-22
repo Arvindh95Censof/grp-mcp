@@ -1680,14 +1680,24 @@ Save, committing the name TWO ways at once:
 With only ONE of the two name channels the Save rejects *"Please specify workgroup description"*. Shipped
 as `AspxDiagnostic.add_workgroup`. Verify every parent against `EPCompanyTree` (the tool does).
 
-### Still open
+### Node select + delete (v0.68.6)
 
-- `moveWorkGroup` (camelCase) opens a parent-picker dialog (`Dialog="True" ViewName="SelectedParentFolders"`)
-  — reparent is drivable via that dialog, not yet wired.
-- `deleteWorkGroup`'s earlier "stages nothing" was ALSO the casing bug, not a dialog wall — re-test camelCase.
-- `_tree_node_dom_id` mis-selected a HIGH-INDEX root (SortOrder 16 → `node_0_15` didn't land): the rendered
-  root order ≠ SortOrder on a large tree. Harmless for a fresh build (nodes address fine as they're added),
-  but fix before trusting selection on a big existing tree.
+- `deleteWorkGroup` (camelCase) is **confirmed** — select a node, fire it (stages `isDirty`), Save, the row
+  is gone from EPCompanyTree. Its old "stages nothing" was the SAME casing bug, not a dialog wall. Use it
+  via `aspx_tree_node_action` with `allow_delete` (pass the camelCase name).
+- Selection is **retried** now. The "high-index root won't select" scare was NOT a dom-id bug —
+  `_tree_node_dom_id` is byte-exact (every root's derived id matches the rendered tree, including
+  `node_0_15`). It was a transient server flake: an occasional ~147-byte empty `ReloadPage` with no form
+  echo, which clears on retry with the same id. `select_tree_node` now retries up to 3× (a WRONG id fails
+  every time; a flake clears), and returns `select_attempts`.
+
+### Still open — reparent (`moveWorkGroup`)
+
+`moveWorkGroup` (camelCase) opens a FORM dialog — `Dialog="True" ViewName="SelectedParentFolders"`, form
+`ctl00_phDialogs_PanelChangeWorkgroup_formMoveWorkGroup` with a parent SELECTOR (not a nested tree, so it's
+tractable). Wiring reparent needs the classic modal dialog-answer protocol: set the parent field, send the
+OK/DialogAnswer, then Save. Deferred — build + delete already cover create/teardown; reparent is an
+incremental-edit convenience.
 
 ---
 
