@@ -29,7 +29,7 @@ from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
                      xml_as_new_record)
 
 _KB_FIRST_POLICY = (
-    "TOOL SELECTION: this server has ~95 tools across FIVE Acumatica planes (contract "
+    "TOOL SELECTION: this server has ~104 tools across FIVE Acumatica planes (contract "
     "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON, plus a diagnostic-only "
     "classic-ASPX callback plane). If you're unsure which "
     "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
@@ -4737,6 +4737,94 @@ async def build_company_tree(
 
 
 @mcp.tool()
+async def add_workgroup_member(
+    workgroup: Any,
+    member: Any,
+    is_owner: bool = False,
+    active: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Add a MEMBER to a Company Tree workgroup (EP204061) — headless.
+
+    Selects the workgroup node, then inserts a row into its "Group Members" grid.
+    Members are Contacts (each employee carries a DefContactID); the grid's member
+    column is keyed by ContactID.
+
+    workgroup: the target workgroup — its `Description` (name, unique) or its
+        integer WorkGroupID (from EPCompanyTree).
+    member: WHO to add — an EMPLOYEE CODE (e.g. "EMP001"; resolved to the employee's
+        DefContactID via EPEmployee), or a raw ContactID (int).
+    is_owner: mark the member as the workgroup owner (default False).
+    active:   member is active (default True).
+
+    Requires allow_write. VERIFY CAVEAT: the Members grid does not read back on this
+    plane (classic Refresh returns no rows; EPCompanyTreeMember has no OData
+    EntitySet), so success is reported from a clean Save (`saved:true`, no alert). A
+    re-add of the same (workgroup, member) returns "Another process has added the
+    record" — the persist signal. Confirm in the UI when it matters.
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+
+    # resolve the workgroup -> WorkGroupID (+ its ParentWGID for selection)
+    tr = await run_dac_odata("EPCompanyTree",
+                             select="WorkGroupID,Description,ParentWGID,SortOrder",
+                             top=5000, instance=instance)
+    rows = (tr.get("value") or []) if isinstance(tr, dict) else []
+    if isinstance(workgroup, str) and not workgroup.isdigit():
+        hits = [r for r in rows if r.get("Description") == workgroup]
+        if not hits:
+            return {"error": f"workgroup {workgroup!r} not found in EPCompanyTree."}
+        if len(hits) > 1:
+            return {"error": f"workgroup name {workgroup!r} is ambiguous "
+                             f"({len(hits)} matches) — pass the WorkGroupID instead."}
+        wg = hits[0]
+    else:
+        wid = int(workgroup)
+        wg = next((r for r in rows if r.get("WorkGroupID") == wid), None)
+        if not wg:
+            return {"error": f"WorkGroupID {workgroup} not found in EPCompanyTree."}
+
+    # resolve the member -> ContactID
+    if isinstance(member, str) and not member.isdigit():
+        emp = await run_dac_odata("EPEmployee", filter=f"AcctCD eq '{_oq(member.strip())}'",
+                                  select="AcctCD,DefContactID,AcctName", top=1, instance=instance)
+        ev = (emp.get("value") or []) if isinstance(emp, dict) else []
+        if not ev or not ev[0].get("DefContactID"):
+            return {"error": f"employee code {member!r} not found (or has no default "
+                             f"contact) — pass a ContactID instead."}
+        contact_id = ev[0]["DefContactID"]
+        member_label = f"{member} ({ev[0].get('AcctName')})"
+    else:
+        contact_id = int(member)
+        member_label = f"ContactID {contact_id}"
+
+    # resolve the EP204061 page
+    sm = await run_dac_odata("SiteMap", filter="ScreenID eq 'EP204061'",
+                             select="ScreenID,Url", top=1, instance=instance)
+    smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+    raw = smv[0].get("Url") if smv else None
+    if not raw or ".aspx" not in raw:
+        return {"error": "no classic ASPX page found for EP204061."}
+    url = inst.base_url.rstrip("/") + raw.lstrip("~")
+
+    async with ScreenClient(inst, "EP204061") as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        tree_ctl = d.find_tree_control()
+        dom = _tree_node_dom_id(wg["WorkGroupID"], rows, tree_ctl,
+                                "WorkGroupID", "ParentWGID", "SortOrder")
+        if not dom:
+            return {"error": f"could not derive the tree DOM id for workgroup "
+                             f"{wg.get('Description')!r}."}
+        res = await d.add_member(tree_ctl, dom, wg["WorkGroupID"], contact_id,
+                                 is_owner=is_owner, active=active)
+    return {"workgroup": wg.get("Description"), "workgroup_id": wg["WorkGroupID"],
+            "member": member_label, **res}
+
+
+@mcp.tool()
 async def generate_master_calendar(
     from_year: str, to_year: str | None = None, instance: str | None = None
 ) -> Any:
@@ -7421,7 +7509,7 @@ async def _probe_exists(client, dac: str, key: str):
 # Long-form per-tool caveats, relocated OUT of the tool docstrings.
 #
 # Every docstring is prefilled into the model's context on EVERY request, so carrying
-# the full reverse-engineering narrative on ~97 tools (112k chars, ~28k tokens) taxes
+# the full reverse-engineering narrative on ~104 tools (112k chars, ~28k tokens) taxes
 # every turn to serve a page that most calls never open. The knowledge is NOT deleted:
 # the trimmed docstring still NAMES each trap in a line (so a reader knows there is
 # something to look up, which is what stops the silent-no-op class of bug), and the
@@ -7965,7 +8053,9 @@ _GUIDE = {
         "org structure / trees / approvals": [
             "tree_triage (FIRST — is a tree screen API-buildable, and with which tool?)",
             "build_company_tree (build the EP204061 workgroup hierarchy headlessly — "
-            "select parent + addWorkGroup per node; deterministic at any depth)"],
+            "select parent + addWorkGroup per node; deterministic at any depth)",
+            "add_workgroup_member (add a member — employee code or ContactID — to a "
+            "Company Tree workgroup on EP204061)"],
         "lookups / reference data": ["ui_lookup (search any selector's table)",
             "ui_resolve_selector (resolve one selector field to {id,text} for a write)"],
         "web-service endpoints / customization": ["get_endpoint_definition",
@@ -8023,7 +8113,7 @@ _GUIDE = {
 
 @mcp.tool()
 def guide(topic: str | None = None) -> Any:
-    """START HERE — pick the right grp-mcp tool for your task (this server has ~95 tools
+    """START HERE — pick the right grp-mcp tool for your task (this server has ~104 tools
     across five Acumatica planes, so guessing wastes calls).
 
     Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,

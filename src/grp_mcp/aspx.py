@@ -1198,6 +1198,47 @@ class AspxDiagnostic:
                         "likely did not commit (needs BOTH the form RowChanges and "
                         "the raw field post)."}
 
+    async def add_member(self, tree_ctl: str, node_dom_id: str, node_key: Any,
+                         contact_id: int, is_owner: bool = False,
+                         active: bool = True) -> dict[str, Any]:
+        """Add a MEMBER (by ContactID) to a workgroup on EP204061, headless. Proven
+        live 2026-07-22.
+
+        SELECT the workgroup node, then insert a row into its "Group Members" grid.
+        The member column is a selector whose KEY is `ContactID` (an employee's
+        DefContactID) — set ContactID directly; its display twin `EPEmployee__AcctCD`
+        does NOT resolve the key on its own (measured: "Cannot insert NULL into
+        ContactID"). The grid write goes through the same engine as replay_grid_save
+        (which harvests the grid's selector-column mapping via a Refresh first — a
+        plain single-callback insert misses that and fails).
+
+        VERIFY CAVEAT: the Members grid read-back is INERT on this screen — the
+        classic Refresh returns columns but NO rows (like PY309000 child grids), and
+        EPCompanyTreeMember has no OData EntitySet. So a clean success is `alert=None`
+        on the Save; a re-add of the same (workgroup, contact) errors "Another process
+        has added the record" — that conflict is the persist signal. Confirm in the UI
+        when it matters.
+        """
+        sel = await self.select_tree_node(tree_ctl, node_dom_id, node_key)
+        if not sel.get("select_verified"):
+            return {"saved": False, "selected_name": sel.get("selected_name"),
+                    "error": "the workgroup node selection did not land — cannot add "
+                             "a member to an unselected node.", **{"select": sel}}
+        res = await self.replay_grid_save(
+            "Members", {"ContactID": contact_id, "Active": active, "IsOwner": is_owner},
+            operation="insert")
+        alert = res.get("alert")
+        return {"saved": not alert, "alert": alert,
+                "possibly_saved": res.get("possibly_saved"),
+                "selected_name": sel.get("selected_name"),
+                "contact_id": contact_id,
+                "note": ("member Save reported no error. NOTE the Members grid "
+                         "read-back is inert here, so this cannot be read back on "
+                         "this plane — a re-add of the same pair would conflict, "
+                         "which is the persist signal.") if not alert else
+                        ("member NOT added — see alert. 'Another process has added "
+                         "the record' means this (workgroup, contact) already exists.")}
+
     async def replay_grid_batch(self, grid_view: str,
                                 operations: list[dict[str, Any]]) -> dict[str, Any]:
         """Apply MULTIPLE row changes to ONE grid in a SINGLE atomic Save.

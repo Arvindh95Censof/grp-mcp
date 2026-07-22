@@ -1691,6 +1691,25 @@ as `AspxDiagnostic.add_workgroup`. Verify every parent against `EPCompanyTree` (
   echo, which clears on retry with the same id. `select_tree_node` now retries up to 3× (a WRONG id fails
   every time; a flake clears), and returns `select_attempts`.
 
+### Members (v0.68.7) — `add_workgroup_member`
+
+Add a member to a workgroup headless: SELECT the node, then INSERT into its "Group Members" grid
+(view `Members`). Two gotchas, both measured:
+
+- The member column is a SELECTOR keyed by `ContactID` (an employee's `DefContactID`). Set `ContactID`
+  DIRECTLY — the display twin `EPEmployee__AcctCD` (the "EMP001" code) does NOT resolve the key on its own
+  ("Cannot insert the value NULL into column 'ContactID'"). The tool accepts an employee code and looks up
+  `EPEmployee.DefContactID` for you, or takes a raw ContactID.
+- The insert must go through the grid-write engine that harvests the grid's selector-column mapping via a
+  Refresh first (`replay_grid_save`). A plain single-callback insert skips that setup and fails with the
+  same NULL error.
+
+VERIFY CAVEAT: the Members grid does NOT read back on this plane — the classic Refresh returns columns but
+NO rows (like the PY309000 child grids), and `EPCompanyTreeMember` has no OData EntitySet. So success is a
+clean Save (`saved:true`, `alert=None`). The persist signal is that a RE-ADD of the same (workgroup,
+contact) errors *"Another process has added the 'EPCompanyTreeMember' record"* — the PK is
+`WorkGroupID+ContactID`. Confirm in the UI when it matters.
+
 ### Still open — reparent (`moveWorkGroup`)
 
 `moveWorkGroup` (camelCase) opens a FORM dialog — `Dialog="True" ViewName="SelectedParentFolders"`, form
