@@ -31,7 +31,7 @@ from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
                      xml_as_new_record)
 
 _KB_FIRST_POLICY = (
-    "TOOL SELECTION: this server has ~105 tools across FIVE Acumatica planes (contract "
+    "TOOL SELECTION: this server has ~106 tools across FIVE Acumatica planes (contract "
     "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON, plus a diagnostic-only "
     "classic-ASPX callback plane). If you're unsure which "
     "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
@@ -8285,7 +8285,10 @@ _GUIDE = {
             "screen_bulk_load (N master records to any classic screen via SOAP — no endpoint)",
             "setup_readiness"],
         "files / notes / attachments": ["attach_file", "attach_file_to_provider "
-            "(GET-free, for Data Providers)", "download_file", "list_attachments", "set_note"],
+            "(GET-free, for Data Providers)", "download_file", "list_attachments", "set_note",
+            "run_report (contract-REST Report entity — needs SM207060 setup first)",
+            "download_classic_report (classic report screens, e.g. AP630500 — no setup "
+            "needed, works where run_report/screen_capabilities can't reach)"],
         "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],
         "sessions / config / seats": ["release_sessions (free API seats)", "test_connection",
             "reload_config", "set_active_instance", "add_instance", "remove_instance"],
@@ -8317,7 +8320,7 @@ _GUIDE = {
 
 @mcp.tool()
 def guide(topic: str | None = None) -> Any:
-    """START HERE — pick the right grp-mcp tool for your task (this server has ~105 tools
+    """START HERE — pick the right grp-mcp tool for your task (this server has ~106 tools
     across five Acumatica planes, so guessing wastes calls).
 
     Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,
@@ -8786,6 +8789,57 @@ async def run_report(
         "bytes": len(data),
         "path": out_path,
         "parameters": parameters or {},
+        "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
+    }
+
+
+@mcp.tool()
+async def download_classic_report(
+    screen_id: str,
+    out_path: str,
+    parameters: list[dict] | None = None,
+    report_filename: str | None = None,
+    instance: str | None = None,
+) -> Any:
+    """Render a CLASSIC report screen (AP630500, AR6xxxxx, SM2xxxxx family — the ones
+    screen_capabilities/ui_get_structure fail on with "the view doesn't exist") and
+    save the rendered PDF to disk. Fully headless — no browser, no SM207060 endpoint
+    entity needed.
+
+    This is a DIFFERENT mechanism from run_report (which drives a contract-REST
+    Report-type endpoint entity — requires SM207060 setup per report and only works
+    for screens with modern-UI Views). This tool drives the classic ASPX report-viewer
+    handler directly (reverse-engineered from a live browser capture): a launcher page
+    yields an `__instanceKey`, then PX.ReportViewer.axd?OpType=PdfReport returns the
+    PDF bytes. Works for ANY classic report screen — no per-report setup at all.
+
+    parameters: submit()-style commands to set the report's filter fields first, e.g.
+        [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"},
+         {"set": "FinancialPeriod", "to": "202607"}]
+        Field names are the FRIENDLY names from screen_get_schema's "Parameters"
+        container (e.g. Company/Branch/FinancialPeriod/VendorClass on AP630500).
+        Omit to reuse the account's last-used values (Acumatica persists them
+        server-side per user+screen, so a first run should always pass them).
+    report_filename: override the default "{screen_id}.rpx" report-file guess if a
+        screen's underlying report differs from its screen ID (rare).
+
+    Live-proven: AP630500 (AP Aged Period-Sensitive), 4-row report, PDF content
+    verified against a live DB read of the same records.
+
+    Requires "allow_write": true (parameters are applied via a real screen Submit).
+    out_path must be within the instance's write_roots (if configured).
+    """
+    _require_write(instance)
+    dest = _check_write_path(out_path, instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        data = await s.download_report_pdf(parameters=parameters, report_filename=report_filename)
+    dest.write_bytes(data)
+    return {
+        "screen_id": screen_id,
+        "bytes": len(data),
+        "path": out_path,
+        "parameters": parameters or [],
         "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }
 

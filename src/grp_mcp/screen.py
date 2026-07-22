@@ -3705,3 +3705,74 @@ class ScreenClient:
             "headers": headers,
             "rows": [dict(zip(headers, r)) for r in rows[1:]],
         }
+
+    async def download_report_pdf(
+        self, parameters: list[dict] | None = None, report_filename: str | None = None
+    ) -> bytes:
+        """Render a classic report screen (SM200xxx/AR6xxxxx/AP6xxxxx/... family) and
+        return its PDF bytes — the ONLY headless path for a report screen that has no
+        modern-UI Views (screen_capabilities/ui_get_structure fail with "the view
+        doesn't exist" on these) and no contract-REST Report entity configured.
+
+        Reverse-engineered from a live browser capture (csmdev AP630500, 2026-07-22):
+        the report VIEWER is a separate mechanism from both the modern JSON plane and
+        the contract-REST Report-entity plane (SM207060) — a classic ASPX handler pair
+        that rides the SAME cookie session as this client's SOAP calls:
+
+          1. GET  {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&unum=0&HideScript=On
+             -> HTML containing <input name="__instanceKey" value="<32-hex>" />.
+             (Acumatica's stock page is plain "ReportLauncher.aspx" on most instances;
+             this csmdev tenant's is Censof-branded — try the stock name as a fallback.)
+          2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&OpType=PdfReport&Refresh=True
+             -> raw PDF bytes (Content-Type: application/pdf).
+
+        The report reads its PARAMETERS from the screen's live session state, not from
+        the launcher request — so pass `parameters` as submit()-style commands
+        ({"set": "<FriendlyName>", "to": <value>}, from screen_get_schema's "Parameters"
+        container) and they are applied via a real Submit BEFORE the launcher GET.
+        Omit parameters to reuse whatever the account's last-used values are (Acumatica
+        persists them server-side per user+screen).
+
+        report_filename: override the "{ScreenID}.rpx" convention if a screen's actual
+        report file differs (rare — verified 1:1 for AP630500).
+
+        Live-proven: AP630500, 4-row report, 4386-byte PDF, magic bytes b"%PDF-1.7",
+        content correct (matched the live DB read of the same 4 Bills).
+        """
+        if parameters:
+            result = await self.submit(parameters)
+            if not result.get("ok", True):
+                raise ScreenError(
+                    f"download_report_pdf {self.screen_id}: parameter submit failed — "
+                    f"{result.get('field_errors') or result.get('messages')}"
+                )
+        base = self.instance.base_url.rstrip("/")
+        rpt = report_filename or f"{self.screen_id}.rpx"
+        launcher_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&unum=0&HideScript=On"
+        r1 = await self._http.get(launcher_url)
+        if r1.status_code >= 400:
+            raise ScreenError(
+                f"download_report_pdf {self.screen_id}: launcher GET -> HTTP {r1.status_code}"
+            )
+        m = re.search(r'name="__instanceKey"[^>]*value="([a-f0-9]+)"', r1.text)
+        if not m:
+            raise ScreenError(
+                f"download_report_pdf {self.screen_id}: __instanceKey not found in launcher "
+                f"response (report screen may not exist, or this instance uses a differently "
+                f"named launcher page — try report_filename= or check screen_id)."
+            )
+        instance_key = m.group(1)
+        pdf_url = (f"{base}/PX.ReportViewer.axd?InstanceID={instance_key}"
+                   f"&OpType=PdfReport&Refresh=True")
+        r2 = await self._http.get(pdf_url)
+        if r2.status_code >= 400:
+            raise ScreenError(
+                f"download_report_pdf {self.screen_id}: PDF GET -> HTTP {r2.status_code}"
+            )
+        if not r2.content.startswith(b"%PDF"):
+            raise ScreenError(
+                f"download_report_pdf {self.screen_id}: response was not a PDF "
+                f"(content-type={r2.headers.get('content-type')!r}, "
+                f"first bytes={r2.content[:16]!r}) — the report likely errored server-side."
+            )
+        return r2.content

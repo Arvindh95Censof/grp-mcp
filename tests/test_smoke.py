@@ -3704,6 +3704,115 @@ def test_get_bytes_retries_once_on_401(monkeypatch):
     assert calls["auth"] == 2
 
 
+# --- download_report_pdf: classic ASPX report-viewer handler (reverse-engineered
+# from a live browser capture, csmdev AP630500, 2026-07-22) — the headless path for
+# report screens that have no modern-UI Views (run_report/screen_capabilities can't
+# reach them at all: "the view doesn't exist"). ------------------------------------
+
+class _FakeGetResp:
+    """httpx.Response stand-in for download_report_pdf's raw self._http.get() calls
+    — needs BOTH .text (launcher HTML parse) and .content (PDF bytes check), which
+    _FakeRawResp below (built for AcumaticaClient's shape) doesn't carry."""
+    def __init__(self, status_code=200, text="", content=b"", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.content = content if content else text.encode("utf-8")
+        self.headers = headers or {}
+
+
+def _report_client(get_responses, submit_result=None, submit_calls=None):
+    """A ScreenClient stand-in with _http.get() stubbed to a canned response queue
+    and submit() stubbed to a canned result — same object.__new__ pattern used for
+    ui_import_xml above, so download_report_pdf's REAL control flow runs."""
+    import types
+    c = object.__new__(ScreenClient)
+    c.screen_id = "AP630500"
+    c.instance = types.SimpleNamespace(base_url="https://example.invalid/Site")
+    calls = submit_calls if submit_calls is not None else []
+
+    async def _submit(commands, **kw):
+        calls.append(commands)
+        return submit_result if submit_result is not None else {"ok": True}
+    c.submit = _submit
+
+    queue = list(get_responses)
+    async def _get(url):
+        calls.append(("GET", url))
+        return queue.pop(0)
+    c._http = types.SimpleNamespace(get=_get)
+    return c, calls
+
+
+_LAUNCHER_HTML_OK = (
+    '<input type="hidden" name="__instanceKey" id="__instanceKey" '
+    'value="d08a6aa2ac714cd39ce16b91fd39e5b3" />'
+)
+
+
+def test_download_report_pdf_happy_path_sets_params_then_fetches_pdf():
+    c, calls = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"%PDF-1.7 fake bytes",
+                     headers={"content-type": "application/pdf"}),
+    ])
+    params = [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"}]
+    data = asyncio.run(ScreenClient.download_report_pdf(c, parameters=params))
+    assert data == b"%PDF-1.7 fake bytes"
+    assert calls[0] == params                                    # submit ran first
+    assert calls[1][1].endswith("AP630500.rpx&unum=0&HideScript=On")
+    assert "InstanceID=d08a6aa2ac714cd39ce16b91fd39e5b3" in calls[2][1]
+    assert "OpType=PdfReport" in calls[2][1]
+
+
+def test_download_report_pdf_skips_submit_when_no_parameters():
+    c, calls = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"%PDF-1.7 x"),
+    ])
+    asyncio.run(ScreenClient.download_report_pdf(c, parameters=None))
+    # only the two GETs — no submit() call recorded
+    assert all(isinstance(call, tuple) and call[0] == "GET" for call in calls)
+    assert len(calls) == 2
+
+
+def test_download_report_pdf_raises_on_failed_submit_before_any_get():
+    c, calls = _report_client(
+        [_FakeGetResp(200, text=_LAUNCHER_HTML_OK)],
+        submit_result={"ok": False, "field_errors": ["Branch: invalid value"]},
+    )
+    with pytest.raises(ScreenError, match="parameter submit failed"):
+        asyncio.run(ScreenClient.download_report_pdf(
+            c, parameters=[{"set": "Branch", "to": "NOPE"}]))
+    # never reached the launcher GET
+    assert not any(isinstance(call, tuple) for call in calls)
+
+
+def test_download_report_pdf_raises_when_instance_key_missing():
+    c, _ = _report_client([_FakeGetResp(200, text="<html>no key here</html>")])
+    with pytest.raises(ScreenError, match="instanceKey not found"):
+        asyncio.run(ScreenClient.download_report_pdf(c))
+
+
+def test_download_report_pdf_raises_when_response_is_not_pdf():
+    # e.g. a server-side report error renders an HTML error page with a 200 status
+    c, _ = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"<html>error</html>",
+                     headers={"content-type": "text/html"}),
+    ])
+    with pytest.raises(ScreenError, match="not a PDF"):
+        asyncio.run(ScreenClient.download_report_pdf(c))
+
+
+def test_download_report_pdf_honors_report_filename_override():
+    c, calls = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"%PDF-1.7 x"),
+    ])
+    asyncio.run(ScreenClient.download_report_pdf(c, report_filename="CustomName.rpx"))
+    assert "ID=CustomName.rpx" in calls[0][1]
+
+
 # --- #3: run_report must resolve a site-absolute Location via _abs(), not a
 # naive base_url + location concat (which doubles the virtual directory). ---
 

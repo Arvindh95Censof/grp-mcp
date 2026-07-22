@@ -1775,6 +1775,69 @@ An approver is a workgroup MEMBER, which is an employee's Contact. The whole cha
 The map is BUILT but does not GATE postings until it is wired into the module's approval preferences
 (a separate activation step).
 
+## 18. Classic REPORT screens — headless PDF via the ASPX report-viewer handler (v0.68.9)
+
+`screen_capabilities`/`ui_get_structure` fail on report screens (`AP630500`, `AR6xxxxx`, `SM2xxxxx`
+family — anything that opens as a Report Parameters + Preview form, not a data-entry grid) with
+**"The view doesn't exist"**. This is not a broken screen — it's the modern JSON UI plane genuinely
+having no `Views`/`DataMembers` structure for a report, because reports render through a completely
+different, older mechanism (RDL + report-viewer control), never ported to the modern plane.
+
+**Two ways exist to get the PDF, and they are NOT the same:**
+
+| | `run_report` (contract REST) | `download_classic_report` (this section) |
+|---|---|---|
+| Mechanism | `Report`-type endpoint entity (SM207060) | Classic ASPX report-viewer handler |
+| Setup per report | Add entity to an endpoint via SM207060 first | None |
+| Works on classic-only report screens | **NO** (see below) | Yes |
+
+### Why `run_report`'s setup path is a dead end for classic report screens
+
+Adding a report as a contract entity via SM207060's live wizard (`ui_tree_dialog_insert` with
+`CreateEntityView.ObjectType="R"`) DOES create the entity shell cleanly (verified: `EntityID`
+assigned, entity appears in `get_endpoint_definition`). But the wizard's field/parameter-mapping step
+(`PopulateFields`/`PopulateParameters`, and `ui_populate_endpoint_entity_fields`) needs to read the
+report's "Views" to auto-discover fields — the SAME modern-plane structure that doesn't exist for a
+classic report screen. Both the Fields path (`data_view` match → `0 rows`) and the Parameters path
+(commit → `"The view doesn't exist."`) hit this wall. Manually inserting Field/Parameter rows was not
+pursued to completion (a real option — `CreateEntityView` exposes `FieldName`/`ParameterName` for a
+child-node insert — but the ASPX recipe below was found first, is simpler, and needs zero endpoint
+setup). Net: for a classic report screen, `run_report` requires either finishing that manual mapping
+or accepting per-report SM207060 setup; **prefer `download_classic_report`** — no setup at all.
+
+### The recipe (reverse-engineered from a live browser capture, csmdev `AP630500`, 2026-07-22)
+
+```
+1. GET  {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&unum=0&HideScript=On
+     -> HTML containing <input name="__instanceKey" value="<32-hex>" />
+2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&OpType=PdfReport&Refresh=True
+     -> raw PDF bytes (Content-Type: application/pdf)
+```
+
+Both requests ride the SAME cookie session as `screen_submit`/`screen_get` (`ScreenClient._http`) —
+no separate login. The launcher page's `__instanceKey` is assigned ONCE per browser tab/session and
+reused for every subsequent viewer call (confirmed live: the same key served the HTML preview,
+`OpType=Report`, AND the PDF, `OpType=PdfReport`, across multiple clicks).
+
+**Parameters are read from the screen's live session state, not from the launcher request.** Set them
+first with a normal `submit()`/`screen_submit` call (friendly names from `screen_get_schema`'s
+`Parameters` container, e.g. `ReportFormat`/`Company`/`Branch`/`FinancialPeriod`/`VendorClass` on
+`AP630500`) — confirmed live: values submitted via classic SOAP showed up already filled in on the
+browser's Report Parameters tab on a completely separate page load, proving Acumatica persists
+last-used report parameters **server-side per user+screen**. Omitting `parameters` reuses whatever was
+last set (by anyone driving that screen for that user) — pass them explicitly for a deterministic run.
+
+**`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
+name is plain `ReportLauncher.aspx`. `download_report_pdf`'s `report_filename=` override lets you
+point at a different `.rpx` if the `{ScreenID}.rpx` convention doesn't hold, but the LAUNCHER PAGE
+NAME itself (`CensofReportLauncher.aspx` vs `ReportLauncher.aspx`) is currently hardcoded to the
+Censof-branded name — an instance without that branding customization will 404 on step 1 and need the
+stock name substituted in code (not yet made configurable — no non-Censof instance tested).
+
+Live-proven end to end: `AP630500`, 4-row AP Aged Period-Sensitive report, 4386-byte PDF, magic bytes
+`%PDF-1.7`, content verified (correctly listed the same 4 `Bill` records a live DB read returned, with
+matching aging-bucket amounts and a netting balance of 0.00).
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
