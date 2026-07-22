@@ -1642,6 +1642,53 @@ CS100000) genuinely have no key and pass `target="current"` — accurate, not a 
 that caused the incident. It is correct for keyless singletons; anywhere else it deserves a moment's
 thought rather than a reflex when a refusal is inconvenient.
 
+## 16. Company Tree (EP204061) — headless + deterministic build (v0.68.5)
+
+`build_company_tree` builds an arbitrary workgroup hierarchy over the ASPX plane, no browser, exact at
+any depth. For each node it SELECTS the intended parent, fires `addWorkGroup` (stages a child under the
+selection), commits the name, and Saves. Because the parent is explicit, there is no depth limit and no
+placement ambiguity — a 7-node branching tree with two depth-3 leaves built with every parent correct.
+
+### The two bugs this replaced (both mine, stacked — a caution worth keeping)
+
+The tool used to drive the EP204060 "Import Company Tree" GRID with indent (`Right`) presses, and it
+mis-nested anything past a shallow spine. Chasing that produced a long, wrong trail:
+
+1. **Wrong screen.** EP204060's `insert`/`Right` act on the grid's hidden CURRENT-ROW state, which the
+   headless channel never returns and cannot set. Same press sequence → different parents across runs.
+   It is NONDETERMINISTIC and cannot be fixed by tuning press counts. (Spines worked by luck of cursor.)
+2. **Wrong CASE on the right screen.** EP204061 was believed undrivable because `AddWorkGroup` "staged
+   nothing". The command is camelCase — `addWorkGroup`. The server silently ignores an unknown command
+   name and just echoes command states, so a miscased action is a SILENT NO-OP that looks like a hard
+   wall. `Up`/`Down` ARE PascalCase and worked, which masked the pattern for hours.
+
+Meta-lesson: a "silent no-op" on a command plane is a NAME/CASE suspect before it is an "impossible".
+And a negative proven on one screen ("can't build the tree headless") was really a negative about the
+WRONG screen + a typo — scope every impossibility claim to exactly what was tested.
+
+### The recipe (each step was a live failure until right)
+
+```
+select the parent node                          # new node becomes ITS child — explicit, deterministic
+  (root node: dom = f"{tree_ctl}_node", key 0)  # the tree's company root -> top-level workgroup
+addWorkGroup            (camelCase!)             # stages a child; PascalCase = silent no-op
+Save, committing the name TWO ways at once:
+  - a <form><![CDATA[<RowChanges><Current><Row i="0"><Cells><Description>NAME</Description>…
+  - AND the raw field posted: ctl00$phF$sp1$form$edDescription = NAME
+```
+
+With only ONE of the two name channels the Save rejects *"Please specify workgroup description"*. Shipped
+as `AspxDiagnostic.add_workgroup`. Verify every parent against `EPCompanyTree` (the tool does).
+
+### Still open
+
+- `moveWorkGroup` (camelCase) opens a parent-picker dialog (`Dialog="True" ViewName="SelectedParentFolders"`)
+  — reparent is drivable via that dialog, not yet wired.
+- `deleteWorkGroup`'s earlier "stages nothing" was ALSO the casing bug, not a dialog wall — re-test camelCase.
+- `_tree_node_dom_id` mis-selected a HIGH-INDEX root (SortOrder 16 → `node_0_15` didn't land): the rendered
+  root order ≠ SortOrder on a large tree. Harmless for a fresh build (nodes address fine as they're added),
+  but fix before trusting selection on a big existing tree.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

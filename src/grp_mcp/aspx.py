@@ -1108,11 +1108,13 @@ class AspxDiagnostic:
             out["saved"] = False
             out["note"] = (
                 "the action staged NOTHING (the graph never went dirty), so it was "
-                "a SILENT NO-OP and no Save was sent. Known causes: the action "
-                "needs a confirmation dialog this client does not answer (EP204061 "
-                "DeleteWorkGroup behaves this way), the action name is wrong for "
-                "this screen, or the server refused it silently. An action that "
-                "really fires reports staged:true — Up/Down do.")
+                "a SILENT NO-OP and no Save was sent. #1 CAUSE — WRONG CASE: the "
+                "server ignores an unknown command name and just echoes states. On "
+                "EP204061 the workgroup verbs are camelCase (addWorkGroup / "
+                "moveWorkGroup / deleteWorkGroup); Up/Down are PascalCase. Passing "
+                "`AddWorkGroup` looks impossible but is only miscased. Other causes: "
+                "the action opens a dialog needing an answer, or the selection never "
+                "landed. An action that really fires reports staged:true.")
             return out
         if out["alert"] or not save:
             out["saved"] = False
@@ -1125,6 +1127,59 @@ class AspxDiagnostic:
         out["note"] = ("staged + saved without error — but this plane's 'clean' is "
                        "not proof; confirm with run_dac_odata.")
         return out
+
+    def _workgroup_form_ctl(self) -> str:
+        """The EP204061 workgroup detail-form control id, discovered from the page
+        (the container that owns `edDescription`). Falls back to the standard id."""
+        m = re.search(r'name="(ctl00\$[\w$]+\$form)\$edDescription"', self._html)
+        return m.group(1).replace("$", "_") if m else "ctl00_phF_sp1_form"
+
+    async def add_workgroup(self, tree_ctl: str, name: str,
+                            parent_dom_id: str, parent_key: Any,
+                            desc_field: str = "Description") -> dict[str, Any]:
+        """Create a NAMED child workgroup under a selected parent (EP204061), fully
+        headless and DETERMINISTIC. Proven live 2026-07-22.
+
+        Recipe (each step matters, each was a live failure until fixed):
+          1. SELECT the parent node — the new node becomes ITS child, so the parent
+             is explicit and there is no grid-cursor guesswork (which is what made
+             the EP204060 grid path nondeterministic).
+          2. Fire `addWorkGroup` — CAMELCASE. `AddWorkGroup` (PascalCase) is a silent
+             no-op that only echoes command states (the server ignores the unknown
+             name), which is what made this look impossible for a whole session.
+          3. Save committing the name TWO ways in one callback: a form `RowChanges`
+             block inside the DS envelope AND the field posted raw in the form data.
+             With only one, the Save rejects "Please specify workgroup description".
+
+        parent_dom_id / parent_key select the parent. For a TOP-LEVEL workgroup,
+        select the tree's company-root node: parent_dom_id=f"{tree_ctl}_node",
+        parent_key=0 (the new node then gets ParentWGID=0). Returns staged/saved/alert;
+        confirm the real parent with run_dac_odata as everywhere on this plane.
+        """
+        await self.select_tree_node(tree_ctl, parent_dom_id, parent_key)
+        body = await self._callback(_DS_CTL, _TREE_ENVELOPE.format(cmd="addWorkGroup"))
+        self._fold(body)
+        ds = _parse_control_blocks(body).get(_DS_BLOCK) or {}
+        if not ds.get("isDirty"):
+            return {"staged": False, "saved": False, "alert": ds.get("alert"),
+                    "note": "addWorkGroup staged nothing — the command must be "
+                            "camelCase ('addWorkGroup'), and the parent selection "
+                            "must have landed (check select_verified)."}
+        form_ctl = self._workgroup_form_ctl()
+        field = form_ctl.replace("_", "$") + "$ed" + desc_field
+        inner = (f'<{form_ctl}><![CDATA[<RowChanges><Current><Row i="0"><Cells>'
+                 f'<{desc_field}>{_xml_attr_escape(name)}</{desc_field}>'
+                 f'</Cells></Row></Current></RowChanges>]]></{form_ctl}>')
+        env = ('Save|<ctl00_phDS_ds LoadedLevel="-1">' + inner +
+               '<ctl00_phDS_ds OwnerData="1"><![CDATA[]]></ctl00_phDS_ds></ctl00_phDS_ds>')
+        sbody = await self._callback(_DS_CTL, env, extra={field: name})
+        sds = _parse_control_blocks(sbody).get(_DS_BLOCK) or {}
+        alert = sds.get("alert")
+        return {"staged": True, "saved": not alert, "alert": alert,
+                "note": None if not alert else
+                        "addWorkGroup staged but Save reported an alert — the name "
+                        "likely did not commit (needs BOTH the form RowChanges and "
+                        "the raw field post)."}
 
     async def replay_grid_batch(self, grid_view: str,
                                 operations: list[dict[str, Any]]) -> dict[str, Any]:

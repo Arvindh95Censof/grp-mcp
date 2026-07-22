@@ -3480,18 +3480,23 @@ async def aspx_tree_node_action(
 
     WHY THIS EXISTS: a classic tree (PXTreeView, e.g. EP204061 Company Tree)
     binds its detail form and its node-scoped actions to the SELECTED node, and
-    neither the SOAP nor the modern plane can make a selection — which is why
-    `build_company_tree`'s docstring calls driving EP204061 "exhaustively proven"
-    impossible. That verdict was true of THOSE planes only. Selection lives in
-    the tree control's hidden `_state`, and this plane can write it:
+    neither the SOAP nor the modern plane can make a selection. Only THIS plane
+    can — and it is enough to build the whole tree (see build_company_tree, which
+    selects each parent then fires `addWorkGroup`). Selection lives in the tree
+    control's hidden `_state`, and this plane can write it:
     `<PXTreeView SelectedNodeID=… SelectedValue=…/>` + a datasource reload.
     Proven live: selecting two different nodes loaded two different records, and
     firing `Up` on a node committed a real SortOrder change to the database.
 
     node_key: the node's KEY value (e.g. a WorkGroupID from EPCompanyTree).
     action:   omit to SELECT ONLY (safe, changes nothing — use it to verify
-        addressing). Otherwise the node-scoped action to fire, then Save
-        (EP204061: Up | Down | AddWorkGroup | DeleteWorkGroup | MoveWorkGroup).
+        addressing). Otherwise the node-scoped action to fire, then Save. CASE
+        MATTERS and is NOT uniform on this screen: reorder is PascalCase (Up | Down),
+        but the workgroup verbs are CAMELCASE (addWorkGroup | moveWorkGroup |
+        deleteWorkGroup). A wrong-case name is a SILENT NO-OP — the server just
+        echoes command states and the tool reports staged:false. (This cost a whole
+        session: `AddWorkGroup` looked "impossible" when it was only miscased. To
+        CREATE a named child use build_company_tree, which encodes the full recipe.)
     tree_dac / key_field / parent_field / sort_field: where the tree's STRUCTURE
         is read from, to derive the node's DOM id. Defaults are the Company Tree.
         The DOM id encodes the node's sibling-index path and must be EXACT — a
@@ -4590,21 +4595,45 @@ def _flatten_tree(nodes: list, depth: int = 0, out: list | None = None) -> list:
     return out
 
 
+def _flatten_tree_parents(nodes: list, parent: str | None = None,
+                          out: list | None = None) -> list:
+    """Pre-order flatten to [(name, parent_name_or_None), ...] — the shape the
+    EP204061 builder needs (it addresses each node's PARENT explicitly, not a depth)."""
+    out = [] if out is None else out
+    for n in nodes:
+        if isinstance(n, str):
+            name, kids = n, []
+        else:
+            name, kids = n.get("name"), (n.get("children") or [])
+        if not name:
+            raise ValueError(f"tree node missing 'name': {n!r}")
+        out.append((str(name), parent))
+        _flatten_tree_parents(kids, str(name), out)
+    return out
+
+
 @mcp.tool()
 async def build_company_tree(
     structure: Any,
     skip_if_root_exists: bool = True,
     instance: str | None = None,
 ) -> Any:
-    """Build a Company Tree workgroup hierarchy (EP204060) — the ONLY headless way.
+    """Build a Company Tree workgroup hierarchy (EP204061) — headless + deterministic.
 
-    The Company Tree screen (EP204061) can't be driven by the API — its parent link is
-    set by clicking a tree node, and no field/path/command reproduces that (exhaustively
-    proven). But the *Import Company Tree* form (EP204060) exposes a GRID + indent
-    actions instead, which ARE drivable. This builds any hierarchy through it:
-    pre-order (DFS), and for each node — bootstrap, insert into the "List of Groups"
-    (Items) grid, fire `Right` (indent) `depth` times to nest it under the correct
-    ancestor, then Save. Proven live (parents verified against EPCompanyTree).
+    Drives the Company Tree screen directly over the ASPX plane: for each node it
+    SELECTS the intended parent, fires `addWorkGroup` (which stages a child UNDER the
+    selection), commits the name, and Saves. Because the parent is chosen explicitly,
+    placement is exact at any depth — arbitrary branching, no ambiguity.
+
+    HISTORY (why this changed): the previous version drove the EP204060 "Import
+    Company Tree" GRID with indent (`Right`) presses. That was proven NONDETERMINISTIC
+    live 2026-07-22 — `insert`/`Right` act on the grid's hidden current-row state that
+    the headless channel can't observe or set, so the same presses produced different
+    parents across runs (spines worked by luck; deep branches drifted). EP204061 was
+    wrongly believed undrivable only because `addWorkGroup` had been fired in the wrong
+    CASE (PascalCase `AddWorkGroup` is a silent no-op; the real command is camelCase).
+    With the right case + an explicit parent selection, EP204061 is exact. A 7-node
+    branching tree with two depth-3 leaves built with every parent correct.
 
     structure: the tree, as nested {"name": str, "children": [...]} dicts — a single
         root dict, or a LIST of root dicts for a multi-root tree. `children` is optional
@@ -4618,75 +4647,91 @@ async def build_company_tree(
         (return skipped=true) so a re-run can't duplicate the tree. Set false to force.
 
     Requires allow_write. Members are NOT added here (add separately). Returns the built
-    node list + a per-node parent verification read back from EPCompanyTree.
+    node list + a per-node parent verification read back from EPCompanyTree. Names must
+    be UNIQUE within the tree (the builder addresses parents by name).
     """
     _require_write(instance)
     inst = _cfg().get(instance or _cfg().default)
     roots = structure if isinstance(structure, list) else [structure]
-    flat = _flatten_tree(roots)
+    flat = _flatten_tree_parents(roots)   # [(name, parent_name_or_None)] pre-order
     if not flat:
         return {"error": "empty structure"}
+    names = [n for n, _ in flat]
+    if len(set(names)) != len(names):
+        dup = sorted({n for n in names if names.count(n) > 1})
+        return {"error": f"duplicate node names {dup} — the builder addresses each "
+                         f"parent by name, so names must be unique within the tree."}
 
-    async def _existing() -> dict:
-        try:
-            r = await _client(instance).run_dac(
-                "EPCompanyTree", {"$select": "WorkGroupID,Description,ParentWGID"}, timeout=110)
-            return {x.get("Description"): x for x in (r.get("value") or [])}
-        except Exception as e:  # noqa: BLE001
-            return {"__error__": str(e)[:200]}
+    async def _rows() -> list[dict]:
+        r = await run_dac_odata(
+            "EPCompanyTree",
+            select="WorkGroupID,Description,ParentWGID,SortOrder",
+            top=5000, instance=instance)
+        return (r.get("value") or []) if isinstance(r, dict) else []
 
-    before = await _existing()
+    before = await _rows()
     root_name = flat[0][0]
-    if skip_if_root_exists and root_name in before:
+    if skip_if_root_exists and any(x.get("Description") == root_name for x in before):
         return {"skipped": True, "root": root_name,
                 "note": f"root '{root_name}' already exists — refusing to duplicate. "
                         "Pass skip_if_root_exists=false to build anyway."}
 
+    # resolve the ASPX page for EP204061
+    sm = await run_dac_odata("SiteMap", filter="ScreenID eq 'EP204061'",
+                             select="ScreenID,Url", top=1, instance=instance)
+    smv = (sm.get("value") or []) if isinstance(sm, dict) else []
+    raw = smv[0].get("Url") if smv else None
+    if not raw or ".aspx" not in raw:
+        return {"error": "no classic ASPX page found for EP204061 in the site map "
+                         f"(Url={raw!r})."}
+    url = inst.base_url.rstrip("/") + raw.lstrip("~")
+
+    name2id: dict[str, int] = {}
     built: list[dict] = []
-    async with ScreenClient(inst, "EP204060") as s:
-        for i, (name, depth) in enumerate(flat):
-            await s.ui_bootstrap(["Folders", "Items", "Members"])
-            await s.ui_insert_grid_row("Items", {"Description": name}, skip_validation=True)
-            # INDENT SEMANTICS — measured live 2026-07-20, and NOT what they look
-            # like. The original code fired Right `depth` times on the row it had
-            # just inserted, which is wrong twice over:
-            #   (1) OFF BY ONE: the presses issued after inserting node N take
-            #       effect on node N+1, never on N.
-            #   (2) They set that next node's ABSOLUTE level, and the level RESETS
-            #       every step — it does not accumulate and it is not a delta.
-            # So the count to issue in THIS step is simply the next node's depth.
-            # Fitted against a 4-node probe (0/1/0/1 presses -> ROOT / ROOT /
-            # child-of-#2 / ROOT), which only this model explains; it also
-            # reproduces the earlier mis-nested build exactly.
-            # Lefts are never needed (and appeared to be ignored when tried).
-            nxt = flat[i + 1][1] if i + 1 < len(flat) else 0
-            for _ in range(nxt):
-                await s.ui_command("Right")
-            await s.ui_command("Save")
-            built.append({"name": name, "depth": depth})
+    async with ScreenClient(inst, "EP204061") as s:
+        await s._ensure_login()
+        d = AspxDiagnostic(s, url)
+        await d.open()
+        tree_ctl = d.find_tree_control()
+        for name, parent in flat:
+            rows = await _rows()   # refresh so freshly-added parents are addressable
+            if parent is None:
+                parent_dom, parent_key = f"{tree_ctl}_node", 0   # company root
+            else:
+                pid = name2id.get(parent)
+                parent_dom = _tree_node_dom_id(pid, rows, tree_ctl,
+                                               "WorkGroupID", "ParentWGID", "SortOrder") if pid else None
+                parent_key = pid
+                if not parent_dom:
+                    built.append({"name": name, "parent": parent, "staged": False,
+                                  "error": f"could not address parent '{parent}'"})
+                    continue
+            res = await d.add_workgroup(tree_ctl, name, parent_dom, parent_key)
+            # read the new node's id for use as a future parent
+            after = await _rows()
+            hit = [x for x in after if x.get("Description") == name]
+            if hit:
+                name2id[name] = hit[0]["WorkGroupID"]
+            built.append({"name": name, "parent": parent, **res,
+                          "workgroup_id": name2id.get(name)})
 
     # verify parents against the DB
-    after = await _existing()
-    by_id = {v["WorkGroupID"]: k for k, v in after.items() if isinstance(v, dict)}
+    after = await _rows()
+    by_id = {x["WorkGroupID"]: x.get("Description") for x in after}
+    latest = {x.get("Description"): x for x in after}
     checks: list[dict] = []
     ok_all = True
+    for name, parent in flat:
+        row = latest.get(name)
+        got = (by_id.get(row["ParentWGID"], "ROOT") if row and row.get("ParentWGID")
+               else ("ROOT" if row else "MISSING"))
+        want = parent or "ROOT"
+        good = got == want
+        ok_all = ok_all and good
+        checks.append({"name": name, "parent": got, "expected": want, "ok": good})
 
-    def _verify(nodes: list, parent: str | None) -> None:
-        nonlocal ok_all
-        for n in nodes:
-            name = n if isinstance(n, str) else n.get("name")
-            kids = [] if isinstance(n, str) else (n.get("children") or [])
-            row = after.get(name)
-            got = by_id.get(row["ParentWGID"], "ROOT") if isinstance(row, dict) else "MISSING"
-            want = parent or "ROOT"
-            good = got == want
-            ok_all = ok_all and good
-            checks.append({"name": name, "parent": got, "expected": want, "ok": good})
-            _verify(kids, name)
-
-    _verify(roots, None)
-    return {"built": len(built), "root": root_name,
-            "verified": ok_all, "nodes": checks,
+    return {"built": len([b for b in built if b.get("saved")]), "root": root_name,
+            "screen": "EP204061", "verified": ok_all, "nodes": checks,
             "note": ("all parents verified against EPCompanyTree." if ok_all
                      else "SOME parents differ — review nodes[].ok=false.")}
 
@@ -7919,7 +7964,8 @@ _GUIDE = {
             "screen_autofill (resolve required selectors + defaults; surface only human-decision fields)"],
         "org structure / trees / approvals": [
             "tree_triage (FIRST — is a tree screen API-buildable, and with which tool?)",
-            "build_company_tree (build the EP204061 workgroup hierarchy via EP204060)"],
+            "build_company_tree (build the EP204061 workgroup hierarchy headlessly — "
+            "select parent + addWorkGroup per node; deterministic at any depth)"],
         "lookups / reference data": ["ui_lookup (search any selector's table)",
             "ui_resolve_selector (resolve one selector field to {id,text} for a write)"],
         "web-service endpoints / customization": ["get_endpoint_definition",

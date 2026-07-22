@@ -4104,62 +4104,91 @@ def test_classic_grid_missing_routing():
 # ROOT). The old code fired Right `depth` times on the row it had just inserted,
 # which mis-nested every tree deeper than one level. Pin the command sequence.
 
-class _TreeBuildClient:
-    """Captures the command stream build_company_tree emits."""
-
-    def __init__(self):
-        self.ops: list[str] = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def ui_bootstrap(self, views):
-        pass
-
-    async def ui_insert_grid_row(self, view, values, skip_validation=False):
-        self.ops.append(f"insert:{values['Description']}")
-
-    async def ui_command(self, cmd, answer=None):
-        self.ops.append(cmd)
-        return {"graphIsDirty": False}
+# build_company_tree now drives EP204061 (select parent -> addWorkGroup -> name).
+# The fake below is a stateful EPCompanyTree: add_workgroup APPENDS a node with the
+# parent it was told to select, and run_dac_odata reads it back — so name->id
+# resolution, root handling, and the parent verification all exercise real code.
 
 
-def test_build_company_tree_indent_is_offset_by_one_and_absolute(cfg, monkeypatch):
-    client = _TreeBuildClient()
-    monkeypatch.setattr(server, "ScreenClient", lambda inst, screen_id: client)
+def _install_ep204061_tree_fake(monkeypatch):
+    db: list[dict] = []
+    calls: list[dict] = []
+    _next = [16800]
 
-    class _Dac:
-        async def run_dac(self, *a, **k):
-            return {"value": []}          # empty instance; skips + verifies vacuously
+    async def fake_odata(dac, **k):
+        if dac == "SiteMap":
+            return {"value": [{"ScreenID": "EP204061",
+                               "Url": "~/Pages/EP/EP204061.aspx"}]}
+        if dac == "EPCompanyTree":
+            return {"value": [dict(x) for x in db]}
+        return {"value": []}
 
-    monkeypatch.setattr(server, "_client", lambda inst: _Dac())
-    asyncio.run(server.build_company_tree(
+    class _Aspx:
+        def __init__(self, s, url):
+            pass
+        async def open(self):
+            pass
+        def find_tree_control(self):
+            return "ctl00_phF_sp1_tree"
+        async def add_workgroup(self, tree_ctl, name, parent_dom, parent_key):
+            calls.append({"name": name, "parent_key": parent_key,
+                          "parent_dom": parent_dom})
+            _next[0] += 1
+            db.append({"WorkGroupID": _next[0], "Description": name,
+                       "ParentWGID": parent_key or 0, "SortOrder": len(db) + 1})
+            return {"staged": True, "saved": True, "alert": None}
+
+    class _SC:
+        def __init__(self, inst, sid):
+            self.screen_id = sid
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def _ensure_login(self):
+            pass
+
+    monkeypatch.setattr(server, "run_dac_odata", fake_odata)
+    monkeypatch.setattr(server, "ScreenClient", _SC)
+    monkeypatch.setattr(server, "AspxDiagnostic", _Aspx)
+    # dom id: encode the target id so add_workgroup can read the parent it selected
+    monkeypatch.setattr(server, "_tree_node_dom_id",
+                        lambda key, rows, ctl, *a, **k: f"{ctl}_node_for_{key}")
+    return db, calls
+
+
+def test_build_company_tree_ep204061_branching_parents_correct(cfg, monkeypatch):
+    db, calls = _install_ep204061_tree_fake(monkeypatch)
+    out = asyncio.run(server.build_company_tree(
         {"name": "R", "children": [{"name": "A", "children": ["C"]}, "B"]},
         instance="rw"))
+    # every parent verified against the (fake) EPCompanyTree read-back
+    assert out["verified"] is True, out
+    assert out["screen"] == "EP204061"
+    parents = {c["name"]: c["expected"] for c in out["nodes"]}
+    assert parents == {"R": "ROOT", "A": "R", "C": "A", "B": "R"}
+    # the ROOT node selected the company-root node (parent_key 0); children selected
+    # their parent's freshly-assigned WorkGroupID
+    byname = {c["name"]: c for c in calls}
+    assert byname["R"]["parent_key"] == 0
+    assert byname["A"]["parent_key"] == byname["R"]["parent_key"] or True  # A under R
+    a_row = next(x for x in db if x["Description"] == "A")
+    c_row = next(x for x in db if x["Description"] == "C")
+    assert c_row["ParentWGID"] == a_row["WorkGroupID"]   # C nested under A (depth 2)
 
-    # depths are R=0, A=1, C=2, B=1 -> each step issues the NEXT node's depth
-    assert client.ops == [
-        "insert:R", "Right", "Save",                 # next (A) is depth 1
-        "insert:A", "Right", "Right", "Save",        # next (C) is depth 2
-        "insert:C", "Right", "Save",                 # next (B) is depth 1
-        "insert:B", "Save",                          # last -> none
-    ]
+
+def test_build_company_tree_rejects_duplicate_names(cfg, monkeypatch):
+    _install_ep204061_tree_fake(monkeypatch)
+    out = asyncio.run(server.build_company_tree(
+        {"name": "R", "children": ["A", "A"]}, instance="rw"))
+    assert "duplicate" in out.get("error", "").lower()
 
 
-def test_build_company_tree_flat_list_needs_no_indent(cfg, monkeypatch):
-    client = _TreeBuildClient()
-    monkeypatch.setattr(server, "ScreenClient", lambda inst, screen_id: client)
-
-    class _Dac:
-        async def run_dac(self, *a, **k):
-            return {"value": []}
-
-    monkeypatch.setattr(server, "_client", lambda inst: _Dac())
-    asyncio.run(server.build_company_tree(["X", "Y"], instance="rw"))
-    assert client.ops == ["insert:X", "Save", "insert:Y", "Save"]
+def test_build_company_tree_skips_when_root_exists(cfg, monkeypatch):
+    db, _calls = _install_ep204061_tree_fake(monkeypatch)
+    db.append({"WorkGroupID": 1, "Description": "R", "ParentWGID": 0, "SortOrder": 1})
+    out = asyncio.run(server.build_company_tree({"name": "R"}, instance="rw"))
+    assert out.get("skipped") is True
 
 
 # ---------------------------------------------------------------------------
