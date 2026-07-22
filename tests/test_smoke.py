@@ -3732,6 +3732,8 @@ _FAKE_REPORT_SCHEMA = {
             "Branch": {"object": "Parameters", "field": "BranchID"},
             "Company": {"object": "Parameters", "field": "OrganizationID"},
             "Category": {"object": "Parameters", "field": "CategoryValue"},
+            "VendorType": {"object": "Parameters", "field": "VendorType"},
+            "ItemType": {"object": "Parameters", "field": "ItemType"},
         }
     }
 }
@@ -3806,18 +3808,27 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     #      _state=<PXSelector .../> — two separate releases shipped these defaulting to
     #      shape 2 ($text-only) and they silently no-op'd (Branch stuck on MAIN,
     #      VendorClass filter did nothing, Category left the report unfiltered).
+    # VendorType/ItemType are ALSO PXTEXT COMBO (shape 1) — a third release shipped
+    # these defaulting to shape 2 too (VendorType filter did nothing, ItemType label
+    # never changed from "Both").
     c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
     asyncio.run(ScreenClient.set_report_parameters(
         c, [{"set": "ReportFormat", "to": "Summary"},
             {"set": "FinancialPeriod", "to": "03-2026"},
             {"set": "Branch", "to": "YMHQ"},
             {"set": "Company", "to": "YM"},
-            {"set": "Category", "to": "TESTCAT"}],
+            {"set": "Category", "to": "TESTCAT"},
+            {"set": "VendorType", "to": "Employee"},
+            {"set": "ItemType", "to": "Normal"}],
         "https://example.invalid/launcher", "key123", "tok123"))
     form = calls[-1][2]
     # shape 1: PXTEXT COMBO
     assert form["viewer_par_tab_t0_pForm_edFormat_state"] == '<PText Value="S"/>'
     assert form["viewer$par$tab$t0$pForm$edFormat$text"] == "Summary"
+    assert form["viewer_par_tab_t0_pForm_edVendorType_state"] == '<PText Value="EE"/>'
+    assert form["viewer$par$tab$t0$pForm$edVendorType$text"] == "Employee"
+    assert form["viewer_par_tab_t0_pForm_edItemType_state"] == '<PText Value="N"/>'
+    assert form["viewer$par$tab$t0$pForm$edItemType$text"] == "Normal"
     # shape 2: BARE SELECTOR — _state must be absent
     assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form
     assert form["viewer$par$tab$t0$pForm$edPeriodID$text"] == "03-2026"

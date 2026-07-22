@@ -1919,7 +1919,7 @@ defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
 
 | Shape | Fields (verified) | `_state` | `$text` |
 |---|---|---|---|
-| PXTEXT COMBO | `Format` | `<PText Value="<code>"/>` — REQUIRED | full value |
+| PXTEXT COMBO | `Format`, `VendorType`, `ItemType` | `<PText Value="<code>"/>` — REQUIRED | full value |
 | BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
 | LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
 
@@ -1952,14 +1952,33 @@ lookup shape, with `CategoryValue` held fixed both times — and came back **byt
 Its effect could not be isolated in this tenant, so it's deliberately left OUT of the lookup registry
 rather than guessed in on the assumption that a paired control must share its partner's shape.
 
-**The meta-lesson, stated plainly because it cost THREE ship cycles now:** a field that is
+**`VendorType`/`ItemType` — SIXTH/SEVENTH gotchas, found 2026-07-23, same day as Category, this time on
+the PXTEXT COMBO side of the shape table (not LOOKUP SELECTOR).** Both ARE visible on AP630500's
+Parameters tab as real dropdowns ("Vendor"/"Employee" and "Both"/... ), unlike Category — but the
+browser's own combo popup wasn't reliably capturable in-session (screenshots kept timing out mid-click),
+so this was proven by direct A/B POST instead, same discipline, different tool.
+- `VendorType`: test vendor VEND01 is DAC-confirmed `Type="VE"`. `_state=<PText Value="VE"/>` (matching
+  code) kept it INCLUDED — byte-identical to the unfiltered baseline. `_state=<PText Value="EE"/>` (the
+  other real BAccountType code, "Employee") EXCLUDED it — the report emptied out. Full two-direction
+  proof, the same tier Branch/VendorClass got. The OLD default (bare `$text`) left it silently
+  unfiltered either way, tested first — same bug class, third time.
+- `ItemType`: default renders "Item Type : Both" (`_state` code `"B"`). `_state=<PText Value="N"/>`
+  changed the printed label to "Item Type : Normal Items Only" — note that's the SERVER's own label,
+  not the (deliberately wrong) `$text` guess `"Non-Stock"` this test sent — proof the code is genuinely
+  validated server-side, not the `$text` blindly echoed. The row DATA stayed identical (this tenant's
+  test bills carry no inventory lines that would differ across item-type buckets), so this one has a
+  label proof but not a row-filtering proof — a real but weaker tier than VendorType's.
+
+**The meta-lesson, stated plainly because it cost FIVE ship cycles now:** a field that is
 structurally/visually identical to a previously-verified field (Branch and Company both LOOK like
-`FinancialPeriod` — a text box with a magnifier icon) can use a completely different wire protocol
-underneath — and a field that isn't even VISIBLE in the UI (Category, AttributeID) can still be live and
-read server-side, or can genuinely do nothing; the only way to tell which is an A/B test against the
-rendered output, not an assumption either way. Never extend a verified pattern to a new field — including
-a "no error, no visible change" result, which is exactly what BOTH a truly inert field and a
-silently-no-op'd wrong-shape field look like from the outside.
+`FinancialPeriod` — a text box with a magnifier icon; VendorType and ItemType both LOOK like Format — a
+dropdown combo) can use a completely different wire protocol underneath — and a field that isn't even
+VISIBLE in the UI (Category, AttributeID) can still be live and read server-side, or can genuinely do
+nothing; the only way to tell which is an A/B test against the rendered output, not an assumption either
+way, and not even a reliable browser capture where one's available (this round's proof came entirely
+from scripted POSTs, no browser reverse-engineering at all). Never extend a verified pattern to a new
+field — including a "no error, no visible change" result, which is exactly what BOTH a truly inert field
+and a silently-no-op'd wrong-shape field look like from the outside.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you

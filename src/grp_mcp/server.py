@@ -8837,14 +8837,20 @@ async def download_classic_report(
         check), Branch/VendorClass (MAIN vs YMHQ, DEFAULT vs STAFF — correctly
         included/excluded a test vendor by class and by branch), Company (AI
         STAGING vs YM, csmdev's 2nd org — the header changed AND the body genuinely
-        emptied since MAIN branch's bills belong to the other org), and Category (an
+        emptied since MAIN branch's bills belong to the other org), Category (an
         A/B test against the same value proved the old default shape silently
         no-op'd while the correct shape genuinely filters — empties the report, since
-        this tenant has no vendor with a matching category), all confirmed together
-        in combined calls. Two prior releases shipped Branch/VendorClass then Category
-        defaulting to the wrong wire shape and silently no-op'ing; both are fixed —
-        see KNOWLEDGE.md §18 for the field-type shapes this now handles automatically
-        (you don't need to know which shape a field uses).
+        this tenant has no vendor with a matching category), VendorType ("Vendor" vs
+        "Employee" — genuinely included/excluded the test vendor by its real DAC type,
+        same two-direction proof as Branch/VendorClass), and ItemType ("Both" vs
+        "Normal" — the printed label changed to the server's OWN text, not the
+        caller's guess, proving the code is validated server-side even though this
+        tenant's test data didn't exercise row-level filtering), all confirmed
+        together in combined calls. Three prior releases shipped Branch/VendorClass,
+        then Category, then VendorType/ItemType defaulting to the wrong wire shape and
+        silently no-op'ing; all are fixed — see KNOWLEDGE.md §18 for the field-type
+        shapes this now handles automatically (you don't need to know which shape a
+        field uses).
 
         AttributeID (Category's paired dimension-selector) was A/B tested directly and
         made no observable difference either way — its shape is deliberately left

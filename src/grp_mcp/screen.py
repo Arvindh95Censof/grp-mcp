@@ -3771,12 +3771,33 @@ class ScreenClient:
     # untouched" instead of "add it" because the A/B test came back negative rather
     # than positive.
     #
+    # `VendorType` and `ItemType` (2026-07-23) are TWO MORE PXTEXT COMBO fields, found by
+    # the same "measure, don't guess" A/B method rather than browser capture (the
+    # launcher's combo popup wasn't reliably clickable in-session). Both proven live:
+    #   - `VendorType`: test vendor VEND01 is DAC-confirmed `Type="VE"`. Setting
+    #     `_state=<PText Value="VE"/>` (matching code) kept it INCLUDED (byte-identical
+    #     to the unfiltered baseline); `_state=<PText Value="EE"/>` (the other real
+    #     BAccountType code, "Employee") EXCLUDED it — the report emptied out. Full
+    #     two-direction proof, same tier as Branch/VendorClass. The tool's old default
+    #     (bare `$text`) left it silently unfiltered either way — same bug class again.
+    #   - `ItemType`: default renders "Item Type : Both" (`_state` code `"B"`). Setting
+    #     `_state=<PText Value="N"/>` changed the printed label to "Item Type : Normal
+    #     Items Only" — a label the SERVER supplied, not the (wrong) `$text` guess
+    #     ("Non-Stock") this test sent, proving the code is genuinely validated
+    #     server-side rather than the `$text` being echoed blindly. The row DATA stayed
+    #     identical (this tenant's test bills don't carry inventory lines that would
+    #     differ across item-type buckets), so — unlike VendorType — only the label
+    #     proof exists here, not a row-filtering proof; still enough to confirm the
+    #     field is read and applied, not inert.
+    #
     # Everything else not listed here defaults to case 2 (bare `$text`), which is
     # CORRECT for PeriodID but unverified for any other untested field. Don't extend
     # either mapping on a guess; measure first — that's exactly how Branch/VendorClass/
-    # Category went undetected as broken.
+    # Category/VendorType/ItemType went undetected as broken.
     _PXTEXT_COMBO_FIELDS: dict[str, dict[str, str]] = {
         "Format": {"detailed": "D", "summary": "S"},
+        "VendorType": {"vendor": "VE", "employee": "EE"},
+        "ItemType": {"both": "B", "normal": "N"},
     }
     _LOOKUP_SELECTOR_FIELDS: set[str] = {
         "BranchID", "ClassID", "OrganizationID", "CategoryValue",
@@ -3831,6 +3852,13 @@ class ScreenClient:
           the same value proved bare `$text` silently no-ops (unfiltered) while the
           lookup shape genuinely filters (switches to a grouped layout and empties
           out, since this tenant has no vendor with a matching category value).
+        - VendorType ("Vendor"/"Employee") — via PXTEXT COMBO shape: `_state`
+          code "VE" (VEND01's real DAC type) kept it included, "EE" excluded it —
+          full two-direction proof.
+        - ItemType ("Both"/"Normal") — via PXTEXT COMBO shape: `_state` code "N"
+          changed the printed label to the server's OWN "Normal Items Only" text
+          (not the caller's guessed `$text`), proving the code is validated
+          server-side; row data was unaffected by this particular test data.
         All confirmed together in combined calls (format+period, branch+class+period).
 
         Any field not in _PXTEXT_COMBO_FIELDS or _LOOKUP_SELECTOR_FIELDS defaults to
@@ -3842,7 +3870,8 @@ class ScreenClient:
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
         but NOT on a recognized field whose shape hasn't been verified and turns out
-        to silently no-op (as Branch/VendorClass/Category did before their fixes).
+        to silently no-op (as Branch/VendorClass/Category/VendorType/ItemType did
+        before their fixes).
         """
         schema = await self.get_schema()
         param_fields = schema.get("containers", {}).get("Parameters", {})
