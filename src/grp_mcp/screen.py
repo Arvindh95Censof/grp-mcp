@@ -3706,13 +3706,27 @@ class ScreenClient:
             "rows": [dict(zip(headers, r)) for r in rows[1:]],
         }
 
-    async def download_report_pdf(
-        self, parameters: list[dict] | None = None, report_filename: str | None = None
+    # OpType/ExportFormat query suffix + a magic-bytes validator, per output format.
+    # Excel enum casing is LOAD-BEARING: "Excel" works, "EXCEL"/"XLS" silently return
+    # an HTML error page instead (200 OK, text/html) — verified live, csmdev AP630500.
+    _REPORT_FORMATS: dict[str, tuple[str, str, tuple[bytes, ...]]] = {
+        "pdf": ("OpType=PdfReport&Refresh=True", "application/pdf", (b"%PDF",)),
+        "excel": ("OpType=Export&ExportFormat=Excel",
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                  (b"PK\x03\x04",)),  # .xlsx is a zip container
+    }
+
+    async def download_report_file(
+        self,
+        parameters: list[dict] | None = None,
+        report_filename: str | None = None,
+        fmt: str = "pdf",
     ) -> bytes:
         """Render a classic report screen (SM200xxx/AR6xxxxx/AP6xxxxx/... family) and
-        return its PDF bytes — the ONLY headless path for a report screen that has no
-        modern-UI Views (screen_capabilities/ui_get_structure fail with "the view
-        doesn't exist" on these) and no contract-REST Report entity configured.
+        return its rendered bytes (PDF or Excel) — the ONLY headless path for a report
+        screen that has no modern-UI Views (screen_capabilities/ui_get_structure fail
+        with "the view doesn't exist" on these) and no contract-REST Report entity
+        configured.
 
         Reverse-engineered from a live browser capture (csmdev AP630500, 2026-07-22):
         the report VIEWER is a separate mechanism from both the modern JSON plane and
@@ -3723,8 +3737,11 @@ class ScreenClient:
              -> HTML containing <input name="__instanceKey" value="<32-hex>" />.
              (Acumatica's stock page is plain "ReportLauncher.aspx" on most instances;
              this csmdev tenant's is Censof-branded — try the stock name as a fallback.)
-          2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&OpType=PdfReport&Refresh=True
-             -> raw PDF bytes (Content-Type: application/pdf).
+          2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&<format-specific suffix>
+             -> raw bytes (Content-Type varies by fmt — see _REPORT_FORMATS).
+
+        fmt: "pdf" (default) or "excel". Same launcher/instanceKey step either way —
+        only the second GET's query string and expected content differ.
 
         The report reads its PARAMETERS from the screen's live session state, not from
         the launcher request — so pass `parameters` as submit()-style commands
@@ -3736,14 +3753,22 @@ class ScreenClient:
         report_filename: override the "{ScreenID}.rpx" convention if a screen's actual
         report file differs (rare — verified 1:1 for AP630500).
 
-        Live-proven: AP630500, 4-row report, 4386-byte PDF, magic bytes b"%PDF-1.7",
-        content correct (matched the live DB read of the same 4 Bills).
+        Live-proven: AP630500, 4-row report — PDF (4386 bytes, b"%PDF-1.7") and Excel
+        (6631 bytes, real .xlsx: correct MIME type, ZIP magic bytes, well-formed
+        sharedStrings.xml carrying the same report data) both verified against a live
+        DB read of the same 4 Bills.
         """
+        if fmt not in self._REPORT_FORMATS:
+            raise ScreenError(
+                f"download_report_file {self.screen_id}: unknown fmt {fmt!r} — "
+                f"expected one of {sorted(self._REPORT_FORMATS)}"
+            )
+        query_suffix, expected_ct, magic_prefixes = self._REPORT_FORMATS[fmt]
         if parameters:
             result = await self.submit(parameters)
             if not result.get("ok", True):
                 raise ScreenError(
-                    f"download_report_pdf {self.screen_id}: parameter submit failed — "
+                    f"download_report_file {self.screen_id}: parameter submit failed — "
                     f"{result.get('field_errors') or result.get('messages')}"
                 )
         base = self.instance.base_url.rstrip("/")
@@ -3752,27 +3777,28 @@ class ScreenClient:
         r1 = await self._http.get(launcher_url)
         if r1.status_code >= 400:
             raise ScreenError(
-                f"download_report_pdf {self.screen_id}: launcher GET -> HTTP {r1.status_code}"
+                f"download_report_file {self.screen_id}: launcher GET -> HTTP {r1.status_code}"
             )
         m = re.search(r'name="__instanceKey"[^>]*value="([a-f0-9]+)"', r1.text)
         if not m:
             raise ScreenError(
-                f"download_report_pdf {self.screen_id}: __instanceKey not found in launcher "
+                f"download_report_file {self.screen_id}: __instanceKey not found in launcher "
                 f"response (report screen may not exist, or this instance uses a differently "
                 f"named launcher page — try report_filename= or check screen_id)."
             )
         instance_key = m.group(1)
-        pdf_url = (f"{base}/PX.ReportViewer.axd?InstanceID={instance_key}"
-                   f"&OpType=PdfReport&Refresh=True")
-        r2 = await self._http.get(pdf_url)
+        file_url = f"{base}/PX.ReportViewer.axd?InstanceID={instance_key}&{query_suffix}"
+        r2 = await self._http.get(file_url)
         if r2.status_code >= 400:
             raise ScreenError(
-                f"download_report_pdf {self.screen_id}: PDF GET -> HTTP {r2.status_code}"
+                f"download_report_file {self.screen_id}: {fmt} GET -> HTTP {r2.status_code}"
             )
-        if not r2.content.startswith(b"%PDF"):
+        if not r2.content.startswith(magic_prefixes):
             raise ScreenError(
-                f"download_report_pdf {self.screen_id}: response was not a PDF "
-                f"(content-type={r2.headers.get('content-type')!r}, "
-                f"first bytes={r2.content[:16]!r}) — the report likely errored server-side."
+                f"download_report_file {self.screen_id}: response was not valid {fmt} "
+                f"(expected content-type {expected_ct!r}, got "
+                f"{r2.headers.get('content-type')!r}; first bytes={r2.content[:16]!r}) — "
+                f"the report likely errored server-side, or this instance rejects the "
+                f"{fmt} export enum value (verify the exact casing in a browser capture)."
             )
         return r2.content

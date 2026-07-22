@@ -8799,19 +8799,24 @@ async def download_classic_report(
     out_path: str,
     parameters: list[dict] | None = None,
     report_filename: str | None = None,
+    fmt: str = "pdf",
     instance: str | None = None,
 ) -> Any:
     """Render a CLASSIC report screen (AP630500, AR6xxxxx, SM2xxxxx family — the ones
     screen_capabilities/ui_get_structure fail on with "the view doesn't exist") and
-    save the rendered PDF to disk. Fully headless — no browser, no SM207060 endpoint
-    entity needed.
+    save the rendered file (PDF or Excel) to disk. Fully headless — no browser, no
+    SM207060 endpoint entity needed.
 
     This is a DIFFERENT mechanism from run_report (which drives a contract-REST
     Report-type endpoint entity — requires SM207060 setup per report and only works
     for screens with modern-UI Views). This tool drives the classic ASPX report-viewer
     handler directly (reverse-engineered from a live browser capture): a launcher page
-    yields an `__instanceKey`, then PX.ReportViewer.axd?OpType=PdfReport returns the
-    PDF bytes. Works for ANY classic report screen — no per-report setup at all.
+    yields an `__instanceKey`, then PX.ReportViewer.axd returns the rendered bytes.
+    Works for ANY classic report screen — no per-report setup at all.
+
+    fmt: "pdf" (default) or "excel" (a real .xlsx — correct MIME type + ZIP structure,
+        verified against a live DB read of the same data). Both live-proven on
+        AP630500. Any other value is rejected before the request is made.
 
     parameters: submit()-style commands to set the report's filter fields first, e.g.
         [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"},
@@ -8823,9 +8828,6 @@ async def download_classic_report(
     report_filename: override the default "{screen_id}.rpx" report-file guess if a
         screen's underlying report differs from its screen ID (rare).
 
-    Live-proven: AP630500 (AP Aged Period-Sensitive), 4-row report, PDF content
-    verified against a live DB read of the same records.
-
     Requires "allow_write": true (parameters are applied via a real screen Submit).
     out_path must be within the instance's write_roots (if configured).
     """
@@ -8833,10 +8835,12 @@ async def download_classic_report(
     dest = _check_write_path(out_path, instance)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        data = await s.download_report_pdf(parameters=parameters, report_filename=report_filename)
+        data = await s.download_report_file(
+            parameters=parameters, report_filename=report_filename, fmt=fmt)
     dest.write_bytes(data)
     return {
         "screen_id": screen_id,
+        "fmt": fmt,
         "bytes": len(data),
         "path": out_path,
         "parameters": parameters or [],

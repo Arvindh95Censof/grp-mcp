@@ -1775,7 +1775,7 @@ An approver is a workgroup MEMBER, which is an employee's Contact. The whole cha
 The map is BUILT but does not GATE postings until it is wired into the module's approval preferences
 (a separate activation step).
 
-## 18. Classic REPORT screens — headless PDF via the ASPX report-viewer handler (v0.68.9)
+## 18. Classic REPORT screens — headless PDF/Excel via the ASPX report-viewer handler (v0.68.9)
 
 `screen_capabilities`/`ui_get_structure` fail on report screens (`AP630500`, `AR6xxxxx`, `SM2xxxxx`
 family — anything that opens as a Report Parameters + Preview form, not a data-entry grid) with
@@ -1810,14 +1810,29 @@ or accepting per-report SM207060 setup; **prefer `download_classic_report`** —
 ```
 1. GET  {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&unum=0&HideScript=On
      -> HTML containing <input name="__instanceKey" value="<32-hex>" />
-2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&OpType=PdfReport&Refresh=True
-     -> raw PDF bytes (Content-Type: application/pdf)
+2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&<format-specific query>
+     -> raw file bytes
 ```
+
+Step 2's query string is the ONLY thing that varies by output format — same launcher, same
+`__instanceKey`, same session:
+
+| `fmt` | query suffix | Content-Type | magic bytes |
+|---|---|---|---|
+| `pdf` | `OpType=PdfReport&Refresh=True` | `application/pdf` | `%PDF` |
+| `excel` | `OpType=Export&ExportFormat=Excel` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `PK\x03\x04` (zip) |
+
+**The `ExportFormat` enum casing is LOAD-BEARING** — measured live, csmdev `AP630500`: `Excel` works;
+`EXCEL` and `XLS` both return `200 text/html` (a silent HTML error page, not an error status) instead
+of the file. Anything driving this recipe MUST fail loud on a magic-bytes mismatch rather than trust
+the 200 status — `download_report_file` does this (raises `ScreenError` if the response doesn't start
+with the expected prefix for the requested `fmt`).
 
 Both requests ride the SAME cookie session as `screen_submit`/`screen_get` (`ScreenClient._http`) —
 no separate login. The launcher page's `__instanceKey` is assigned ONCE per browser tab/session and
 reused for every subsequent viewer call (confirmed live: the same key served the HTML preview,
-`OpType=Report`, AND the PDF, `OpType=PdfReport`, across multiple clicks).
+`OpType=Report`, the PDF, `OpType=PdfReport`, AND the Excel export, `OpType=Export&ExportFormat=Excel`,
+across multiple calls in the same session).
 
 **Parameters are read from the screen's live session state, not from the launcher request.** Set them
 first with a normal `submit()`/`screen_submit` call (friendly names from `screen_get_schema`'s
@@ -1828,15 +1843,21 @@ last-used report parameters **server-side per user+screen**. Omitting `parameter
 last set (by anyone driving that screen for that user) — pass them explicitly for a deterministic run.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
-name is plain `ReportLauncher.aspx`. `download_report_pdf`'s `report_filename=` override lets you
+name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
 point at a different `.rpx` if the `{ScreenID}.rpx` convention doesn't hold, but the LAUNCHER PAGE
 NAME itself (`CensofReportLauncher.aspx` vs `ReportLauncher.aspx`) is currently hardcoded to the
 Censof-branded name — an instance without that branding customization will 404 on step 1 and need the
 stock name substituted in code (not yet made configurable — no non-Censof instance tested).
 
-Live-proven end to end: `AP630500`, 4-row AP Aged Period-Sensitive report, 4386-byte PDF, magic bytes
-`%PDF-1.7`, content verified (correctly listed the same 4 `Bill` records a live DB read returned, with
-matching aging-bucket amounts and a netting balance of 0.00).
+Live-proven end to end: `AP630500`, 4-row AP Aged Period-Sensitive report —
+- **PDF**: 4386 bytes, magic bytes `%PDF-1.7`.
+- **Excel**: 6631 bytes, correct `.xlsx` MIME type + ZIP magic bytes; `xl/sharedStrings.xml` inspected
+  directly (openpyxl's strict stylesheet parser chokes on this file's `Fill` definitions — a known
+  openpyxl brittleness with some generators' minor spec deviations, NOT evidence of a broken file; the
+  raw OOXML is well-formed and real Excel/LibreOffice open it fine).
+
+Both formats' content matched the same live DB read of the same 4 `Bill` records (aging-bucket
+amounts, netting balance of 0.00).
 
 ---
 

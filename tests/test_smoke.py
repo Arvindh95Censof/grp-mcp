@@ -3704,15 +3704,15 @@ def test_get_bytes_retries_once_on_401(monkeypatch):
     assert calls["auth"] == 2
 
 
-# --- download_report_pdf: classic ASPX report-viewer handler (reverse-engineered
+# --- download_report_file: classic ASPX report-viewer handler (reverse-engineered
 # from a live browser capture, csmdev AP630500, 2026-07-22) — the headless path for
 # report screens that have no modern-UI Views (run_report/screen_capabilities can't
-# reach them at all: "the view doesn't exist"). ------------------------------------
+# reach them at all: "the view doesn't exist"). Supports pdf + excel. --------------
 
 class _FakeGetResp:
-    """httpx.Response stand-in for download_report_pdf's raw self._http.get() calls
-    — needs BOTH .text (launcher HTML parse) and .content (PDF bytes check), which
-    _FakeRawResp below (built for AcumaticaClient's shape) doesn't carry."""
+    """httpx.Response stand-in for download_report_file's raw self._http.get() calls
+    — needs BOTH .text (launcher HTML parse) and .content (PDF/Excel bytes check),
+    which _FakeRawResp below (built for AcumaticaClient's shape) doesn't carry."""
     def __init__(self, status_code=200, text="", content=b"", headers=None):
         self.status_code = status_code
         self.text = text
@@ -3723,7 +3723,7 @@ class _FakeGetResp:
 def _report_client(get_responses, submit_result=None, submit_calls=None):
     """A ScreenClient stand-in with _http.get() stubbed to a canned response queue
     and submit() stubbed to a canned result — same object.__new__ pattern used for
-    ui_import_xml above, so download_report_pdf's REAL control flow runs."""
+    ui_import_xml above, so download_report_file's REAL control flow runs."""
     import types
     c = object.__new__(ScreenClient)
     c.screen_id = "AP630500"
@@ -3749,14 +3749,14 @@ _LAUNCHER_HTML_OK = (
 )
 
 
-def test_download_report_pdf_happy_path_sets_params_then_fetches_pdf():
+def test_download_report_file_happy_path_sets_params_then_fetches_pdf():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
         _FakeGetResp(200, content=b"%PDF-1.7 fake bytes",
                      headers={"content-type": "application/pdf"}),
     ])
     params = [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"}]
-    data = asyncio.run(ScreenClient.download_report_pdf(c, parameters=params))
+    data = asyncio.run(ScreenClient.download_report_file(c, parameters=params))
     assert data == b"%PDF-1.7 fake bytes"
     assert calls[0] == params                                    # submit ran first
     assert calls[1][1].endswith("AP630500.rpx&unum=0&HideScript=On")
@@ -3764,52 +3764,82 @@ def test_download_report_pdf_happy_path_sets_params_then_fetches_pdf():
     assert "OpType=PdfReport" in calls[2][1]
 
 
-def test_download_report_pdf_skips_submit_when_no_parameters():
+def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
+    c, calls = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"PK\x03\x04 fake xlsx bytes",
+                     headers={"content-type": "application/vnd.openxmlformats-"
+                                               "officedocument.spreadsheetml.sheet"}),
+    ])
+    data = asyncio.run(ScreenClient.download_report_file(c, fmt="excel"))
+    assert data == b"PK\x03\x04 fake xlsx bytes"
+    assert "OpType=Export" in calls[1][1] and "ExportFormat=Excel" in calls[1][1]
+
+
+def test_download_report_file_rejects_unknown_fmt_before_any_request():
+    c, calls = _report_client([])
+    with pytest.raises(ScreenError, match="unknown fmt"):
+        asyncio.run(ScreenClient.download_report_file(c, fmt="csv"))
+    assert calls == []                                           # no request attempted
+
+
+def test_download_report_file_excel_rejects_pdf_bytes_and_vice_versa():
+    # a wrong-format response (e.g. the enum casing trap: EXCEL/XLS silently return
+    # an HTML error page) must fail loud, not return mislabeled bytes
+    c, _ = _report_client([
+        _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+        _FakeGetResp(200, content=b"%PDF-1.7 not excel"),
+    ])
+    with pytest.raises(ScreenError, match="not valid excel"):
+        asyncio.run(ScreenClient.download_report_file(c, fmt="excel"))
+
+
+def test_download_report_file_skips_submit_when_no_parameters():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
         _FakeGetResp(200, content=b"%PDF-1.7 x"),
     ])
-    asyncio.run(ScreenClient.download_report_pdf(c, parameters=None))
+    asyncio.run(ScreenClient.download_report_file(c, parameters=None))
     # only the two GETs — no submit() call recorded
     assert all(isinstance(call, tuple) and call[0] == "GET" for call in calls)
     assert len(calls) == 2
 
 
-def test_download_report_pdf_raises_on_failed_submit_before_any_get():
+def test_download_report_file_raises_on_failed_submit_before_any_get():
     c, calls = _report_client(
         [_FakeGetResp(200, text=_LAUNCHER_HTML_OK)],
         submit_result={"ok": False, "field_errors": ["Branch: invalid value"]},
     )
     with pytest.raises(ScreenError, match="parameter submit failed"):
-        asyncio.run(ScreenClient.download_report_pdf(
+        asyncio.run(ScreenClient.download_report_file(
             c, parameters=[{"set": "Branch", "to": "NOPE"}]))
     # never reached the launcher GET
     assert not any(isinstance(call, tuple) for call in calls)
 
 
-def test_download_report_pdf_raises_when_instance_key_missing():
+def test_download_report_file_raises_when_instance_key_missing():
     c, _ = _report_client([_FakeGetResp(200, text="<html>no key here</html>")])
     with pytest.raises(ScreenError, match="instanceKey not found"):
-        asyncio.run(ScreenClient.download_report_pdf(c))
+        asyncio.run(ScreenClient.download_report_file(c))
 
 
-def test_download_report_pdf_raises_when_response_is_not_pdf():
+def test_download_report_file_raises_when_response_is_not_pdf():
     # e.g. a server-side report error renders an HTML error page with a 200 status
     c, _ = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
         _FakeGetResp(200, content=b"<html>error</html>",
                      headers={"content-type": "text/html"}),
     ])
-    with pytest.raises(ScreenError, match="not a PDF"):
-        asyncio.run(ScreenClient.download_report_pdf(c))
+    with pytest.raises(ScreenError, match="not valid pdf"):
+        asyncio.run(ScreenClient.download_report_file(c))
 
 
-def test_download_report_pdf_honors_report_filename_override():
+def test_download_report_file_honors_report_filename_override():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
         _FakeGetResp(200, content=b"%PDF-1.7 x"),
     ])
-    asyncio.run(ScreenClient.download_report_pdf(c, report_filename="CustomName.rpx"))
+    asyncio.run(ScreenClient.download_report_file(c, report_filename="CustomName.rpx"))
     assert "ID=CustomName.rpx" in calls[0][1]
 
 
