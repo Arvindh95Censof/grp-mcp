@@ -3710,9 +3710,10 @@ def test_get_bytes_retries_once_on_401(monkeypatch):
 # reach them at all: "the view doesn't exist"). Supports pdf + excel. --------------
 
 class _FakeGetResp:
-    """httpx.Response stand-in for download_report_file's raw self._http.get() calls
-    — needs BOTH .text (launcher HTML parse) and .content (PDF/Excel bytes check),
-    which _FakeRawResp below (built for AcumaticaClient's shape) doesn't carry."""
+    """httpx.Response stand-in for download_report_file's raw self._http.get()/post()
+    calls — needs BOTH .text (launcher HTML parse) and .content (PDF/Excel bytes
+    check), which _FakeRawResp below (built for AcumaticaClient's shape) doesn't
+    carry."""
     def __init__(self, status_code=200, text="", content=b"", headers=None):
         self.status_code = status_code
         self.text = text
@@ -3720,32 +3721,53 @@ class _FakeGetResp:
         self.headers = headers or {}
 
 
-def _report_client(get_responses, submit_result=None, submit_calls=None):
-    """A ScreenClient stand-in with _http.get() stubbed to a canned response queue
-    and submit() stubbed to a canned result — same object.__new__ pattern used for
-    ui_import_xml above, so download_report_file's REAL control flow runs."""
+# Subset of AP630500's real "Parameters" container schema (from screen_get_schema) —
+# enough to exercise both the COMBO path (Format, needs _state) and the PXSelector
+# path (PeriodID/Branch, $text only) that set_report_parameters branches on.
+_FAKE_REPORT_SCHEMA = {
+    "containers": {
+        "Parameters": {
+            "ReportFormat": {"object": "Parameters", "field": "Format"},
+            "FinancialPeriod": {"object": "Parameters", "field": "PeriodID"},
+            "Branch": {"object": "Parameters", "field": "BranchID"},
+        }
+    }
+}
+
+
+def _report_client(get_responses, post_response=None, calls=None):
+    """A ScreenClient stand-in with _http.get()/post() and get_schema() stubbed —
+    same object.__new__ pattern used for ui_import_xml above, so
+    download_report_file/set_report_parameters's REAL control flow runs.
+    `calls` records ("GET", url) / ("POST", url, form_dict) in order."""
     import types
     c = object.__new__(ScreenClient)
     c.screen_id = "AP630500"
     c.instance = types.SimpleNamespace(base_url="https://example.invalid/Site")
-    calls = submit_calls if submit_calls is not None else []
+    calls = calls if calls is not None else []
 
-    async def _submit(commands, **kw):
-        calls.append(commands)
-        return submit_result if submit_result is not None else {"ok": True}
-    c.submit = _submit
+    async def _get_schema():
+        calls.append("SCHEMA")
+        return _FAKE_REPORT_SCHEMA
+    c.get_schema = _get_schema
 
     queue = list(get_responses)
     async def _get(url):
         calls.append(("GET", url))
         return queue.pop(0)
-    c._http = types.SimpleNamespace(get=_get)
+
+    async def _post(url, data=None):
+        calls.append(("POST", url, data))
+        return post_response or _FakeGetResp(200, text='s<viewer><![CDATA[True]]></viewer>')
+    c._http = types.SimpleNamespace(get=_get, post=_post)
     return c, calls
 
 
 _LAUNCHER_HTML_OK = (
     '<input type="hidden" name="__instanceKey" id="__instanceKey" '
     'value="d08a6aa2ac714cd39ce16b91fd39e5b3" />'
+    '<input type="hidden" name="__RequestVerificationToken" id="__RequestVerificationToken" '
+    'value="fake-token-123" />'
 )
 
 
@@ -3755,13 +3777,36 @@ def test_download_report_file_happy_path_sets_params_then_fetches_pdf():
         _FakeGetResp(200, content=b"%PDF-1.7 fake bytes",
                      headers={"content-type": "application/pdf"}),
     ])
-    params = [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"}]
+    params = [{"set": "ReportFormat", "to": "Summary"}, {"set": "Branch", "to": "MAIN"}]
     data = asyncio.run(ScreenClient.download_report_file(c, parameters=params))
     assert data == b"%PDF-1.7 fake bytes"
-    assert calls[0] == params                                    # submit ran first
-    assert calls[1][1].endswith("AP630500.rpx&unum=0&HideScript=On")
-    assert "InstanceID=d08a6aa2ac714cd39ce16b91fd39e5b3" in calls[2][1]
-    assert "OpType=PdfReport" in calls[2][1]
+    assert calls[0][1].endswith("AP630500.rpx&unum=0&HideScript=On")   # launcher GET
+    assert calls[1] == "SCHEMA"                                        # schema lookup
+    post_call = calls[2]
+    assert post_call[0] == "POST"
+    form = post_call[2]
+    assert form["__instanceKey"] == "d08a6aa2ac714cd39ce16b91fd39e5b3"
+    assert form["__RequestVerificationToken"] == "fake-token-123"
+    assert form["viewer$par$tab$t0$pForm$edBranchID$text"] == "MAIN"
+    assert "InstanceID=d08a6aa2ac714cd39ce16b91fd39e5b3" in calls[3][1]  # file GET
+    assert "OpType=PdfReport" in calls[3][1]
+
+
+def test_download_report_file_combo_field_gets_state_selector_field_does_not():
+    # Regression test for the exact live bug: sending `_state` for a PXSelector field
+    # (PeriodID) garbled the rendered value ("03-2026" -> "03- 202"); Format genuinely
+    # NEEDS `_state` (a bare $text left it stuck on the default). Never regress either
+    # direction.
+    c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
+    asyncio.run(ScreenClient.set_report_parameters(
+        c, [{"set": "ReportFormat", "to": "Summary"},
+            {"set": "FinancialPeriod", "to": "03-2026"}],
+        "https://example.invalid/launcher", "key123", "tok123"))
+    form = calls[-1][2]
+    assert form["viewer_par_tab_t0_pForm_edFormat_state"] == '<PText Value="S"/>'
+    assert form["viewer$par$tab$t0$pForm$edFormat$text"] == "Summary"
+    assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form   # NOT sent — the fix
+    assert form["viewer$par$tab$t0$pForm$edPeriodID$text"] == "03-2026"
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
@@ -3794,27 +3839,44 @@ def test_download_report_file_excel_rejects_pdf_bytes_and_vice_versa():
         asyncio.run(ScreenClient.download_report_file(c, fmt="excel"))
 
 
-def test_download_report_file_skips_submit_when_no_parameters():
+def test_download_report_file_skips_parameter_step_when_none_given():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
         _FakeGetResp(200, content=b"%PDF-1.7 x"),
     ])
     asyncio.run(ScreenClient.download_report_file(c, parameters=None))
-    # only the two GETs — no submit() call recorded
+    # only the two GETs — no schema lookup, no POST
     assert all(isinstance(call, tuple) and call[0] == "GET" for call in calls)
     assert len(calls) == 2
 
 
-def test_download_report_file_raises_on_failed_submit_before_any_get():
-    c, calls = _report_client(
-        [_FakeGetResp(200, text=_LAUNCHER_HTML_OK)],
-        submit_result={"ok": False, "field_errors": ["Branch: invalid value"]},
-    )
-    with pytest.raises(ScreenError, match="parameter submit failed"):
+def test_download_report_file_raises_on_unknown_parameter_field():
+    c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
+    with pytest.raises(ScreenError, match="unknown Parameters field"):
         asyncio.run(ScreenClient.download_report_file(
-            c, parameters=[{"set": "Branch", "to": "NOPE"}]))
-    # never reached the launcher GET
-    assert not any(isinstance(call, tuple) for call in calls)
+            c, parameters=[{"set": "NotAField", "to": "x"}]))
+    # never reached the POST or the file GET
+    assert not any(isinstance(call, tuple) and call[0] == "POST" for call in calls)
+    assert sum(1 for call in calls if isinstance(call, tuple) and call[0] == "GET") == 1
+
+
+def test_download_report_file_raises_when_verification_token_missing():
+    # parameters given but the launcher HTML lacks __RequestVerificationToken
+    c, _ = _report_client([_FakeGetResp(
+        200, text='<input name="__instanceKey" value="abc123" />')])
+    with pytest.raises(ScreenError, match="RequestVerificationToken"):
+        asyncio.run(ScreenClient.download_report_file(
+            c, parameters=[{"set": "Branch", "to": "MAIN"}]))
+
+
+def test_download_report_file_raises_on_failed_parameter_post():
+    c, _ = _report_client(
+        [_FakeGetResp(200, text=_LAUNCHER_HTML_OK)],
+        post_response=_FakeGetResp(500, text="server error"),
+    )
+    with pytest.raises(ScreenError, match="POST -> HTTP 500"):
+        asyncio.run(ScreenClient.download_report_file(
+            c, parameters=[{"set": "Branch", "to": "MAIN"}]))
 
 
 def test_download_report_file_raises_when_instance_key_missing():

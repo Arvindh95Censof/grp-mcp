@@ -3716,6 +3716,101 @@ class ScreenClient:
                   (b"PK\x03\x04",)),  # .xlsx is a zip container
     }
 
+    # Known SIMPLE COMBO Parameters fields (raw field name -> {display: code}), keyed
+    # lower-case on the display value. ONLY these fields get a `_state=<PText Value=.../>`
+    # override; every other field gets `$text` alone. This split is LOAD-BEARING, not
+    # cosmetic — measured live, AP630500:
+    #   - Format (a plain combo) needs `_state`; `$text` alone silently reverts to the
+    #     screen's default (Detailed) with no error.
+    #   - PeriodID (a PXSelector) breaks when given a `_state` override at all: any
+    #     dash-containing value in `_state`'s PText comes back GARBLED on render (e.g.
+    #     "03-2026" -> "03- 202", consistently, across every period tried) — the
+    #     selector's server-side value parser evidently does NOT expect `_state` content
+    #     the way a plain combo's does. `$text` alone is clean and correct for it.
+    # Unlisted fields (Branch/Company/VendorClass/...) default to the PXSelector-style
+    # $text-only path, since PeriodID is the closest verified analog for that field
+    # shape — but that's an ASSUMPTION for fields not yet tested individually.
+    _COMBO_STATE_FIELDS: dict[str, dict[str, str]] = {
+        "Format": {"detailed": "D", "summary": "S"},
+    }
+
+    async def set_report_parameters(
+        self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
+    ) -> None:
+        """POST an ASPX CALLBACK to the report-launcher page itself, applying
+        `parameters` to the SAME graph instance the launcher renders from.
+
+        This is the REAL parameter mechanism (corrects an earlier wrong claim that
+        submit()/screen_submit against the classic SOAP `.asmx` endpoint worked — it
+        doesn't: that endpoint is a SEPARATE graph instance from the ASPX launcher page,
+        even under the same login cookie, so values set there are invisible to the
+        launcher). Reverse-engineered from a live browser capture (csmdev AP630500,
+        2026-07-22) by hooking XHR/fetch on the launcher's OWN window (a same-origin
+        iframe — hooking only the top window misses its requests):
+
+          POST {launcher_url}  (form-urlencoded)
+            __RequestVerificationToken=<from the launcher GET>
+            __instanceKey=<from the launcher GET>
+            __CALLBACKID=viewer
+            __CALLBACKPARAM=RefreshParams|<viewer LoadedLevel="-1">
+                <![CDATA[<Params/>]]></viewer>
+            + per changed field:
+              viewer$par$tab$t0$pForm$ed<RawField>$text  = <raw display value>  (always)
+              viewer_par_tab_t0_pForm_ed<RawField>_state = <PText Value="<code>"/>
+                  (ONLY for fields in _COMBO_STATE_FIELDS — see its comment for why
+                  sending BOTH for every field is NOT safe: `_state` corrupts PeriodID)
+
+        `<RawField>` is screen_get_schema's "Parameters" container field name for the
+        friendly name given (e.g. FinancialPeriod -> PeriodID, so the control ID is
+        `viewer_par_tab_t0_pForm_edPeriodID`) — the classic control ID is always
+        "ed" + the raw field name, verified for Format and PeriodID, assumed uniform
+        for the rest of the Parameters container.
+
+        Live-proven: AP630500 — ReportFormat "Summary" (title changed to "(Summary)",
+        row structure genuinely collapsed to vendor-level, via $text+_state) and
+        FinancialPeriod "05-2026"/"04-2026"/"03-2026"/"02-2026"/"01-2026" (rendered
+        period label changed cleanly via $text ALONE; period genuinely empty for those
+        months — no bills exist there — matching a live DB check), including both
+        together in one call.
+
+        Raises ScreenError on an unknown friendly field name or a non-2xx response.
+        """
+        schema = await self.get_schema()
+        param_fields = schema.get("containers", {}).get("Parameters", {})
+        form: dict[str, str] = {
+            "__RequestVerificationToken": token,
+            "__EVENTTARGET": "", "__EVENTARGUMENT": "", "__SmartPanelVisible": "",
+            "__instanceKey": instance_key, "viewer_state": "",
+            "__DataSourceSessionID": "", "__DataSourceLoginID": "", "__VIEWSTATE": "",
+            "viewer_par_tName_state": "", "viewer_par_tab_state": "",
+            "viewer_par_tab_t0_pForm_state": "",
+            "viewer$par$tName$text": "", "viewer$par$tDefault": "", "viewer$par$tShared": "",
+            "__CALLBACKID": "viewer",
+            "__CALLBACKPARAM": 'RefreshParams|<viewer LoadedLevel="-1"><![CDATA[<Params/>]]></viewer>',
+        }
+        for cmd in parameters:
+            if "set" not in cmd:
+                continue
+            friendly = str(cmd["set"]).split(".")[-1]  # allow "Parameters.X" qualification
+            value = cmd.get("to", "")
+            entry = param_fields.get(friendly)
+            if entry is None:
+                raise ScreenError(
+                    f"set_report_parameters {self.screen_id}: unknown Parameters field "
+                    f"{friendly!r} — known: {sorted(param_fields)} (from screen_get_schema)"
+                )
+            raw_field = entry["field"]
+            combo = self._COMBO_STATE_FIELDS.get(raw_field)
+            if combo is not None:
+                code = combo.get(str(value).strip().lower(), value)
+                form[f"viewer_par_tab_t0_pForm_ed{raw_field}_state"] = f'<PText Value="{code}"/>'
+            form[f"viewer$par$tab$t0$pForm$ed{raw_field}$text"] = str(value)
+        resp = await self._http.post(launcher_url, data=form)
+        if resp.status_code >= 400:
+            raise ScreenError(
+                f"set_report_parameters {self.screen_id}: POST -> HTTP {resp.status_code}"
+            )
+
     async def download_report_file(
         self,
         parameters: list[dict] | None = None,
@@ -3734,40 +3829,31 @@ class ScreenClient:
         that rides the SAME cookie session as this client's SOAP calls:
 
           1. GET  {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&unum=0&HideScript=On
-             -> HTML containing <input name="__instanceKey" value="<32-hex>" />.
+             -> HTML containing <input name="__instanceKey" value="<32-hex>" /> and
+                <input name="__RequestVerificationToken" value="..." />.
              (Acumatica's stock page is plain "ReportLauncher.aspx" on most instances;
              this csmdev tenant's is Censof-branded — try the stock name as a fallback.)
-          2. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&<format-specific suffix>
+          2. IF parameters given: set_report_parameters() — see its docstring for why
+             this replaced an earlier (wrong) classic-SOAP submit() approach.
+          3. GET  {base}/PX.ReportViewer.axd?InstanceID=<key>&<format-specific suffix>
              -> raw bytes (Content-Type varies by fmt — see _REPORT_FORMATS).
 
         fmt: "pdf" (default) or "excel". Same launcher/instanceKey step either way —
-        only the second GET's query string and expected content differ.
+        only the final GET's query string and expected content differ.
 
-        `parameters` HAS NO CONFIRMED EFFECT (re-tested 2026-07-22, corrects an earlier
-        wrong claim in this docstring). They ARE submitted via a real Submit() before
-        the launcher GET, and that Submit reports ok:true — but the launcher renders
-        the SAME thing (the screen's true default period/format) no matter what value
-        was set: 3 ReportFormat values and 5 FinancialPeriod encodings all rendered
-        identically across fresh sessions. Root cause: the classic SOAP `.asmx`
-        Submit() and the ASPX launcher page are SEPARATE graph instances even under
-        the same login cookie — Submit() writes into a graph the launcher never reads.
-        The original "proof" was a false positive (the test period happened to equal
-        the account's actual default). The REAL parameter mechanism, per the original
-        browser capture, is an ASPX CALLBACK POST to the launcher page itself (two POSTs
-        preceded the launcher GET in that capture, targeting
-        viewer_par_tab_t0_pForm_ed{Format,BranchID,PeriodID,ClassID}_state — the same
-        __CALLBACKPARAM/Command|<envelope> shape aspx.py implements for other screens)
-        — not yet implemented. Until then this always returns the account's DEFAULT
-        period/format for the screen, regardless of `parameters`.
+        parameters: [{"set": "<FriendlyName>", "to": <value>}, ...] using the friendly
+        names from screen_get_schema's "Parameters" container (e.g. ReportFormat/
+        Company/Branch/FinancialPeriod/VendorClass on AP630500). Omit to reuse the
+        report's default period/format for the account. See set_report_parameters()
+        for the mechanism and what's verified vs. assumed.
 
         report_filename: override the "{ScreenID}.rpx" convention if a screen's actual
         report file differs (rare — verified 1:1 for AP630500).
 
-        Live-proven (default period/format only): AP630500, 4-row report — PDF (4386
-        bytes, b"%PDF-1.7") and Excel (6631 bytes, real .xlsx: correct MIME type, ZIP
-        magic bytes, well-formed sharedStrings.xml carrying the same report data) both
-        verified against a live DB read of the same 4 Bills. The fetch/render/format
-        mechanism is sound; only parameter application is broken.
+        Live-proven: AP630500, PDF (4386 bytes, b"%PDF-1.7") and Excel (6631 bytes, real
+        .xlsx: correct MIME type, ZIP magic bytes, well-formed sharedStrings.xml)
+        against a live DB read of the same 4 Bills; both WITH working ReportFormat/
+        FinancialPeriod overrides (see set_report_parameters) and without (defaults).
         """
         if fmt not in self._REPORT_FORMATS:
             raise ScreenError(
@@ -3775,13 +3861,6 @@ class ScreenClient:
                 f"expected one of {sorted(self._REPORT_FORMATS)}"
             )
         query_suffix, expected_ct, magic_prefixes = self._REPORT_FORMATS[fmt]
-        if parameters:
-            result = await self.submit(parameters)
-            if not result.get("ok", True):
-                raise ScreenError(
-                    f"download_report_file {self.screen_id}: parameter submit failed — "
-                    f"{result.get('field_errors') or result.get('messages')}"
-                )
         base = self.instance.base_url.rstrip("/")
         rpt = report_filename or f"{self.screen_id}.rpx"
         launcher_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&unum=0&HideScript=On"
@@ -3798,6 +3877,16 @@ class ScreenClient:
                 f"named launcher page — try report_filename= or check screen_id)."
             )
         instance_key = m.group(1)
+        if parameters:
+            tm = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', r1.text)
+            if not tm:
+                raise ScreenError(
+                    f"download_report_file {self.screen_id}: __RequestVerificationToken not "
+                    f"found in launcher response — cannot apply parameters."
+                )
+            # Post-launcher-URL for the callback omits &unum=0 (matches the live capture).
+            callback_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&HideScript=On"
+            await self.set_report_parameters(parameters, callback_url, instance_key, tm.group(1))
         file_url = f"{base}/PX.ReportViewer.axd?InstanceID={instance_key}&{query_suffix}"
         r2 = await self._http.get(file_url)
         if r2.status_code >= 400:

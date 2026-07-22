@@ -1834,41 +1834,60 @@ reused for every subsequent viewer call (confirmed live: the same key served the
 `OpType=Report`, the PDF, `OpType=PdfReport`, AND the Excel export, `OpType=Export&ExportFormat=Excel`,
 across multiple calls in the same session).
 
-**CORRECTION (2026-07-22, same day) — `parameters` DOES NOT WORK. The claim below this paragraph was
-wrong; it is kept, struck through in spirit, as a record of the mistake.** Re-testing after a user
-asked for a Summary-format / different-period download exposed it: every value tried for
-`ReportFormat` (`Summary`, `S`, `Summarized`) and `FinancialPeriod` (`202512`, `12-2025`, `2025-12`,
-`202606`, `202608` — three different formats, five different periods) rendered IDENTICALLY —
-`Detailed`, `07-2026` — across fresh logins, fresh sessions, varied `unum`. `submit()` itself reports
-`ok:true` with no field errors every time; the values simply never reach what the launcher renders.
+### `parameters` — two wrong turns, then the real mechanism (both 2026-07-22)
 
-**Root cause: the classic SOAP `.asmx` endpoint and the ASPX report-launcher page are SEPARATE graph
-instances**, even under the same login cookie. `screen_submit`'s `Submit` op writes into the
-SOAP-plane's own isolated graph; `CensofReportLauncher.aspx` is a real ASPX WebForms page with its own
-graph, and reads its OWN default — current business period + default format — never the SOAP graph's
-state. The ORIGINAL "live-proven" claim was a false positive: the test value (`202607`) happened to
-equal this account's current business period anyway, so the download looked parameter-driven when it
-was actually just the unconditional default the whole time.
+**First claim (wrong):** "parameters are read from the screen's live session state — pass them via
+`submit()`/`screen_submit`." This was a false positive. The test value (`202607`) happened to equal the
+account's current business period, so the download LOOKED parameter-driven when it was actually just
+rendering the unconditional default. Re-testing with genuinely different values (3 `ReportFormat`
+values, 5 `FinancialPeriod` encodings) proved every one rendered IDENTICALLY regardless of what was
+submitted. **Root cause:** the classic SOAP `.asmx` endpoint (`screen_submit`'s `Submit` op) and the
+ASPX report-launcher page are SEPARATE graph instances, even under the same login cookie — `Submit()`
+writes into a graph the launcher never reads.
 
-**What this means in practice:** `download_report_file`/`download_classic_report`'s `parameters`
-argument currently has NO EFFECT on the rendered report. Every call returns the SAME thing — the
-account's default period + default format for that screen — regardless of what you pass. The
-`report_filename`/`fmt` arguments are unaffected (verified independently: PDF vs Excel genuinely
-differ; format/period do not).
+**The real mechanism** is an ASPX CALLBACK POST to the launcher page itself — captured by hooking
+`XMLHttpRequest`/`fetch` inside the launcher's OWN window (it's a same-origin iframe; hooking only the
+top window misses its requests entirely) while manually changing fields in the browser:
 
-**The real mechanism, per the original browser capture, was there the whole time and got misread:**
-before the launcher GET, the browser fires TWO `POST`s to the SAME `CensofReportLauncher.aspx` URL —
-those are classic ASPX CALLBACK protocol posts (the `__CALLBACKPARAM`/`Command|<envelope>` shape
-`aspx.py` already implements for OTHER screens — see §11), targeting the Report Parameters form's OWN
-controls (`viewer_par_tab_t0_pForm_edFormat_state`, `..._edBranchID_state`, `..._edPeriodID_state`,
-`..._edClassID_state`, seen verbatim in the launcher's hidden-field markup). Applying parameters for
-real means replaying THAT callback against the launcher page itself, not `screen_submit` against the
-`.asmx` endpoint. Not yet built — this is the next concrete step, not a dead end.
+```
+1. GET  {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&unum=0&HideScript=On
+     -> HTML with <input name="__instanceKey" .../> AND
+        <input name="__RequestVerificationToken" .../>
+2. POST {base}/Frames/CensofReportLauncher.aspx?ID={ScreenID}.rpx&HideScript=On
+     __RequestVerificationToken=<from step 1>
+     __instanceKey=<from step 1>
+     __CALLBACKID=viewer
+     __CALLBACKPARAM=RefreshParams|<viewer LoadedLevel="-1"><![CDATA[<Params/>]]></viewer>
+     + per field to set: viewer$par$tab$t0$pForm$ed<RawField>$text = <display value>
+       (RawField = screen_get_schema's Parameters container field name, e.g.
+       FinancialPeriod -> PeriodID; control ID is always "ed" + RawField)
+3. GET  {base}/PX.ReportViewer.axd?InstanceID=<same key>&<format query>   (as before)
+```
 
-Until then: `download_classic_report` without `parameters` (or with them — same result either way) is
-still genuinely useful for "give me the current period's report as PDF/Excel, headless" — that part is
-real and verified. Anyone needing a SPECIFIC period/format from this tool today must still do it in the
-browser.
+`<Params/>` (empty) is enough — the Sorting-column XML seen in the live capture's `__CALLBACKPARAM`
+is NOT required (tested: identical result with and without it), which is what keeps this
+screen-agnostic rather than hardcoded to APRegister's column names.
+
+**One field type needs MORE than `$text` — and this split is load-bearing, not cosmetic.** `ReportFormat`
+is a plain combo: `$text` alone silently reverts to the default (`Detailed`), no error. It ALSO needs
+a `_state` override: `viewer_par_tab_t0_pForm_edFormat_state = <PText Value="D"/>` (`Detailed`) or
+`="S"/>` (`Summary`) — the coded value, not the display text. But sending that SAME `_state` pattern
+for `FinancialPeriod` (a `PXSelector`) — even with a harmless-looking bogus value in `_state` while
+`$text` carried the correct one — **corrupted the render**: every dash-containing period value came
+back garbled (`"03-2026"` → `"03- 202"`, consistently, across five different months). `$text` ALONE is
+clean and correct for it. Conclusion: `_state` is a per-field-type opt-in (`Format` only, so far — see
+`ScreenClient._COMBO_STATE_FIELDS`), never a blanket "send both, it's harmless" — it categorically is
+NOT harmless for at least one common field shape.
+
+Live-proven, `AP630500`, via the actual shipped code (not just the reverse-engineering scratch script):
+`ReportFormat` "Summary"/"Detailed" (title + row structure genuinely change — Summary collapses to
+vendor-level, no document rows) and `FinancialPeriod` across 5 different months (rendered period label
+changes; months with no data render genuinely empty, matching a live DB check; `07-2026` — the month
+with real `Bill` data — still returns the correct 4 rows), including both parameters together in one
+call. Fields beyond these two (`Branch`/`Company`/`VendorClass`/...) are assumed to follow the
+`PXSelector`/`$text`-only pattern (same shape as the verified `FinancialPeriod`) but have not been
+individually tested — an unrecognized friendly name raises a clear `ScreenError` rather than silently
+doing nothing.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
@@ -1877,17 +1896,15 @@ NAME itself (`CensofReportLauncher.aspx` vs `ReportLauncher.aspx`) is currently 
 Censof-branded name — an instance without that branding customization will 404 on step 1 and need the
 stock name substituted in code (not yet made configurable — no non-Censof instance tested).
 
-Live-proven end to end (default period/format — see the correction above re: `parameters`):
-`AP630500`, 4-row AP Aged Period-Sensitive report —
+Live-proven end to end: `AP630500`, AP Aged Period-Sensitive report —
 - **PDF**: 4386 bytes, magic bytes `%PDF-1.7`.
 - **Excel**: 6631 bytes, correct `.xlsx` MIME type + ZIP magic bytes; `xl/sharedStrings.xml` inspected
   directly (openpyxl's strict stylesheet parser chokes on this file's `Fill` definitions — a known
   openpyxl brittleness with some generators' minor spec deviations, NOT evidence of a broken file; the
   raw OOXML is well-formed and real Excel/LibreOffice open it fine).
 
-Both formats' content matched the same live DB read of the same 4 `Bill` records (aging-bucket
-amounts, netting balance of 0.00) — this part is genuinely verified: the FETCH/RENDER/FORMAT mechanism
-is sound, only the PARAMETER-APPLICATION half of the recipe is broken.
+Content matched a live DB read of the same `Bill` records (aging-bucket amounts, netting balance of
+0.00), both with default parameters and with explicit `ReportFormat`/`FinancialPeriod` overrides.
 
 ---
 
