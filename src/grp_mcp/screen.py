@@ -3812,10 +3812,30 @@ class ScreenClient:
     # bare). Genuine "tested, no effect found" results, not skipped tests — left OUT of
     # both registries rather than guessed in either direction.
     #
+    # `OrgBAccountID` (friendly "CompanyBranch", GL632000 "Trial Balance Summary") is a
+    # NINTH gotcha and a genuinely NEW FOURTH wire shape, found 2026-07-23. It is a
+    # "Company/Branch tree selector" — an Org > Branch hierarchy dropdown (CSS class
+    # `branch-selector__*`), NOT a PXSelector magnifier or a PText combo. Its wire form
+    # is unlike all three prior shapes: the value posts on the BARE control name
+    # `viewer$par$tab$t0$pForm$edOrgBAccountID` — with NO `$text` suffix at all — while
+    # `_state` is present but EMPTY. Every other field type posts its value on
+    # `...ed<Field>$text`; this one drops the suffix entirely. That single mismatch is
+    # why it looked completely inert: the tool blindly appended `$text`, so the value
+    # landed on a field name the server doesn't read, and NONE of ~8 attempted PXSelector/
+    # PText/tree-selector `_state` variants moved it (all posted to the wrong bare name).
+    # The fix needed NO full-page postback (an earlier hypothesis, disproven): the
+    # ordinary RefreshParams AJAX callback commits it fine once the value is on the
+    # correct bare name. Live-proven two directions + a control via the shipped callback
+    # path: MAIN -> the populated report (4 real GL accounts, 400.00 dr/cr), YMHQ -> a
+    # genuinely empty report (real branch, no GL activity), and the OLD `$text` shape ->
+    # still a silent no-op (confirming the bug is exactly the field-name suffix). Only
+    # OrgBAccountID is registered — LedgerID/PeriodID on the same screen are ordinary
+    # magnifier selectors, tested to still work via their normal shapes.
+    #
     # Everything else not listed here defaults to case 2 (bare `$text`), which is
     # CORRECT for PeriodID but unverified for any other untested field. Don't extend
-    # either mapping on a guess; measure first — that's exactly how Branch/VendorClass/
-    # Category/VendorType/ItemType/int0 went undetected as broken.
+    # any mapping on a guess; measure first — that's exactly how Branch/VendorClass/
+    # Category/VendorType/ItemType/int0/OrgBAccountID went undetected as broken.
     _PXTEXT_COMBO_FIELDS: dict[str, dict[str, str]] = {
         "Format": {"detailed": "D", "summary": "S"},
         "VendorType": {"vendor": "VE", "employee": "EE"},
@@ -3824,6 +3844,9 @@ class ScreenClient:
     _LOOKUP_SELECTOR_FIELDS: set[str] = {
         "BranchID", "ClassID", "OrganizationID", "CategoryValue", "int0",
     }
+    # Fields whose value posts on the BARE control name (no `$text` suffix), `_state`
+    # present-but-empty — the Company/Branch tree-selector shape. See the block above.
+    _BARE_NAME_FIELDS: set[str] = {"OrgBAccountID"}
 
     async def set_report_parameters(
         self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
@@ -3845,12 +3868,16 @@ class ScreenClient:
             __CALLBACKID=viewer
             __CALLBACKPARAM=RefreshParams|<viewer LoadedLevel="-1">
                 <![CDATA[<Params/>]]></viewer>
-            + per changed field:
-              viewer$par$tab$t0$pForm$ed<RawField>$text  = <value>  (always sent)
+            + per changed field, ONE of four shapes (keyed by raw field name):
+              viewer$par$tab$t0$pForm$ed<RawField>$text  = <value>  (default; the
+                  value field for every shape EXCEPT bare-name — see below)
               viewer_par_tab_t0_pForm_ed<RawField>_state = ...      (field-type-specific
                   — see _PXTEXT_COMBO_FIELDS / _LOOKUP_SELECTOR_FIELDS; OMITTED
                   entirely for a bare selector like PeriodID, where sending it at all
                   corrupts the value)
+              BARE-NAME shape (_BARE_NAME_FIELDS, e.g. OrgBAccountID): the value posts
+                  on viewer$par$tab$t0$pForm$ed<RawField> — NO `$text` suffix — and
+                  `_state` is present-but-empty.
 
         `<RawField>` is screen_get_schema's "Parameters" container field name for the
         friendly name given (e.g. FinancialPeriod -> PeriodID, so the control ID is
@@ -3888,18 +3915,25 @@ class ScreenClient:
           clean under the same treatment.
         All confirmed together in combined calls (format+period, branch+class+period).
 
-        Any field not in _PXTEXT_COMBO_FIELDS or _LOOKUP_SELECTOR_FIELDS defaults to
-        the BARE SELECTOR (`$text`-only) shape — correct for PeriodID, unverified for
-        anything else not yet individually tested. `AttributeID` (raw `attributeID`,
-        Category's paired dimension-selector), `Int1` (Int0's apparent pair), and
-        `DeffNull` were all A/B tested directly (every shape, in Int1/DeffNull's case)
-        and made no observable difference — left out of both registries rather than
-        guessed into either.
+        Live-proven WORKING, GL632000 "Trial Balance Summary":
+        - CompanyBranch (`OrgBAccountID`) — via the FOURTH shape, BARE NAME (see
+          _BARE_NAME_FIELDS): the value posts on the bare control name with NO `$text`
+          suffix, `_state` present-but-empty. MAIN -> the populated report (4 real GL
+          accounts, 400.00 dr/cr), YMHQ -> a genuinely empty report; the OLD `$text`
+          shape still no-op'd (confirming the bug was exactly the field-name suffix).
+          Combined with FinancialPeriod in one call.
+
+        Any field in NONE of the registries defaults to the BARE SELECTOR (`$text`-only,
+        no `_state`) shape — correct for PeriodID, unverified for anything else not yet
+        individually tested. `AttributeID` (raw `attributeID`, Category's paired
+        dimension-selector), `Int1` (Int0's apparent pair), and `DeffNull` were all A/B
+        tested directly (every shape, in Int1/DeffNull's case) and made no observable
+        difference — left out of every registry rather than guessed into one.
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
-        but NOT on a recognized field whose shape hasn't been verified and turns out
-        to silently no-op (as Branch/VendorClass/Category/VendorType/ItemType/Int0 did
-        before their fixes).
+        but NOT on a recognized field whose shape hasn't been verified and turns out to
+        silently no-op (as Branch/VendorClass/Category/VendorType/ItemType/Int0/
+        CompanyBranch did before their fixes).
         """
         schema = await self.get_schema()
         param_fields = schema.get("containers", {}).get("Parameters", {})
@@ -3927,6 +3961,13 @@ class ScreenClient:
                 )
             raw_field = entry["field"]
             control = f"viewer_par_tab_t0_pForm_ed{raw_field}"
+            if raw_field in self._BARE_NAME_FIELDS:
+                # Company/Branch tree-selector: value on the BARE control name (NO
+                # `$text` suffix), `_state` present-but-empty. This is the ONLY shape
+                # that does not append `$text`, so it's handled first and standalone.
+                form[f"viewer$par$tab$t0$pForm$ed{raw_field}"] = str(value)
+                form[f"{control}_state"] = ""
+                continue
             combo = self._PXTEXT_COMBO_FIELDS.get(raw_field)
             if combo is not None:
                 code = combo.get(str(value).strip().lower(), value)

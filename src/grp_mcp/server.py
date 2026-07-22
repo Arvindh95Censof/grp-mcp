@@ -8859,6 +8859,14 @@ async def download_classic_report(
         KNOWLEDGE.md §18 for the field-type shapes this now handles automatically (you
         don't need to know which shape a field uses).
 
+        Also live-verified on GL632000 "Trial Balance Summary": CompanyBranch
+        (OrgBAccountID) — a FOURTH wire shape, a Company/Branch tree selector whose
+        value posts on the BARE control name (no `$text` suffix). MAIN -> the populated
+        report, YMHQ -> a genuinely empty one; the old universal-`$text` shape still
+        no-op'd, confirming the bug was exactly the field-name suffix. This is a
+        different classic-report screen family than AP630500 but the SAME launcher/
+        callback mechanism — the shape registry is per-field, so it composes.
+
         AttributeID (Category's paired dimension-selector), Int1 (Int0's apparent
         pair), and DeffNull were all A/B tested directly (every shape, for Int1/
         DeffNull) and made no observable difference — deliberately left unresolved

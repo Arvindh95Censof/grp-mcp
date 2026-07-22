@@ -3735,6 +3735,7 @@ _FAKE_REPORT_SCHEMA = {
             "VendorType": {"object": "Parameters", "field": "VendorType"},
             "ItemType": {"object": "Parameters", "field": "ItemType"},
             "Int0": {"object": "Parameters", "field": "int0"},
+            "CompanyBranch": {"object": "Parameters", "field": "OrgBAccountID"},
         }
     }
 }
@@ -3844,6 +3845,24 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     assert form["viewer$par$tab$t0$pForm$edCategoryValue$text"] == "TESTCAT"
     assert form["viewer_par_tab_t0_pForm_edint0_state"] == '<PXSelector Value="999"/>'
     assert form["viewer$par$tab$t0$pForm$edint0$text"] == "999"
+
+
+def test_download_report_file_bare_name_field_omits_text_suffix():
+    # shape 4: BARE NAME (GL632000 CompanyBranch / OrgBAccountID — a Company/Branch tree
+    # selector). The value posts on the bare control name with NO `$text` suffix, and
+    # `_state` is present-but-empty. Live-proven: the tool's universal `$text` suffix
+    # was landing the value on a field the server never reads, so branch filtering
+    # silently no-op'd on GL632000 until this shape was added.
+    c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
+    asyncio.run(ScreenClient.set_report_parameters(
+        c, [{"set": "CompanyBranch", "to": "YMHQ"}],
+        "https://example.invalid/launcher", "key123", "tok123"))
+    form = calls[-1][2]
+    # value on the BARE name, NOT on `...$text`
+    assert form["viewer$par$tab$t0$pForm$edOrgBAccountID"] == "YMHQ"
+    assert "viewer$par$tab$t0$pForm$edOrgBAccountID$text" not in form
+    # `_state` present but empty (matches the browser)
+    assert form["viewer_par_tab_t0_pForm_edOrgBAccountID_state"] == ""
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():

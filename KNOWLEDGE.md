@@ -1913,15 +1913,18 @@ Two things worth knowing before assuming this needs more than it does:
 - `$text` does NOT need the `"<code> - <Description>"` form the UI displays — the bare code alone
   works (tested: `$text="STAFF"` filtered correctly, same as `$text="STAFF - General Staff (Dummy)"`).
 
-So there are now THREE field-type shapes, not two — `ScreenClient` picks the right one per field via
-two explicit registries (`_PXTEXT_COMBO_FIELDS`, `_LOOKUP_SELECTOR_FIELDS`); anything in neither
-defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
+So there are now FOUR field-type shapes, not two — `ScreenClient` picks the right one per field via
+three explicit registries (`_PXTEXT_COMBO_FIELDS`, `_LOOKUP_SELECTOR_FIELDS`, `_BARE_NAME_FIELDS`);
+anything in none of them defaults to the bare-`$text` shape that's correct for `FinancialPeriod`.
+Note the value's POST FIELD NAME is `...ed<Field>$text` for every shape EXCEPT bare-name, which drops
+the `$text` suffix entirely — that one-token difference is what makes bare-name fields look inert:
 
-| Shape | Fields (verified) | `_state` | `$text` |
+| Shape | Fields (verified) | value field name | `_state` |
 |---|---|---|---|
-| PXTEXT COMBO | `Format`, `VendorType`, `ItemType` | `<PText Value="<code>"/>` — REQUIRED | full value |
-| BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
-| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue`, `int0` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
+| PXTEXT COMBO | `Format`, `VendorType`, `ItemType` | `ed<Field>$text` | `<PText Value="<code>"/>` — REQUIRED |
+| BARE SELECTOR | `PeriodID` | `ed<Field>$text` | **omit entirely** — sending it AT ALL corrupts the value |
+| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue`, `int0` | `ed<Field>$text` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed |
+| BARE NAME | `OrgBAccountID` | `ed<Field>` — **NO `$text` suffix** | present but EMPTY |
 
 Live-proven WORKING via the actual shipped code (not just the reverse-engineering scratch script):
 `Branch` (`MAIN` includes the test vendor's bills, `YMHQ` correctly excludes them — a genuinely
@@ -1988,7 +1991,26 @@ report rather than being fully independent filters — unconfirmed, not pursued 
 are deliberately left OUT of both shape registries — not because they weren't tested, but because they
 were tested and the result was negative. This completes every field in AP630500's Parameters container.
 
-**The meta-lesson, stated plainly because it cost SIX ship cycles now:** a field that is
+**`CompanyBranch` (`OrgBAccountID`) on GL632000 — a NINTH gotcha and the FOURTH wire shape, found
+2026-07-23 on a DIFFERENT report screen ("Trial Balance Summary").** This one nearly got mislabeled
+"needs a full-page postback, out of scope" — the browser's RUN REPORT does a full form navigation, and
+~8 attempted `_state` shape variants (PXSelector with branch code / padded / numeric BAccountID,
+PXTreeSelector, PText, org-level code, bare `$text`) ALL rendered byte-identical to baseline, which
+looked like the AJAX callback simply couldn't reach this field. The real cause was one token: the
+field is a "Company/Branch tree selector" widget (CSS `branch-selector__*`, an Org > Branch hierarchy
+dropdown), and its value posts on the BARE control name `viewer$par$tab$t0$pForm$edOrgBAccountID` —
+with **no `$text` suffix** — while `_state` is present-but-empty. Every other field posts on
+`...ed<Field>$text`; the tool's universal `$text` append landed the value on a name the server never
+reads. Found by reading the live form's element NAMES directly (`form.elements[...].name`) after the
+tree dropdown wouldn't reliably click — the DOM element's `id` still ends in `_text`, but its submit
+`name` is the bare field, an easy thing to miss. No postback rebuild needed: the ordinary RefreshParams
+callback commits it fine once the value is on the right name. Live-proven two directions + a control
+via the shipped `download_report_file`: `CompanyBranch="MAIN"` -> the populated report (4 GL accounts,
+400.00 dr/cr), `"YMHQ"` -> a genuinely empty report, old `$text` shape -> still a silent no-op. Only
+`OrgBAccountID` is registered; `LedgerID`/`PeriodID` on the same screen are ordinary magnifier
+selectors that still work via their normal shapes.
+
+**The meta-lesson, stated plainly because it cost SEVEN ship cycles now:** a field that is
 structurally/visually identical to a previously-verified field (Branch and Company both LOOK like
 `FinancialPeriod` — a text box with a magnifier icon; VendorType and ItemType both LOOK like Format — a
 dropdown combo) can use a completely different wire protocol underneath — and a field that isn't even
@@ -1997,7 +2019,10 @@ nothing; the only way to tell which is an A/B test against the rendered output, 
 way, and not even a reliable browser capture where one's available (this round's proof came entirely
 from scripted POSTs, no browser reverse-engineering at all). Never extend a verified pattern to a new
 field — including a "no error, no visible change" result, which is exactly what BOTH a truly inert field
-and a silently-no-op'd wrong-shape field look like from the outside.
+and a silently-no-op'd wrong-shape field look like from the outside. And `CompanyBranch` adds one more
+edge to the lesson: when several `_state` variants all fail identically, don't assume the whole
+MECHANISM is wrong (the "needs a full postback" dead-end) — check the value's POST FIELD NAME first,
+because a widget can quietly drop the `$text` suffix every other field uses.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
