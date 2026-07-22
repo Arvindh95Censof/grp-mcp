@@ -8845,16 +8845,21 @@ async def download_classic_report(
         same two-direction proof as Branch/VendorClass), and ItemType ("Both" vs
         "Normal" — the printed label changed to the server's OWN text, not the
         caller's guess, proving the code is validated server-side even though this
-        tenant's test data didn't exercise row-level filtering), all confirmed
-        together in combined calls. Three prior releases shipped Branch/VendorClass,
-        then Category, then VendorType/ItemType defaulting to the wrong wire shape and
-        silently no-op'ing; all are fixed — see KNOWLEDGE.md §18 for the field-type
-        shapes this now handles automatically (you don't need to know which shape a
-        field uses).
+        tenant's test data didn't exercise row-level filtering), and Int0 (a
+        non-matching value emptied the report the same way Category's did — verified
+        NOT a generic "any malformed selector breaks it" artifact via a control test:
+        a fictitious field name and a genuinely-correct value on a real field both
+        rendered clean), all confirmed together in combined calls. Four prior releases
+        shipped Branch/VendorClass, then Category, then VendorType/ItemType, then Int0
+        defaulting to the wrong wire shape and silently no-op'ing; all are fixed — see
+        KNOWLEDGE.md §18 for the field-type shapes this now handles automatically (you
+        don't need to know which shape a field uses).
 
-        AttributeID (Category's paired dimension-selector) was A/B tested directly and
-        made no observable difference either way — its shape is deliberately left
-        unresolved rather than guessed.
+        AttributeID (Category's paired dimension-selector), Int1 (Int0's apparent
+        pair), and DeffNull were all A/B tested directly (every shape, for Int1/
+        DeffNull) and made no observable difference — deliberately left unresolved
+        rather than guessed either way. Every Parameters field on AP630500 has now
+        been individually tested.
 
         Any Parameters field not yet individually tested defaults to the shape
         verified for FinancialPeriod, which may not be correct for every field. An

@@ -1921,7 +1921,7 @@ defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
 |---|---|---|---|
 | PXTEXT COMBO | `Format`, `VendorType`, `ItemType` | `<PText Value="<code>"/>` — REQUIRED | full value |
 | BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
-| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
+| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue`, `int0` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
 
 Live-proven WORKING via the actual shipped code (not just the reverse-engineering scratch script):
 `Branch` (`MAIN` includes the test vendor's bills, `YMHQ` correctly excludes them — a genuinely
@@ -1969,7 +1969,26 @@ so this was proven by direct A/B POST instead, same discipline, different tool.
   test bills carry no inventory lines that would differ across item-type buckets), so this one has a
   label proof but not a row-filtering proof — a real but weaker tier than VendorType's.
 
-**The meta-lesson, stated plainly because it cost FIVE ship cycles now:** a field that is
+**`Int0` — an EIGHTH gotcha, found 2026-07-23, closing out the LAST untested AP630500 Parameters
+fields (`Int0`, `Int1`, `DeffNull`).** Unlike Category/AttributeID it doesn't even have a DOM element
+on the launcher page at all — a stronger "looks inert" signal than any prior field got, and still
+wrong: `_state=<PXSelector Value="999"/>` (a value matching nothing) emptied the report with the SAME
+"Supplied-by Vendor" grouping signature Category's proof showed. Before trusting that, a control test
+ruled out the scarier alternative explanation — "any malformed `PXSelector` `_state` anywhere breaks
+the report," which would have invalidated Category's proof too: a completely fictitious field name
+under the identical malformed treatment, and a real field with a genuinely correct value
+(`BranchID="MAIN"`), both rendered clean and unfiltered. Only `int0` (and `Category`) actually changed
+anything, so the emptying is real and field-specific. Also worth recording: `int0` and `CategoryValue`
+trigger the IDENTICAL grouping signature, hinting they may share the same underlying subsystem in the
+report rather than being fully independent filters — unconfirmed, not pursued further.
+
+**`Int1` and `DeffNull` — genuinely tested, genuinely no effect found.** `int1` alone, and paired with
+`int0`, produced no observable change either time. `deffNull` was tried under all three wire shapes
+(PXTEXT COMBO, LOOKUP SELECTOR, bare `$text`) and came back byte-identical to baseline every time. Both
+are deliberately left OUT of both shape registries — not because they weren't tested, but because they
+were tested and the result was negative. This completes every field in AP630500's Parameters container.
+
+**The meta-lesson, stated plainly because it cost SIX ship cycles now:** a field that is
 structurally/visually identical to a previously-verified field (Branch and Company both LOOK like
 `FinancialPeriod` — a text box with a magnifier icon; VendorType and ItemType both LOOK like Format — a
 dropdown combo) can use a completely different wire protocol underneath — and a field that isn't even

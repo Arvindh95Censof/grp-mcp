@@ -3734,6 +3734,7 @@ _FAKE_REPORT_SCHEMA = {
             "Category": {"object": "Parameters", "field": "CategoryValue"},
             "VendorType": {"object": "Parameters", "field": "VendorType"},
             "ItemType": {"object": "Parameters", "field": "ItemType"},
+            "Int0": {"object": "Parameters", "field": "int0"},
         }
     }
 }
@@ -3810,7 +3811,8 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     #      VendorClass filter did nothing, Category left the report unfiltered).
     # VendorType/ItemType are ALSO PXTEXT COMBO (shape 1) — a third release shipped
     # these defaulting to shape 2 too (VendorType filter did nothing, ItemType label
-    # never changed from "Both").
+    # never changed from "Both"). Int0 is ALSO LOOKUP SELECTOR (shape 3) — a fourth
+    # release shipped it defaulting to shape 2 too, silently leaving it unfiltered.
     c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
     asyncio.run(ScreenClient.set_report_parameters(
         c, [{"set": "ReportFormat", "to": "Summary"},
@@ -3819,7 +3821,8 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
             {"set": "Company", "to": "YM"},
             {"set": "Category", "to": "TESTCAT"},
             {"set": "VendorType", "to": "Employee"},
-            {"set": "ItemType", "to": "Normal"}],
+            {"set": "ItemType", "to": "Normal"},
+            {"set": "Int0", "to": "999"}],
         "https://example.invalid/launcher", "key123", "tok123"))
     form = calls[-1][2]
     # shape 1: PXTEXT COMBO
@@ -3839,6 +3842,8 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     assert form["viewer$par$tab$t0$pForm$edOrganizationID$text"] == "YM"
     assert form["viewer_par_tab_t0_pForm_edCategoryValue_state"] == '<PXSelector Value="TESTCAT"/>'
     assert form["viewer$par$tab$t0$pForm$edCategoryValue$text"] == "TESTCAT"
+    assert form["viewer_par_tab_t0_pForm_edint0_state"] == '<PXSelector Value="999"/>'
+    assert form["viewer$par$tab$t0$pForm$edint0$text"] == "999"
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():

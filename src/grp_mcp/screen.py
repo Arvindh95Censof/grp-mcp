@@ -3790,17 +3790,38 @@ class ScreenClient:
     #     proof exists here, not a row-filtering proof; still enough to confirm the
     #     field is read and applied, not inert.
     #
+    # `int0` (friendly "Int0") is an EIGHTH gotcha, found 2026-07-23 covering the
+    # remaining untested AP630500 Parameters fields. Unlike Category/AttributeID it
+    # doesn't even have a DOM element on the launcher page at all (Category/AttributeID
+    # at least rendered as 0x0 hidden inputs) — a stronger "looks inert" signal than
+    # any prior field got, and still wrong: `_state=<PXSelector Value="999"/>` (a value
+    # that matches nothing) switched the report to the SAME grouped "Supplied-by
+    # Vendor" layout and emptied it, exactly like Category's proof. Before trusting
+    # that, a sanity sweep ruled out "any malformed PXSelector state anywhere breaks
+    # the report" as the real cause (which would have invalidated Category's proof
+    # too): a completely fictitious field name with the same malformed shape, and a
+    # real field with a genuinely correct value (Branch=MAIN), both rendered clean and
+    # unfiltered — only int0 (and Category) actually changed anything. Also worth
+    # recording: int0 and CategoryValue both trigger the identical "Supplied-by Vendor"
+    # layout signature, suggesting they may share the same underlying grouping
+    # subsystem in the report rather than being fully independent filters — unconfirmed.
+    #
+    # `int1` and `deffNull` were BOTH tested and came back with NO observable effect —
+    # int1 alone, int1 paired with int0, deffNull via all three shapes (combo/lookup/
+    # bare). Genuine "tested, no effect found" results, not skipped tests — left OUT of
+    # both registries rather than guessed in either direction.
+    #
     # Everything else not listed here defaults to case 2 (bare `$text`), which is
     # CORRECT for PeriodID but unverified for any other untested field. Don't extend
     # either mapping on a guess; measure first — that's exactly how Branch/VendorClass/
-    # Category/VendorType/ItemType went undetected as broken.
+    # Category/VendorType/ItemType/int0 went undetected as broken.
     _PXTEXT_COMBO_FIELDS: dict[str, dict[str, str]] = {
         "Format": {"detailed": "D", "summary": "S"},
         "VendorType": {"vendor": "VE", "employee": "EE"},
         "ItemType": {"both": "B", "normal": "N"},
     }
     _LOOKUP_SELECTOR_FIELDS: set[str] = {
-        "BranchID", "ClassID", "OrganizationID", "CategoryValue",
+        "BranchID", "ClassID", "OrganizationID", "CategoryValue", "int0",
     }
 
     async def set_report_parameters(
@@ -3859,18 +3880,24 @@ class ScreenClient:
           changed the printed label to the server's OWN "Normal Items Only" text
           (not the caller's guessed `$text`), proving the code is validated
           server-side; row data was unaffected by this particular test data.
+        - Int0 — via LOOKUP SELECTOR shape: a non-matching value emptied the report
+          the same way Category's did (same "Supplied-by Vendor" grouping signature),
+          verified NOT to be a generic "any malformed selector breaks it" artifact —
+          a fictitious field name and a genuinely-correct real field both rendered
+          clean under the same treatment.
         All confirmed together in combined calls (format+period, branch+class+period).
 
         Any field not in _PXTEXT_COMBO_FIELDS or _LOOKUP_SELECTOR_FIELDS defaults to
         the BARE SELECTOR (`$text`-only) shape — correct for PeriodID, unverified for
         anything else not yet individually tested. `AttributeID` (raw `attributeID`,
-        Category's paired dimension-selector) was A/B tested directly and its shape
-        made no observable difference — left out of the lookup registry rather than
-        guessed in.
+        Category's paired dimension-selector), `Int1` (Int0's apparent pair), and
+        `DeffNull` were all A/B tested directly (every shape, in Int1/DeffNull's case)
+        and made no observable difference — left out of both registries rather than
+        guessed into either.
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
         but NOT on a recognized field whose shape hasn't been verified and turns out
-        to silently no-op (as Branch/VendorClass/Category/VendorType/ItemType did
+        to silently no-op (as Branch/VendorClass/Category/VendorType/ItemType/Int0 did
         before their fixes).
         """
         schema = await self.get_schema()
