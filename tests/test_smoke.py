@@ -3792,21 +3792,33 @@ def test_download_report_file_happy_path_sets_params_then_fetches_pdf():
     assert "OpType=PdfReport" in calls[3][1]
 
 
-def test_download_report_file_combo_field_gets_state_selector_field_does_not():
-    # Regression test for the exact live bug: sending `_state` for a PXSelector field
-    # (PeriodID) garbled the rendered value ("03-2026" -> "03- 202"); Format genuinely
-    # NEEDS `_state` (a bare $text left it stuck on the default). Never regress either
-    # direction.
+def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
+    # Regression test for the THREE distinct wire shapes a Parameters field can need —
+    # sending the wrong one either no-ops silently or corrupts the value. All three
+    # bugs were caught live before shipping:
+    #   1. PXTEXT COMBO (Format): needs _state=<PText .../> — $text alone silently
+    #      reverts to the default.
+    #   2. BARE SELECTOR (PeriodID): _state must be OMITTED — sending it at all
+    #      garbled the rendered value ("03-2026" -> "03- 202").
+    #   3. LOOKUP SELECTOR (Branch/VendorClass/Company): needs _state=<PXSelector .../>
+    #      — an earlier release shipped these defaulting to shape 2 ($text-only) and
+    #      they silently no-op'd (Branch stuck on MAIN, VendorClass filter did nothing).
     c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
     asyncio.run(ScreenClient.set_report_parameters(
         c, [{"set": "ReportFormat", "to": "Summary"},
-            {"set": "FinancialPeriod", "to": "03-2026"}],
+            {"set": "FinancialPeriod", "to": "03-2026"},
+            {"set": "Branch", "to": "YMHQ"}],
         "https://example.invalid/launcher", "key123", "tok123"))
     form = calls[-1][2]
+    # shape 1: PXTEXT COMBO
     assert form["viewer_par_tab_t0_pForm_edFormat_state"] == '<PText Value="S"/>'
     assert form["viewer$par$tab$t0$pForm$edFormat$text"] == "Summary"
-    assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form   # NOT sent — the fix
+    # shape 2: BARE SELECTOR — _state must be absent
+    assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form
     assert form["viewer$par$tab$t0$pForm$edPeriodID$text"] == "03-2026"
+    # shape 3: LOOKUP SELECTOR
+    assert form["viewer_par_tab_t0_pForm_edBranchID_state"] == '<PXSelector Value="YMHQ"/>'
+    assert form["viewer$par$tab$t0$pForm$edBranchID$text"] == "YMHQ"
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():

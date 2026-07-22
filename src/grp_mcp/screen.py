@@ -3716,23 +3716,42 @@ class ScreenClient:
                   (b"PK\x03\x04",)),  # .xlsx is a zip container
     }
 
-    # Known SIMPLE COMBO Parameters fields (raw field name -> {display: code}), keyed
-    # lower-case on the display value. ONLY these fields get a `_state=<PText Value=.../>`
-    # override; every other field gets `$text` alone. This split is LOAD-BEARING, not
-    # cosmetic — measured live, AP630500:
-    #   - Format (a plain combo) needs `_state`; `$text` alone silently reverts to the
-    #     screen's default (Detailed) with no error.
-    #   - PeriodID (a PXSelector) breaks when given a `_state` override at all: any
-    #     dash-containing value in `_state`'s PText comes back GARBLED on render (e.g.
-    #     "03-2026" -> "03- 202", consistently, across every period tried) — the
-    #     selector's server-side value parser evidently does NOT expect `_state` content
-    #     the way a plain combo's does. `$text` alone is clean and correct for it.
-    # Unlisted fields (Branch/Company/VendorClass/...) default to the PXSelector-style
-    # $text-only path, since PeriodID is the closest verified analog for that field
-    # shape — but that's an ASSUMPTION for fields not yet tested individually.
-    _COMBO_STATE_FIELDS: dict[str, dict[str, str]] = {
+    # Report-Parameters fields need ONE of THREE distinct wire shapes, keyed by raw
+    # field name — sending the wrong one either no-ops silently or CORRUPTS the value.
+    # Measured live, AP630500 (2026-07-22/23), across three separate reverse-engineering
+    # sessions:
+    #
+    #   1. PXTEXT COMBO (Format): needs `_state=<PText Value="<code>"/>` PLUS `$text`.
+    #      `$text` alone silently reverts to the screen default (Detailed) — no error.
+    #
+    #   2. BARE SELECTOR (PeriodID): needs `$text` ALONE — sending `_state` AT ALL
+    #      corrupts it: a dash-containing value comes back GARBLED on render (e.g.
+    #      "03-2026" -> "03- 202", reproduced across 5 different months). This is the
+    #      ONE case where `_state` must be OMITTED, not just left off by omission.
+    #
+    #   3. LOOKUP SELECTOR (BranchID, ClassID — anything with a magnifier/master-data
+    #      popup): needs `_state=<PXSelector Value="<code>"/>` PLUS `$text=<code>`.
+    #      `$text` alone silently no-ops (proven: Branch stuck on MAIN, VendorClass
+    #      filter had zero effect, until `_state` was added). The `DataValues="..."`
+    #      attribute the browser ALSO sends (a full XML-encoded row dump of every
+    #      popup-grid column) is NOT required — a bare `Value="<code>"` works
+    #      identically; tested both ways for VendorClass, identical result. `$text`
+    #      does not need the "<code> - <Description>" form the UI displays either —
+    #      the bare code is sufficient (tested).
+    #
+    # Company (OrganizationID) is included here too — tried the same PXSelector shape,
+    # posts cleanly (no error, no corruption) — but this tenant has only ONE
+    # organization, so there's nothing to switch TO: the actual FILTERING effect is
+    # unverified, unlike Branch/VendorClass where a second value existed to prove the
+    # report's output genuinely changed. Only the wire shape is confirmed for Company.
+    # Everything else not listed here defaults to case 2 (bare `$text`), which is
+    # CORRECT for PeriodID but unverified for any other untested field. Don't extend
+    # either mapping on a guess; measure first — that's exactly how Branch/VendorClass
+    # went undetected as broken for a full release cycle.
+    _PXTEXT_COMBO_FIELDS: dict[str, dict[str, str]] = {
         "Format": {"detailed": "D", "summary": "S"},
     }
+    _LOOKUP_SELECTOR_FIELDS: set[str] = {"BranchID", "ClassID", "OrganizationID"}
 
     async def set_report_parameters(
         self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
@@ -3755,39 +3774,39 @@ class ScreenClient:
             __CALLBACKPARAM=RefreshParams|<viewer LoadedLevel="-1">
                 <![CDATA[<Params/>]]></viewer>
             + per changed field:
-              viewer$par$tab$t0$pForm$ed<RawField>$text  = <raw display value>  (always)
-              viewer_par_tab_t0_pForm_ed<RawField>_state = <PText Value="<code>"/>
-                  (ONLY for fields in _COMBO_STATE_FIELDS — see its comment for why
-                  sending BOTH for every field is NOT safe: `_state` corrupts PeriodID)
+              viewer$par$tab$t0$pForm$ed<RawField>$text  = <value>  (always sent)
+              viewer_par_tab_t0_pForm_ed<RawField>_state = ...      (field-type-specific
+                  — see _PXTEXT_COMBO_FIELDS / _LOOKUP_SELECTOR_FIELDS; OMITTED
+                  entirely for a bare selector like PeriodID, where sending it at all
+                  corrupts the value)
 
         `<RawField>` is screen_get_schema's "Parameters" container field name for the
         friendly name given (e.g. FinancialPeriod -> PeriodID, so the control ID is
         `viewer_par_tab_t0_pForm_edPeriodID`) — the classic control ID is always
-        "ed" + the raw field name, verified for Format and PeriodID, assumed uniform
-        for the rest of the Parameters container.
+        "ed" + the raw field name, verified for every field type tested so far.
 
-        Live-proven WORKING: AP630500 — ReportFormat "Summary" (title changed to
-        "(Summary)", row structure genuinely collapsed to vendor-level, via
-        $text+_state) and FinancialPeriod "05-2026"/"04-2026"/"03-2026"/"02-2026"/
-        "01-2026" (rendered period label changed cleanly via $text ALONE; period
-        genuinely empty for those months — no bills exist there — matching a live DB
-        check), including both together in one call.
+        Live-proven WORKING, AP630500:
+        - ReportFormat "Summary"/"Detailed" — title + row structure genuinely change
+          (Summary collapses to vendor-level), via PXTEXT COMBO shape.
+        - FinancialPeriod, 5 different months — rendered period label changes, empty
+          months genuinely render empty (matches a live DB check), via BARE SELECTOR
+          shape (no `_state` at all).
+        - Branch (MAIN vs YMHQ) and VendorClass (DEFAULT vs STAFF, correctly
+          excluding a DEFAULT-class vendor) — via LOOKUP SELECTOR shape. This
+          corrects the immediately-preceding release, which shipped with these two
+          fields defaulting to the WRONG (bare-selector) shape and silently no-op'ing.
+        All confirmed together in combined calls (format+period, branch+class+period).
 
-        Live-proven NOT WORKING (2026-07-23): Branch and VendorClass, via $text alone,
-        are silently ignored — tried a plain code, the full "CODE - Description"
-        display text (matching what the UI shows for these two fields, unlike
-        FinancialPeriod's bare code), a genuinely different branch (YMHQ vs the
-        default MAIN), and a vendor class that should exclude the test vendor
-        (STAFF, when the vendor is class DEFAULT) — every one rendered the SAME
-        unfiltered default output. FinancialPeriod's `$text`-only mechanism does NOT
-        generalize to every PXSelector field on this screen; root cause not yet
-        found (needs another browser-capture session to isolate what these two
-        fields actually need). Do not assume an untested field works — only
-        ReportFormat and FinancialPeriod are confirmed.
+        Unverified: Company (OrganizationID) posts cleanly via the same LOOKUP
+        SELECTOR shape but this tenant has only one organization, so the actual
+        FILTERING effect can't be proven the way Branch/VendorClass's could (a second
+        value existed to switch to). Any field not in _PXTEXT_COMBO_FIELDS or
+        _LOOKUP_SELECTOR_FIELDS defaults to the BARE SELECTOR (`$text`-only) shape —
+        correct for PeriodID, unverified for anything else not yet individually tested.
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
-        but NOT on a recognized field that silently fails to apply (Branch/VendorClass
-        currently do this; see above).
+        but NOT on a recognized field whose shape hasn't been verified and turns out
+        to silently no-op (as Branch/VendorClass did before this fix).
         """
         schema = await self.get_schema()
         param_fields = schema.get("containers", {}).get("Parameters", {})
@@ -3814,10 +3833,14 @@ class ScreenClient:
                     f"{friendly!r} — known: {sorted(param_fields)} (from screen_get_schema)"
                 )
             raw_field = entry["field"]
-            combo = self._COMBO_STATE_FIELDS.get(raw_field)
+            control = f"viewer_par_tab_t0_pForm_ed{raw_field}"
+            combo = self._PXTEXT_COMBO_FIELDS.get(raw_field)
             if combo is not None:
                 code = combo.get(str(value).strip().lower(), value)
-                form[f"viewer_par_tab_t0_pForm_ed{raw_field}_state"] = f'<PText Value="{code}"/>'
+                form[f"{control}_state"] = f'<PText Value="{escape(str(code))}"/>'
+            elif raw_field in self._LOOKUP_SELECTOR_FIELDS:
+                form[f"{control}_state"] = f'<PXSelector Value="{escape(str(value))}"/>'
+            # else: BARE SELECTOR shape (e.g. PeriodID) — `_state` deliberately omitted.
             form[f"viewer$par$tab$t0$pForm$ed{raw_field}$text"] = str(value)
         resp = await self._http.post(launcher_url, data=form)
         if resp.status_code >= 400:

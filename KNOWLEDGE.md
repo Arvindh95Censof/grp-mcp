@@ -1886,25 +1886,60 @@ period label changes; months with no data render genuinely empty, matching a liv
 — the month with real `Bill` data — still returns the correct 4 rows), including both parameters
 together in one call.
 
-**Live-proven NOT WORKING (2026-07-23, same-day follow-up test) — `Branch` and `VendorClass` are
-silently ignored.** The assumption two paragraphs up ("other PXSelector fields probably follow the
-same `$text`-only pattern as FinancialPeriod") was WRONG for these two specific fields — caught before
-it shipped as fact, but worth recording so it isn't re-assumed. Tried, against a live vendor (`VEND01`,
-class `DEFAULT`, posted to branch `MAIN`):
-- `Branch` = `"YMHQ"` (plain code), `"YMHQ - YAYASAN MELAKA"` (full "CODE - Description" display text,
-  matching what the UI actually shows for this field, unlike FinancialPeriod's bare code) — both
-  rendered with `Branch: MAIN` still in the header, unchanged.
-- `VendorClass` = `"STAFF"` (should exclude a DEFAULT-class vendor) vs `"DEFAULT"` (should include it)
-  — BOTH rendered `VEND01` present. No filtering occurred either way.
+### `Branch`/`VendorClass` — a THIRD wire shape, found the same day they were flagged broken
 
-No error, no field-error in the response — the `$text` value is accepted and silently discarded by
-whatever mechanism the launcher uses for these two fields, same failure SHAPE as the original
-`submit()` bug this section already documents, but a DIFFERENT root cause (this is after the fix,
-through the now-working ASPX-callback path — these two fields specifically don't respond to it).
-Root cause not yet isolated; would need another browser-capture session focused on changing Branch/
-VendorClass specifically (the original capture only exercised Format and PeriodID). **Only
-`ReportFormat` and `FinancialPeriod` are confirmed working — do not assume any other Parameters field
-does, including ones that look structurally identical to `FinancialPeriod`.**
+**First found broken (2026-07-23):** the assumption two paragraphs up ("other PXSelector fields
+probably follow the same `$text`-only pattern as FinancialPeriod") was WRONG for `Branch` and
+`VendorClass`. Tried, against a live vendor (`VEND01`, class `DEFAULT`, posted to branch `MAIN`):
+`Branch="YMHQ"` (plain code and full `"YMHQ - YAYASAN MELAKA"` display text) still rendered
+`Branch: MAIN`; `VendorClass="STAFF"` (should exclude a DEFAULT-class vendor) still rendered `VEND01`
+present. No error either way — the `$text` value was silently discarded.
+
+**Then fixed, same day**, by hooking XHR on the launcher's OWN window again (direct navigation to the
+launcher URL — no iframe wrapper needed this time) and using the real browser's Vendor-Class LOOKUP
+DIALOG (magnifier icon → double-click a row) instead of typing raw text. That surfaced a THIRD, distinct
+wire shape neither Format nor PeriodID uses:
+
+```
+viewer_par_tab_t0_pForm_ed<RawField>_state = <PXSelector Value="<code>"/>
+viewer$par$tab$t0$pForm$ed<RawField>$text  = <code>
+```
+
+Two things worth knowing before assuming this needs more than it does:
+- The browser ALSO sends a `DataValues="..."` attribute on `<PXSelector>` — a full XML-encoded dump of
+  every popup-grid column for the selected row (all 3 columns for VendorClass: code/description/terms).
+  **Not required** — tested both ways, a bare `Value="<code>"` (no `DataValues`) produces an identical
+  result.
+- `$text` does NOT need the `"<code> - <Description>"` form the UI displays — the bare code alone
+  works (tested: `$text="STAFF"` filtered correctly, same as `$text="STAFF - General Staff (Dummy)"`).
+
+So there are now THREE field-type shapes, not two — `ScreenClient` picks the right one per field via
+two explicit registries (`_PXTEXT_COMBO_FIELDS`, `_LOOKUP_SELECTOR_FIELDS`); anything in neither
+defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
+
+| Shape | Fields (verified) | `_state` | `$text` |
+|---|---|---|---|
+| PXTEXT COMBO | `Format` | `<PText Value="<code>"/>` — REQUIRED | full value |
+| BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
+| LOOKUP SELECTOR | `BranchID`, `ClassID` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
+
+Live-proven WORKING via the actual shipped code (not just the reverse-engineering scratch script):
+`Branch` (`MAIN` includes the test vendor's bills, `YMHQ` correctly excludes them — a genuinely
+different branch, not just a different label) and `VendorClass` (`DEFAULT` includes `VEND01`, `STAFF`
+correctly excludes it), each independently and combined with `ReportFormat`+`FinancialPeriod` in one
+call (4 parameters at once).
+
+**Unverified: `Company` (`OrganizationID`).** Posts cleanly via the LOOKUP SELECTOR shape (no error,
+same as Branch) — but this tenant has only ONE organization, so there is nothing to switch TO, and the
+actual filtering effect can't be proven the way Branch/VendorClass's could. Only the wire shape is
+confirmed for `Company`, not the filtering behavior.
+
+**The meta-lesson, stated plainly because it cost two ship cycles:** a field that is
+structurally/visually identical to a previously-verified field (Branch and Company both LOOK like
+`FinancialPeriod` — a text box with a magnifier icon) can use a completely different wire protocol
+underneath. Never extend a verified pattern to a new field on the assumption that "it's the same kind
+of control" — the ONE thing distinguishing `PeriodID` (bare selector) from `BranchID`/`ClassID` (lookup
+selector) is not visible from the UI at all; it only showed up by capturing the real request.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
