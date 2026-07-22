@@ -1921,7 +1921,7 @@ defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
 |---|---|---|---|
 | PXTEXT COMBO | `Format` | `<PText Value="<code>"/>` — REQUIRED | full value |
 | BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
-| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
+| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID`, `CategoryValue` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
 
 Live-proven WORKING via the actual shipped code (not just the reverse-engineering scratch script):
 `Branch` (`MAIN` includes the test vendor's bills, `YMHQ` correctly excludes them — a genuinely
@@ -1937,12 +1937,29 @@ belong to `AI STAGING`'s org, not `YM`'s, so switching org while `Branch` stayed
 correctly returned nothing. Same LOOKUP SELECTOR shape as Branch/VendorClass, now equally proven —
 not just a clean-post wire-shape check.
 
-**The meta-lesson, stated plainly because it cost two ship cycles:** a field that is
+**`Category` (`CategoryValue`) — a FIFTH gotcha, found 2026-07-23 by A/B test, not by browser
+reverse-engineering.** This field isn't even rendered as a visible control on AP630500's own
+Parameters tab — its input exists in the DOM but is 0x0 / `offsetParent`-less, genuinely hidden, not
+just unnoticed. First read as "this field is simply inert for this report" — WRONG. Direct A/B proof:
+the identical garbage value `"ZZZINVALID"` sent via bare `$text` left the report fully unfiltered
+(byte-identical to no-param-set output — silently ignored); the SAME value sent via
+`_state=<PXSelector Value="ZZZINVALID"/>` switched the report to a grouped "Supplied-by Vendor" layout
+AND emptied every total. This tenant has no vendor carrying a matching category (its only real CS
+Attribute is an unrelated one, `COPYPO`), so a positive-match inclusion test isn't possible here — but
+the structural change plus emptying is the same tier of proof Company got. `AttributeID` (raw
+`attributeID`, Category's paired "which dimension" selector) was A/B tested directly too — bare vs
+lookup shape, with `CategoryValue` held fixed both times — and came back **byte-identical either way**.
+Its effect could not be isolated in this tenant, so it's deliberately left OUT of the lookup registry
+rather than guessed in on the assumption that a paired control must share its partner's shape.
+
+**The meta-lesson, stated plainly because it cost THREE ship cycles now:** a field that is
 structurally/visually identical to a previously-verified field (Branch and Company both LOOK like
 `FinancialPeriod` — a text box with a magnifier icon) can use a completely different wire protocol
-underneath. Never extend a verified pattern to a new field on the assumption that "it's the same kind
-of control" — the ONE thing distinguishing `PeriodID` (bare selector) from `BranchID`/`ClassID` (lookup
-selector) is not visible from the UI at all; it only showed up by capturing the real request.
+underneath — and a field that isn't even VISIBLE in the UI (Category, AttributeID) can still be live and
+read server-side, or can genuinely do nothing; the only way to tell which is an A/B test against the
+rendered output, not an assumption either way. Never extend a verified pattern to a new field — including
+a "no error, no visible change" result, which is exactly what BOTH a truly inert field and a
+silently-no-op'd wrong-shape field look like from the outside.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you

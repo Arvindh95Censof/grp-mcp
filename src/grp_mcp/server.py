@@ -8835,13 +8835,20 @@ async def download_classic_report(
         structure genuinely change), FinancialPeriod (5 different months, rendered
         period label changes, empty months genuinely render empty — matches a live DB
         check), Branch/VendorClass (MAIN vs YMHQ, DEFAULT vs STAFF — correctly
-        included/excluded a test vendor by class and by branch), and Company (AI
+        included/excluded a test vendor by class and by branch), Company (AI
         STAGING vs YM, csmdev's 2nd org — the header changed AND the body genuinely
-        emptied since MAIN branch's bills belong to the other org), all confirmed
-        together in combined calls. A prior release shipped Branch/VendorClass
-        defaulting to the wrong wire shape and silently no-op'ing; that's fixed — see
-        KNOWLEDGE.md §18 for the three distinct field-type shapes this now handles
-        automatically (you don't need to know which shape a field uses).
+        emptied since MAIN branch's bills belong to the other org), and Category (an
+        A/B test against the same value proved the old default shape silently
+        no-op'd while the correct shape genuinely filters — empties the report, since
+        this tenant has no vendor with a matching category), all confirmed together
+        in combined calls. Two prior releases shipped Branch/VendorClass then Category
+        defaulting to the wrong wire shape and silently no-op'ing; both are fixed —
+        see KNOWLEDGE.md §18 for the field-type shapes this now handles automatically
+        (you don't need to know which shape a field uses).
+
+        AttributeID (Category's paired dimension-selector) was A/B tested directly and
+        made no observable difference either way — its shape is deliberately left
+        unresolved rather than guessed.
 
         Any Parameters field not yet individually tested defaults to the shape
         verified for FinancialPeriod, which may not be correct for every field. An

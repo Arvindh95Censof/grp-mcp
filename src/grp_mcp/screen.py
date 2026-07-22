@@ -3745,14 +3745,42 @@ class ScreenClient:
     # report body (Company Total went to 0) — MAIN branch's AP bills belong to AI
     # STAGING's org, not YM's, so switching org with Branch left at its MAIN default
     # correctly returned nothing. Same shape as Branch/VendorClass, now equally proven.
+    #
+    # CategoryValue (friendly "Category") is a FOURTH field caught by this same bug,
+    # found 2026-07-23: unlike Branch/VendorClass/Company it isn't even rendered as a
+    # visible control on AP630500's own Parameters tab (its input exists in the DOM but
+    # is 0x0 / offsetParent-less — genuinely hidden, not just unnoticed), which first
+    # looked like "this field is simply inert for this report". It is NOT inert: sending
+    # it via bare `$text` (the old default-shape guess) left the report fully unfiltered
+    # (identical output, garbage value silently ignored) — but the SAME garbage value
+    # sent via `_state=<PXSelector .../>` switched the report to a grouped "Supplied-by
+    # Vendor" layout AND emptied every total (no vendor in this tenant carries a
+    # matching category, since the tenant's only real CS Attribute is unrelated
+    # "COPYPO" — there's no positive-match value available to test the inclusion side,
+    # but the structural change + emptying proves the field is read and applied, same
+    # tier of proof as Company's).
+    #
+    # `attributeID` (friendly "AttributeID", CategoryValue's paired field — nominally
+    # selects WHICH attribute dimension CategoryValue filters on) was A/B tested
+    # DIRECTLY: bare `$text` vs `_state=<PXSelector .../>`, with CategoryValue held
+    # fixed via the lookup shape both times. BOTH gave byte-identical output. Its effect
+    # could not be isolated in this tenant (it has no real attribute records to switch
+    # between besides one unrelated one, "COPYPO") — so, unlike CategoryValue, it is
+    # deliberately left OUT of _LOOKUP_SELECTOR_FIELDS rather than guessed into it. This
+    # is the same "don't extend on a guess" discipline, just landing on "leave it
+    # untouched" instead of "add it" because the A/B test came back negative rather
+    # than positive.
+    #
     # Everything else not listed here defaults to case 2 (bare `$text`), which is
     # CORRECT for PeriodID but unverified for any other untested field. Don't extend
-    # either mapping on a guess; measure first — that's exactly how Branch/VendorClass
-    # went undetected as broken for a full release cycle.
+    # either mapping on a guess; measure first — that's exactly how Branch/VendorClass/
+    # Category went undetected as broken.
     _PXTEXT_COMBO_FIELDS: dict[str, dict[str, str]] = {
         "Format": {"detailed": "D", "summary": "S"},
     }
-    _LOOKUP_SELECTOR_FIELDS: set[str] = {"BranchID", "ClassID", "OrganizationID"}
+    _LOOKUP_SELECTOR_FIELDS: set[str] = {
+        "BranchID", "ClassID", "OrganizationID", "CategoryValue",
+    }
 
     async def set_report_parameters(
         self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
@@ -3799,15 +3827,22 @@ class ScreenClient:
         - Company (AI STAGING vs YM, csmdev's 2nd org) — via LOOKUP SELECTOR shape:
           the printed "Company:" header changed AND the body genuinely emptied
           (MAIN branch's bills belong to AI STAGING, not YM).
+        - Category (`CategoryValue`) — via LOOKUP SELECTOR shape: an A/B test against
+          the same value proved bare `$text` silently no-ops (unfiltered) while the
+          lookup shape genuinely filters (switches to a grouped layout and empties
+          out, since this tenant has no vendor with a matching category value).
         All confirmed together in combined calls (format+period, branch+class+period).
 
         Any field not in _PXTEXT_COMBO_FIELDS or _LOOKUP_SELECTOR_FIELDS defaults to
         the BARE SELECTOR (`$text`-only) shape — correct for PeriodID, unverified for
-        anything else not yet individually tested.
+        anything else not yet individually tested. `AttributeID` (raw `attributeID`,
+        Category's paired dimension-selector) was A/B tested directly and its shape
+        made no observable difference — left out of the lookup registry rather than
+        guessed in.
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
         but NOT on a recognized field whose shape hasn't been verified and turns out
-        to silently no-op (as Branch/VendorClass did before this fix).
+        to silently no-op (as Branch/VendorClass/Category did before their fixes).
         """
         schema = await self.get_schema()
         param_fields = schema.get("containers", {}).get("Parameters", {})

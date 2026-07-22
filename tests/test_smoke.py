@@ -3731,6 +3731,7 @@ _FAKE_REPORT_SCHEMA = {
             "FinancialPeriod": {"object": "Parameters", "field": "PeriodID"},
             "Branch": {"object": "Parameters", "field": "BranchID"},
             "Company": {"object": "Parameters", "field": "OrganizationID"},
+            "Category": {"object": "Parameters", "field": "CategoryValue"},
         }
     }
 }
@@ -3801,15 +3802,17 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     #      reverts to the default.
     #   2. BARE SELECTOR (PeriodID): _state must be OMITTED — sending it at all
     #      garbled the rendered value ("03-2026" -> "03- 202").
-    #   3. LOOKUP SELECTOR (Branch/VendorClass/Company): needs _state=<PXSelector .../>
-    #      — an earlier release shipped these defaulting to shape 2 ($text-only) and
-    #      they silently no-op'd (Branch stuck on MAIN, VendorClass filter did nothing).
+    #   3. LOOKUP SELECTOR (Branch/VendorClass/Company/Category): needs
+    #      _state=<PXSelector .../> — two separate releases shipped these defaulting to
+    #      shape 2 ($text-only) and they silently no-op'd (Branch stuck on MAIN,
+    #      VendorClass filter did nothing, Category left the report unfiltered).
     c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
     asyncio.run(ScreenClient.set_report_parameters(
         c, [{"set": "ReportFormat", "to": "Summary"},
             {"set": "FinancialPeriod", "to": "03-2026"},
             {"set": "Branch", "to": "YMHQ"},
-            {"set": "Company", "to": "YM"}],
+            {"set": "Company", "to": "YM"},
+            {"set": "Category", "to": "TESTCAT"}],
         "https://example.invalid/launcher", "key123", "tok123"))
     form = calls[-1][2]
     # shape 1: PXTEXT COMBO
@@ -3823,6 +3826,8 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     assert form["viewer$par$tab$t0$pForm$edBranchID$text"] == "YMHQ"
     assert form["viewer_par_tab_t0_pForm_edOrganizationID_state"] == '<PXSelector Value="YM"/>'
     assert form["viewer$par$tab$t0$pForm$edOrganizationID$text"] == "YM"
+    assert form["viewer_par_tab_t0_pForm_edCategoryValue_state"] == '<PXSelector Value="TESTCAT"/>'
+    assert form["viewer$par$tab$t0$pForm$edCategoryValue$text"] == "TESTCAT"
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
