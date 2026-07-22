@@ -8288,7 +8288,9 @@ _GUIDE = {
             "(GET-free, for Data Providers)", "download_file", "list_attachments", "set_note",
             "run_report (contract-REST Report entity — needs SM207060 setup first)",
             "download_classic_report (classic report screens, e.g. AP630500 — no setup "
-            "needed, works where run_report/screen_capabilities can't reach)"],
+            "needed, works where run_report/screen_capabilities can't reach; NOTE its "
+            "`parameters` arg has no confirmed effect yet — always returns the "
+            "account's default period/format, see its docstring)"],
         "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],
         "sessions / config / seats": ["release_sessions (free API seats)", "test_connection",
             "reload_config", "set_active_instance", "add_instance", "remove_instance"],
@@ -8818,17 +8820,23 @@ async def download_classic_report(
         verified against a live DB read of the same data). Both live-proven on
         AP630500. Any other value is rejected before the request is made.
 
-    parameters: submit()-style commands to set the report's filter fields first, e.g.
-        [{"set": "ReportFormat", "to": "Detailed"}, {"set": "Branch", "to": "MAIN"},
-         {"set": "FinancialPeriod", "to": "202607"}]
-        Field names are the FRIENDLY names from screen_get_schema's "Parameters"
-        container (e.g. Company/Branch/FinancialPeriod/VendorClass on AP630500).
-        Omit to reuse the account's last-used values (Acumatica persists them
-        server-side per user+screen, so a first run should always pass them).
+    parameters: HAS NO EFFECT — kept for a future fix, do not rely on it. Re-tested
+        2026-07-22: every ReportFormat/FinancialPeriod value tried (3 formats, 5
+        periods, multiple value encodings) rendered IDENTICALLY — the report's true
+        DEFAULT (current business period, default format), regardless of what was
+        passed. Root cause: this calls submit() against the classic SOAP `.asmx`
+        endpoint, which writes to an ISOLATED graph the ASPX report-launcher page
+        never reads (separate graph instances despite sharing a login cookie). The
+        earlier "live-proven" claim was a false positive — the test value happened to
+        equal the account's default period. Every download from this tool currently
+        returns the account's DEFAULT period/format for the given screen, no matter
+        what `parameters` says. See KNOWLEDGE.md §18 for the real fix path (an ASPX
+        callback POST to the launcher page itself, not yet implemented).
     report_filename: override the default "{screen_id}.rpx" report-file guess if a
         screen's underlying report differs from its screen ID (rare).
 
-    Requires "allow_write": true (parameters are applied via a real screen Submit).
+    Requires "allow_write": true (parameters are still submitted for forward
+    compatibility, even though they currently have no observable effect).
     out_path must be within the instance's write_roots (if configured).
     """
     _require_write(instance)
@@ -8843,6 +8851,11 @@ async def download_classic_report(
         "fmt": fmt,
         "bytes": len(data),
         "path": out_path,
+        "warning": ("parameters were submitted but have NO CONFIRMED EFFECT on the "
+                     "rendered report — every value tested renders the account's "
+                     "default period/format regardless (see tool docstring / "
+                     "KNOWLEDGE.md §18). Verify the output, don't assume it applied.")
+                   if parameters else None,
         "parameters": parameters or [],
         "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }

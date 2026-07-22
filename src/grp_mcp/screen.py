@@ -3743,20 +3743,31 @@ class ScreenClient:
         fmt: "pdf" (default) or "excel". Same launcher/instanceKey step either way —
         only the second GET's query string and expected content differ.
 
-        The report reads its PARAMETERS from the screen's live session state, not from
-        the launcher request — so pass `parameters` as submit()-style commands
-        ({"set": "<FriendlyName>", "to": <value>}, from screen_get_schema's "Parameters"
-        container) and they are applied via a real Submit BEFORE the launcher GET.
-        Omit parameters to reuse whatever the account's last-used values are (Acumatica
-        persists them server-side per user+screen).
+        `parameters` HAS NO CONFIRMED EFFECT (re-tested 2026-07-22, corrects an earlier
+        wrong claim in this docstring). They ARE submitted via a real Submit() before
+        the launcher GET, and that Submit reports ok:true — but the launcher renders
+        the SAME thing (the screen's true default period/format) no matter what value
+        was set: 3 ReportFormat values and 5 FinancialPeriod encodings all rendered
+        identically across fresh sessions. Root cause: the classic SOAP `.asmx`
+        Submit() and the ASPX launcher page are SEPARATE graph instances even under
+        the same login cookie — Submit() writes into a graph the launcher never reads.
+        The original "proof" was a false positive (the test period happened to equal
+        the account's actual default). The REAL parameter mechanism, per the original
+        browser capture, is an ASPX CALLBACK POST to the launcher page itself (two POSTs
+        preceded the launcher GET in that capture, targeting
+        viewer_par_tab_t0_pForm_ed{Format,BranchID,PeriodID,ClassID}_state — the same
+        __CALLBACKPARAM/Command|<envelope> shape aspx.py implements for other screens)
+        — not yet implemented. Until then this always returns the account's DEFAULT
+        period/format for the screen, regardless of `parameters`.
 
         report_filename: override the "{ScreenID}.rpx" convention if a screen's actual
         report file differs (rare — verified 1:1 for AP630500).
 
-        Live-proven: AP630500, 4-row report — PDF (4386 bytes, b"%PDF-1.7") and Excel
-        (6631 bytes, real .xlsx: correct MIME type, ZIP magic bytes, well-formed
-        sharedStrings.xml carrying the same report data) both verified against a live
-        DB read of the same 4 Bills.
+        Live-proven (default period/format only): AP630500, 4-row report — PDF (4386
+        bytes, b"%PDF-1.7") and Excel (6631 bytes, real .xlsx: correct MIME type, ZIP
+        magic bytes, well-formed sharedStrings.xml carrying the same report data) both
+        verified against a live DB read of the same 4 Bills. The fetch/render/format
+        mechanism is sound; only parameter application is broken.
         """
         if fmt not in self._REPORT_FORMATS:
             raise ScreenError(

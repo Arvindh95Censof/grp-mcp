@@ -1834,13 +1834,41 @@ reused for every subsequent viewer call (confirmed live: the same key served the
 `OpType=Report`, the PDF, `OpType=PdfReport`, AND the Excel export, `OpType=Export&ExportFormat=Excel`,
 across multiple calls in the same session).
 
-**Parameters are read from the screen's live session state, not from the launcher request.** Set them
-first with a normal `submit()`/`screen_submit` call (friendly names from `screen_get_schema`'s
-`Parameters` container, e.g. `ReportFormat`/`Company`/`Branch`/`FinancialPeriod`/`VendorClass` on
-`AP630500`) — confirmed live: values submitted via classic SOAP showed up already filled in on the
-browser's Report Parameters tab on a completely separate page load, proving Acumatica persists
-last-used report parameters **server-side per user+screen**. Omitting `parameters` reuses whatever was
-last set (by anyone driving that screen for that user) — pass them explicitly for a deterministic run.
+**CORRECTION (2026-07-22, same day) — `parameters` DOES NOT WORK. The claim below this paragraph was
+wrong; it is kept, struck through in spirit, as a record of the mistake.** Re-testing after a user
+asked for a Summary-format / different-period download exposed it: every value tried for
+`ReportFormat` (`Summary`, `S`, `Summarized`) and `FinancialPeriod` (`202512`, `12-2025`, `2025-12`,
+`202606`, `202608` — three different formats, five different periods) rendered IDENTICALLY —
+`Detailed`, `07-2026` — across fresh logins, fresh sessions, varied `unum`. `submit()` itself reports
+`ok:true` with no field errors every time; the values simply never reach what the launcher renders.
+
+**Root cause: the classic SOAP `.asmx` endpoint and the ASPX report-launcher page are SEPARATE graph
+instances**, even under the same login cookie. `screen_submit`'s `Submit` op writes into the
+SOAP-plane's own isolated graph; `CensofReportLauncher.aspx` is a real ASPX WebForms page with its own
+graph, and reads its OWN default — current business period + default format — never the SOAP graph's
+state. The ORIGINAL "live-proven" claim was a false positive: the test value (`202607`) happened to
+equal this account's current business period anyway, so the download looked parameter-driven when it
+was actually just the unconditional default the whole time.
+
+**What this means in practice:** `download_report_file`/`download_classic_report`'s `parameters`
+argument currently has NO EFFECT on the rendered report. Every call returns the SAME thing — the
+account's default period + default format for that screen — regardless of what you pass. The
+`report_filename`/`fmt` arguments are unaffected (verified independently: PDF vs Excel genuinely
+differ; format/period do not).
+
+**The real mechanism, per the original browser capture, was there the whole time and got misread:**
+before the launcher GET, the browser fires TWO `POST`s to the SAME `CensofReportLauncher.aspx` URL —
+those are classic ASPX CALLBACK protocol posts (the `__CALLBACKPARAM`/`Command|<envelope>` shape
+`aspx.py` already implements for OTHER screens — see §11), targeting the Report Parameters form's OWN
+controls (`viewer_par_tab_t0_pForm_edFormat_state`, `..._edBranchID_state`, `..._edPeriodID_state`,
+`..._edClassID_state`, seen verbatim in the launcher's hidden-field markup). Applying parameters for
+real means replaying THAT callback against the launcher page itself, not `screen_submit` against the
+`.asmx` endpoint. Not yet built — this is the next concrete step, not a dead end.
+
+Until then: `download_classic_report` without `parameters` (or with them — same result either way) is
+still genuinely useful for "give me the current period's report as PDF/Excel, headless" — that part is
+real and verified. Anyone needing a SPECIFIC period/format from this tool today must still do it in the
+browser.
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
@@ -1849,7 +1877,8 @@ NAME itself (`CensofReportLauncher.aspx` vs `ReportLauncher.aspx`) is currently 
 Censof-branded name — an instance without that branding customization will 404 on step 1 and need the
 stock name substituted in code (not yet made configurable — no non-Censof instance tested).
 
-Live-proven end to end: `AP630500`, 4-row AP Aged Period-Sensitive report —
+Live-proven end to end (default period/format — see the correction above re: `parameters`):
+`AP630500`, 4-row AP Aged Period-Sensitive report —
 - **PDF**: 4386 bytes, magic bytes `%PDF-1.7`.
 - **Excel**: 6631 bytes, correct `.xlsx` MIME type + ZIP magic bytes; `xl/sharedStrings.xml` inspected
   directly (openpyxl's strict stylesheet parser chokes on this file's `Fill` definitions — a known
@@ -1857,7 +1886,8 @@ Live-proven end to end: `AP630500`, 4-row AP Aged Period-Sensitive report —
   raw OOXML is well-formed and real Excel/LibreOffice open it fine).
 
 Both formats' content matched the same live DB read of the same 4 `Bill` records (aging-bucket
-amounts, netting balance of 0.00).
+amounts, netting balance of 0.00) — this part is genuinely verified: the FETCH/RENDER/FORMAT mechanism
+is sound, only the PARAMETER-APPLICATION half of the recipe is broken.
 
 ---
 
