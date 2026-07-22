@@ -1718,6 +1718,63 @@ tractable). Wiring reparent needs the classic modal dialog-answer protocol: set 
 OK/DialogAnswer, then Save. Deferred — build + delete already cover create/teardown; reparent is an
 incremental-edit convenience.
 
+## 17. Approval workflows end-to-end (EP205015) — `build_approval_map` (v0.68.8)
+
+Building a document-approval workflow headless is now one tool per map: `build_approval_map(name,
+entity, steps, graph_type?, ...)`. It generates the EP205015 `EPAssignmentMap → EPRule (+EPRuleCondition)`
+XML and imports it via the §14 round-trip — no hand-authoring. Proven live building a client's approval
+matrix (GL Journal, AR Invoices) from an Excel spec.
+
+```
+build_approval_map(
+  name="GL Journal Approval WF",
+  entity="PX.Objects.GL.Batch",              # the document EntityType
+  steps=[                                    # routed in order
+    {"name":"Review",  "workgroup":"GL Journal - Reviewer",   # workgroup NAME or WorkGroupID
+     "approve_type":"A",                      # A=any one approves (default) | W=wait for all
+     "conditions":[{"field":"DebitTotal","operator":"ge","value":"0.01"}]},
+    {"name":"Approve", "workgroup":"GL Journal - Approver",
+     "conditions":[{"field":"DebitTotal","operator":"ge","value":"0.01"}]}])
+# graph_type derived from an existing map of the same entity when omitted.
+```
+
+Each step becomes a STEP `EPRule` (StepID null, Sequence orders the steps) plus a CHILD `EPRule`
+(StepID = the step's RuleID) carrying the `WorkgroupID` and any conditions. Conditions live on the
+CHILD (approver) rule — an `EPRuleCondition` with `FieldName` + `Condition` + `Value`.
+
+### Conditions = the "approval limit" column
+
+`EPRuleCondition.Condition` is an enum int: `0` = equals (e.g. `OrderType == "WO"`), `3` = the
+amount-threshold operator the instance's own maps use (`OrderTotal >= 0.01`). `build_approval_map`
+accepts `"eq"`/`"ge"` aliases or the raw int; `value2` makes a between-band. The amount FIELD is
+entity-specific — **GL Batch = `DebitTotal`, AR Invoice = `OrigDocAmt`** (check the DAC for others;
+the OData `$metadata` HIDES these totals — use the acumatica-knowledge `get_dac`). Verified live:
+`DebitTotal >= 0.01` on both rules of maps 1734/1735.
+
+### The create-only trap governs the whole build
+
+EP205015 import CREATES ONLY and the screen cannot navigate to a specific map headless, so there is
+NO headless update or delete of an approval map — fixing one means deleting it in the UI and
+rebuilding. Consequences baked into the tool: `skip_if_exists=True` refuses a duplicate Name by
+default; get each map right the FIRST time (conditions included). Plan a matrix build as one clean
+pass, not iterative.
+
+### Seeding approvers (the full pipeline)
+
+An approver is a workgroup MEMBER, which is an employee's Contact. The whole chain is headless:
+1. **Employees** — `create_or_update_entity("Employee", …)`. The `EmployeeClass` does NOT cascade
+   everything; a minimal create still needs `ContactInfo.DateOfBirth` (REQUIRED), `EmployeeSettings`
+   (Class + BranchID + DepartmentID + Calendar + CurrencyID) and `FinancialSettings`
+   (AP/Expense/Sales accounts + 0 subs + Terms — copy from an existing employee), plus one
+   `EmploymentHistory` line `{StartDate, Active:true}`. Errors surface one at a time
+   (DateOfBirth → EmploymentHistory → SalesAcct).
+2. **Workgroups** — `build_company_tree` (one per module×role).
+3. **Members** — `add_workgroup_member` (employee code → resolves DefContactID).
+4. **Map** — `build_approval_map` (this section).
+
+The map is BUILT but does not GATE postings until it is wired into the module's approval preferences
+(a separate activation step).
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

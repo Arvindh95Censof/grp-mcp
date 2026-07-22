@@ -13,7 +13,9 @@ import importlib.resources
 import json
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
+from html import escape as _xml_escape
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,7 @@ from .screen import (ScreenClient, ScreenError, _leaf, clear_session_cache,
                      xml_as_new_record)
 
 _KB_FIRST_POLICY = (
-    "TOOL SELECTION: this server has ~104 tools across FIVE Acumatica planes (contract "
+    "TOOL SELECTION: this server has ~105 tools across FIVE Acumatica planes (contract "
     "REST, DAC/GI OData, classic screen SOAP, modern UI-JSON, plus a diagnostic-only "
     "classic-ASPX callback plane). If you're unsure which "
     "tool/plane fits your task, call `guide` first (or guide(topic=...)); for one "
@@ -4824,6 +4826,205 @@ async def add_workgroup_member(
             "member": member_label, **res}
 
 
+# Condition operator aliases -> the EPRuleCondition.Condition enum int. `3` is the
+# amount-threshold operator the instance's own maps use (OrderTotal/CuryDocBal >= X);
+# `0` is exact equals (OrderType == "WO"). Callers may also pass the raw int.
+_COND_OPS = {"eq": 0, "equals": 0, "=": 0, "ge": 3, "gte": 3, "gt": 3, ">=": 3, ">": 3}
+
+
+def _approval_map_xml(name: str, entity: str, graph_type: str,
+                      steps: list[dict], map_type: int = 2) -> str:
+    """Build an EP205015 (Approval Map) import XML from a structured step list.
+
+    Pure function (no I/O) so it is unit-testable. `steps` is already resolved:
+    each is {name, workgroup_id:int, approve_type:'A'|'W',
+             conditions:[{field, operator:int, value, value2?, entity?}]}.
+    Each step becomes a STEP EPRule (StepID null) plus a child approver EPRule that
+    carries the WorkgroupID and any EPRuleCondition rows — the exact shape proven live
+    (map 1734: DebitTotal>=0.01 on both rules)."""
+    def esc(v: Any) -> str:
+        return _xml_escape(str(v), quote=True)
+    rows: list[str] = []
+    for i, st in enumerate(steps):
+        step_guid, appr_guid = str(uuid.uuid4()), str(uuid.uuid4())
+        atype = st.get("approve_type") or "A"
+        rows.append(
+            f'<EPRule RuleID="{step_guid}" Sequence="{i + 1}" Name="{esc(st["name"])}" '
+            f'ApproveType="{atype}" RuleType="D" IsActive="1" EmptyStepType="N" '
+            f'ExecuteStep="A" ReasonForApprove="N" ReasonForReject="N" WaitTime="0" '
+            f'AllowReassignment="0" />')
+        cond_xml = ""
+        for j, c in enumerate(st.get("conditions") or []):
+            cond_xml += (
+                f'<EPRuleCondition RuleID="{appr_guid}" RowNbr="{j + 1}" OpenBrackets="0" '
+                f'Entity="{esc(c.get("entity", entity))}" FieldName="{esc(c["field"])}" '
+                f'Condition="{int(c.get("operator", 3))}" IsRelative="0" IsActive="1" '
+                f'IsField="0" Value="{esc(c.get("value", ""))}"'
+                + (f' Value2="{esc(c["value2"])}"' if c.get("value2") is not None else "")
+                + ' CloseBrackets="0" Operator="0" />')
+        appr = (
+            f'<EPRule RuleID="{appr_guid}" StepID="{step_guid}" Sequence="2" '
+            f'Name="{esc(st.get("approver_name") or (str(st["name"]) + " Approvers"))}" '
+            f'ApproveType="{atype}" WorkgroupID="{int(st["workgroup_id"])}" RuleType="D" '
+            f'IsActive="1" EmptyStepType="N" ExecuteStep="A" ReasonForApprove="N" '
+            f'ReasonForReject="N" WaitTime="0" AllowReassignment="0"')
+        rows.append(appr + (f'>{cond_xml}</EPRule>' if cond_xml else ' />'))
+    body = "\n        ".join(rows)
+    return (
+        '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
+        '<data-set>\n'
+        '  <relations format-version="4" relations-version="20160101" '
+        'main-table="EPAssignmentMap" file-name="(Name)">\n'
+        '    <link from="EPRule (AssignmentMapID)" to="EPAssignmentMap (AssignmentMapID)" />\n'
+        '    <link from="EPRuleCondition (RuleID)" to="EPRule (RuleID)" />\n'
+        '    <link from="EPRuleEmployeeCondition (RuleID)" to="EPRule (RuleID)" />\n'
+        '    <link from="EPRuleApprover (RuleID)" to="EPRule (RuleID)" />\n'
+        '  </relations>\n'
+        '  <layout>\n'
+        '    <table name="EPAssignmentMap">\n'
+        '      <table name="EPRule" uplink="(AssignmentMapID) = (AssignmentMapID)">\n'
+        '        <table name="EPRuleCondition" uplink="(RuleID) = (RuleID)" />\n'
+        '        <table name="EPRuleEmployeeCondition" uplink="(RuleID) = (RuleID)" />\n'
+        '        <table name="EPRuleApprover" uplink="(RuleID) = (RuleID)" />\n'
+        '      </table>\n'
+        '    </table>\n'
+        '  </layout>\n'
+        '  <data>\n'
+        '    <EPAssignmentMap>\n'
+        f'      <row AssignmentMapID="0" Name="{esc(name)}" EntityType="{esc(entity)}" '
+        f'GraphType="{esc(graph_type)}" MapType="{int(map_type)}" DeletedDatabaseRecord="0">\n'
+        f'        {body}\n'
+        '      </row>\n'
+        '    </EPAssignmentMap>\n'
+        '  </data>\n'
+        '</data-set>\n')
+
+
+@mcp.tool()
+async def build_approval_map(
+    name: str,
+    entity: str,
+    steps: Any,
+    graph_type: str | None = None,
+    map_type: int = 2,
+    skip_if_exists: bool = True,
+    instance: str | None = None,
+) -> Any:
+    """Build an EP205015 Approval Map (workflow) headless — generate + import the XML.
+
+    Wraps the proven EP205015 XML round-trip so you don't hand-author the document:
+    one step-per-role, each referencing a workgroup, with optional amount/field
+    CONDITIONS (approval limits). Built live for a client approval matrix (GL Journal,
+    AR Invoices) — see [[create-dummy-employee-rest]] for the full pipeline.
+
+    name:   the approval map name (EPAssignmentMap.Name).
+    entity: the document EntityType, e.g. "PX.Objects.GL.Batch",
+        "PX.Objects.AR.ARInvoice", "PX.Objects.AP.APInvoice".
+    steps:  ordered list — the document routes through them in sequence. Each:
+        {"name": "Review",
+         "workgroup": "GL Journal - Reviewer"   # workgroup NAME (from EPCompanyTree) or WorkGroupID int
+         "approve_type": "A",                    # optional: A=any one approves (default) | W=wait for all
+         "conditions": [                         # optional — a rule fires only when ALL match
+            {"field": "DebitTotal", "operator": "ge", "value": "0.01"}]}
+        operator: "eq"|"ge"(≥, the amount-threshold operator) or the raw Condition int;
+        add "value2" for a between-band. The condition's amount FIELD is entity-specific
+        (GL Batch: DebitTotal; AR Invoice: OrigDocAmt) — check the DAC if unsure.
+    graph_type: the maintenance graph (e.g. "PX.Objects.GL.JournalEntry"). Omit to
+        DERIVE it from an existing map with the same EntityType; errors if none exists.
+    map_type:   2 (the standard approval map). skip_if_exists: refuse if a map with this
+        Name already exists (default True) — because IMPORT CREATES ONLY and EP205015
+        cannot delete/update headless, so a re-run would DUPLICATE. Set false to force.
+
+    Requires allow_write. Returns the assignment_map_id + the rules read back from
+    EPRule for verification. NOTE the create-only limitation: to change a map you must
+    delete it in the UI first (headless delete of a specific map is not possible).
+    """
+    _require_write(instance)
+    inst = _cfg().get(instance or _cfg().default)
+    step_list = list(steps) if isinstance(steps, (list, tuple)) else [steps]
+    if not step_list:
+        return {"error": "steps is empty — an approval map needs at least one step."}
+
+    # refuse duplicate name (create-only; no headless delete to undo a dupe)
+    existing = await run_dac_odata("EPAssignmentMap", filter=f"Name eq '{_oq(name)}'",
+                                   select="AssignmentMapID,Name", top=1, instance=instance)
+    ev = (existing.get("value") or []) if isinstance(existing, dict) else []
+    if skip_if_exists and ev:
+        return {"skipped": True, "name": name,
+                "assignment_map_id": ev[0].get("AssignmentMapID"),
+                "note": f"an approval map named {name!r} already exists (ID "
+                        f"{ev[0].get('AssignmentMapID')}). Refusing to create a "
+                        f"DUPLICATE — import creates only and EP205015 cannot delete "
+                        f"headless. Delete it in the UI, or pass skip_if_exists=false."}
+
+    # derive GraphType from an existing map of the same entity if not given
+    if not graph_type:
+        r = await run_dac_odata("EPAssignmentMap", filter=f"EntityType eq '{_oq(entity)}'",
+                                select="GraphType", top=1, instance=instance)
+        gv = (r.get("value") or []) if isinstance(r, dict) else []
+        graph_type = gv[0].get("GraphType") if gv else None
+        if not graph_type:
+            return {"error": f"no graph_type given and none could be derived from an "
+                             f"existing map with EntityType {entity!r} — pass graph_type=."}
+
+    # resolve workgroup names -> ids (one read) and condition operator aliases -> ints
+    wgr = await run_dac_odata("EPCompanyTree", select="WorkGroupID,Description",
+                              top=5000, instance=instance)
+    wgrows = (wgr.get("value") or []) if isinstance(wgr, dict) else []
+    name2id: dict[str, int] = {}
+    for x in wgrows:
+        name2id.setdefault(x.get("Description"), x.get("WorkGroupID"))
+    resolved: list[dict] = []
+    for st in step_list:
+        w = st.get("workgroup")
+        if isinstance(w, str) and not str(w).isdigit():
+            wid = name2id.get(w)
+            if not wid:
+                return {"error": f"step {st.get('name')!r}: workgroup {w!r} not found "
+                                 f"in EPCompanyTree (create it first with build_company_tree)."}
+        elif w is not None:
+            wid = int(w)
+        else:
+            return {"error": f"step {st.get('name')!r} has no 'workgroup'."}
+        conds = []
+        for c in (st.get("conditions") or []):
+            op = c.get("operator", 3)
+            if isinstance(op, str):
+                op = _COND_OPS.get(op.lower())
+                if op is None:
+                    return {"error": f"unknown condition operator "
+                                     f"{c.get('operator')!r}; use an int or one of "
+                                     f"{sorted(_COND_OPS)}."}
+            if not c.get("field"):
+                return {"error": f"a condition on step {st.get('name')!r} has no 'field'."}
+            conds.append({**c, "operator": op})
+        resolved.append({**st, "workgroup_id": wid, "conditions": conds})
+
+    xml = _approval_map_xml(name, entity, graph_type, resolved, map_type)
+    async with ScreenClient(inst, "EP205015") as s:
+        result = await s.ui_import_xml(xml.encode("utf-8"), filename="EP205015.xml", save=True)
+
+    # verify: find the created map (highest id with this name) + read its rules back
+    v = await run_dac_odata("EPAssignmentMap", filter=f"Name eq '{_oq(name)}'",
+                            select="AssignmentMapID,Name,EntityType", top=50, instance=instance)
+    maps = [m for m in ((v.get("value") or []) if isinstance(v, dict) else [])
+            if m.get("Name") == name]
+    map_id = max((m["AssignmentMapID"] for m in maps), default=None)
+    rules = None
+    if map_id is not None:
+        rr = await run_dac_odata("EPRule", filter=f"AssignmentMapID eq {map_id}",
+                                 select="Name,StepID,Sequence,WorkgroupID,ApproveType",
+                                 instance=instance)
+        rules = (rr.get("value") or []) if isinstance(rr, dict) else []
+    return {"name": name, "entity": entity, "graph_type": graph_type,
+            "map_type": map_type, "assignment_map_id": map_id,
+            "steps_requested": len(step_list), "rules_created": len(rules) if rules else None,
+            "rules": rules, "imported": result.get("imported"), "saved": result.get("saved"),
+            "note": "verify rules[] — each step should have one StepID=null step rule and "
+                    "one child (WorkgroupID) rule. IMPORT CREATES ONLY; EP205015 can't "
+                    "delete/update headless, so fix mistakes by deleting in the UI + rebuilding."}
+
+
 @mcp.tool()
 async def generate_master_calendar(
     from_year: str, to_year: str | None = None, instance: str | None = None
@@ -7509,7 +7710,7 @@ async def _probe_exists(client, dac: str, key: str):
 # Long-form per-tool caveats, relocated OUT of the tool docstrings.
 #
 # Every docstring is prefilled into the model's context on EVERY request, so carrying
-# the full reverse-engineering narrative on ~104 tools (112k chars, ~28k tokens) taxes
+# the full reverse-engineering narrative on ~105 tools (112k chars, ~28k tokens) taxes
 # every turn to serve a page that most calls never open. The knowledge is NOT deleted:
 # the trimmed docstring still NAMES each trap in a line (so a reader knows there is
 # something to look up, which is what stops the silent-no-op class of bug), and the
@@ -8055,7 +8256,10 @@ _GUIDE = {
             "build_company_tree (build the EP204061 workgroup hierarchy headlessly — "
             "select parent + addWorkGroup per node; deterministic at any depth)",
             "add_workgroup_member (add a member — employee code or ContactID — to a "
-            "Company Tree workgroup on EP204061)"],
+            "Company Tree workgroup on EP204061)",
+            "build_approval_map (build an EP205015 approval workflow headless — "
+            "step-per-role, each referencing a workgroup, with optional amount "
+            "conditions; generates + imports the XML)"],
         "lookups / reference data": ["ui_lookup (search any selector's table)",
             "ui_resolve_selector (resolve one selector field to {id,text} for a write)"],
         "web-service endpoints / customization": ["get_endpoint_definition",
@@ -8113,7 +8317,7 @@ _GUIDE = {
 
 @mcp.tool()
 def guide(topic: str | None = None) -> Any:
-    """START HERE — pick the right grp-mcp tool for your task (this server has ~104 tools
+    """START HERE — pick the right grp-mcp tool for your task (this server has ~105 tools
     across five Acumatica planes, so guessing wastes calls).
 
     Returns a task->tool decision map + the plane-by-shape routing rule. Read-only,

@@ -4283,3 +4283,55 @@ def test_import_screen_xml_result_warns_import_cannot_update(monkeypatch):
     # and the retired false claim must not have crept back into the docstring
     assert "UPDATES the record it came from" not in server.import_screen_xml.__doc__
     assert "IMPORT ONLY EVER *CREATES*" in server.import_screen_xml.__doc__
+
+
+def test_approval_map_xml_shape_and_conditions():
+    """_approval_map_xml builds the EP205015 graph: a step rule + a child approver
+    rule per step, WorkgroupID on the child, and EPRuleCondition when given."""
+    from grp_mcp.server import _approval_map_xml
+    xml = _approval_map_xml(
+        "GL Journal WF", "PX.Objects.GL.Batch", "PX.Objects.GL.JournalEntry",
+        [{"name": "Review", "workgroup_id": 16863, "approve_type": "A",
+          "conditions": [{"field": "DebitTotal", "operator": 3, "value": "0.01"}]},
+         {"name": "Approve", "workgroup_id": 16864, "approve_type": "A", "conditions": []}],
+        map_type=2)
+    # identity + header
+    assert 'AssignmentMapID="0"' in xml
+    assert 'EntityType="PX.Objects.GL.Batch"' in xml
+    assert 'GraphType="PX.Objects.GL.JournalEntry"' in xml
+    # two step rules (StepID null) + two child rules (WorkgroupID) = 4 EPRule
+    assert xml.count("<EPRule ") == 4
+    assert 'WorkgroupID="16863"' in xml and 'WorkgroupID="16864"' in xml
+    # the child rules reference their step via StepID
+    assert xml.count('StepID="') == 2
+    # the condition landed on the reviewer child only
+    assert xml.count("<EPRuleCondition ") == 1
+    assert 'FieldName="DebitTotal"' in xml and 'Condition="3"' in xml and 'Value="0.01"' in xml
+    # mandatory schema blocks present
+    assert "<relations" in xml and "<layout>" in xml
+
+
+def test_approval_map_xml_escapes_name():
+    from grp_mcp.server import _approval_map_xml
+    xml = _approval_map_xml("A & B <x>", "E", "G",
+                            [{"name": "S", "workgroup_id": 1}], 2)
+    assert "A &amp; B &lt;x&gt;" in xml
+    assert "A & B <x>" not in xml.split("<data>")[1]  # not raw inside data
+
+
+def test_build_approval_map_refuses_duplicate(cfg, monkeypatch):
+    from grp_mcp import server
+
+    async def fake_odata(dac, **k):
+        if dac == "EPAssignmentMap":
+            return {"value": [{"AssignmentMapID": 99, "Name": "Dup"}]}
+        return {"value": []}
+
+    monkeypatch.setattr(server, "run_dac_odata", fake_odata)
+    monkeypatch.setattr(server, "_require_write", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_cfg", lambda: type("C", (), {
+        "default": "x", "get": lambda self, n: object()})())
+    out = asyncio.run(server.build_approval_map(
+        "Dup", "PX.Objects.GL.Batch",
+        [{"name": "Approve", "workgroup": 16864}], graph_type="G"))
+    assert out.get("skipped") is True and out["assignment_map_id"] == 99
