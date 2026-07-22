@@ -3942,6 +3942,106 @@ def test_download_report_file_honors_report_filename_override():
     assert "ID=CustomName.rpx" in calls[0][1]
 
 
+# --- download_filter_report: the SECOND, modern-UI "Filter + report action" report
+# mechanism (GL601000 "Trial Balance Daily"), distinct from download_report_file's
+# CensofReportLauncher.aspx family. Fires an action via the JSON plane, follows the
+# openReport redirect's baked-in queryParams, then shares _fetch_rendered_file with
+# the classic path.
+
+def _filter_report_client(struct, command_result, get_responses):
+    """A ScreenClient stand-in for download_filter_report: stubs the high-level
+    modern-plane methods (get_ui_structure/ui_bootstrap/ui_set_field/ui_command)
+    directly rather than the raw JSON protocol, then lets _fetch_rendered_file run
+    its REAL GET-based logic against a stubbed `_http.get`."""
+    import types
+    c = object.__new__(ScreenClient)
+    c.screen_id = "GL601000"
+    c.instance = types.SimpleNamespace(base_url="https://example.invalid/Site")
+    calls: list = []
+
+    async def _struct():
+        return struct
+    async def _bootstrap(views=None):
+        calls.append(("BOOTSTRAP", views))
+    set_fields_seen: list = []
+    async def _set_field(view, field, value):
+        set_fields_seen.append((view, field, value))
+    async def _command(name, answer="ok"):
+        calls.append(("COMMAND", name))
+        return command_result
+    c.get_ui_structure, c.ui_bootstrap = _struct, _bootstrap
+    c.ui_set_field, c.ui_command = _set_field, _command
+
+    queue = list(get_responses)
+    async def _get(url, params=None):
+        calls.append(("GET", url, params))
+        return queue.pop(0)
+    c._http = types.SimpleNamespace(get=_get)
+    return c, calls, set_fields_seen
+
+
+_GL_FILTER_STRUCT = {"views": {"Filter": [{"field": "OrgBAccountID"}, {"field": "LedgerID"}]},
+                     "actions": [{"name": "printReport"}], "grids": {}}
+
+_OPEN_REPORT_RESULT = {
+    "redirects": [{
+        "url": "/frames/reportlauncher.aspx?id=gl661000.rpx",
+        "settings": {"type": "openReport"},
+        "queryParams": {"OrgBAccountID": "MAIN", "LedgerID": "ACTUAL"},
+    }],
+    "isDirty": False,
+}
+
+
+def test_download_filter_report_happy_path_follows_openreport_redirect():
+    c, calls, seen = _filter_report_client(
+        _GL_FILTER_STRUCT, _OPEN_REPORT_RESULT,
+        [_FakeGetResp(200, text=_LAUNCHER_HTML_OK),
+         _FakeGetResp(200, content=b"%PDF-1.7 gl bytes")])
+    data = asyncio.run(ScreenClient.download_filter_report(
+        c, [{"field": "OrgBAccountID", "value": "MAIN"}, {"field": "LedgerID", "value": "1"}]))
+    assert data == b"%PDF-1.7 gl bytes"
+    assert seen == [("Filter", "OrgBAccountID", "MAIN"), ("Filter", "LedgerID", "1")]
+    assert ("COMMAND", "printReport") in calls
+    launch_call = next(c for c in calls if c[0] == "GET" and "reportlauncher.aspx" in c[1])
+    # Regression check for a REAL live bug: httpx's `params=` REPLACES a URL's own
+    # query string rather than merging with it (measured, httpx 0.28) — an early
+    # version passed the bare "?id=<rpx>" URL straight to params=queryParams and
+    # silently dropped "id", leaving __instanceKey empty on GL601000. The URL passed
+    # to the client must be QUERY-FREE (id merged into the dict instead) and "id"
+    # must actually be present in that dict.
+    assert "?" not in launch_call[1]
+    assert launch_call[2] == {"id": "gl661000.rpx", "OrgBAccountID": "MAIN", "LedgerID": "ACTUAL"}
+    file_call = next(c for c in calls if c[0] == "GET" and "PX.ReportViewer.axd" in c[1])
+    assert "OpType=PdfReport" in file_call[1]
+
+
+def test_download_filter_report_raises_when_no_openreport_redirect():
+    # this screen isn't in the modern Filter+report family — a clear error, not a
+    # confusing crash reaching for a redirect that was never there
+    c, _, _ = _filter_report_client(_GL_FILTER_STRUCT, {"redirects": [], "isDirty": False}, [])
+    with pytest.raises(ScreenError, match="no 'openReport' redirect"):
+        asyncio.run(ScreenClient.download_filter_report(
+            c, [{"field": "OrgBAccountID", "value": "MAIN"}]))
+
+
+def test_download_filter_report_rejects_unknown_fmt_before_any_request():
+    c, calls, _ = _filter_report_client(_GL_FILTER_STRUCT, _OPEN_REPORT_RESULT, [])
+    with pytest.raises(ScreenError, match="unknown fmt"):
+        asyncio.run(ScreenClient.download_filter_report(
+            c, [{"field": "OrgBAccountID", "value": "MAIN"}], fmt="csv"))
+    assert calls == []
+
+
+def test_download_filter_report_requires_view_when_screen_has_multiple():
+    multi_view_struct = {"views": {"Filter": [], "Filter2": []},
+                          "actions": [{"name": "printReport"}], "grids": {}}
+    c, _, _ = _filter_report_client(multi_view_struct, _OPEN_REPORT_RESULT, [])
+    with pytest.raises(ScreenError, match="no 'view'"):
+        asyncio.run(ScreenClient.download_filter_report(
+            c, [{"field": "OrgBAccountID", "value": "MAIN"}]))
+
+
 # --- #3: run_report must resolve a site-absolute Location via _abs(), not a
 # naive base_url + location concat (which doubles the virtual directory). ---
 

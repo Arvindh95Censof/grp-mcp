@@ -2016,6 +2016,63 @@ Live-proven end to end: `AP630500`, AP Aged Period-Sensitive report —
 Content matched a live DB read of the same `Bill` records (aging-bucket amounts, netting balance of
 0.00), both with default parameters and with explicit `ReportFormat`/`FinancialPeriod` overrides.
 
+## §19 A SECOND classic-report mechanism: modern-UI "Filter screen + report action"
+
+Not every classic report screen is the `CensofReportLauncher.aspx` popup family §18 documents.
+`GL601000` ("Trial Balance Daily", found 2026-07-23 extending report support past AP630500) is
+architecturally different: `screen_get_schema` returns nothing useful (its Parameters-style container
+is named `Filter_`, not `Parameters`), and `screen_capabilities`/`ui_get_structure` show a normal
+modern-UI screen — a plain `Filter` view (required fields: `OrgBAccountID`/`LedgerID`/`PeriodStart`/
+`PeriodEnd`/two booleans) plus a `printReport` action (labeled "Run Report"). Trying to drive it as if
+it were AP630500 fails outright: `download_classic_report` 404s (`GL601000.rpx` doesn't exist — the
+underlying report file is `GL661000.rpx`, a DIFFERENT id than the screen id) and there's no
+Parameters container to read field names from in the first place.
+
+**How it actually works — no ASPX callback at all:**
+1. Set `Filter` fields via the modern JSON plane (`ui_bootstrap` + `ui_set_field` — same plane
+   `ui_screen_action` already drives).
+2. Fire the report action (`ui_command("printReport")`). The response is a plain 200 whose JSON body
+   carries `redirects: [{settings: {type: "openReport"}, url, queryParams, message}]` — `message` is
+   the report's display title ("Trial Balance Daily"), `url` is the classic launcher path **already
+   carrying its own `?id=<rpx>` query param**, and `queryParams` are the FULLY-RESOLVED filter values
+   as a ready-made query string (e.g. `{"StartDate": "07/01/2026", "OrgBAccountID": "MAIN      ", ...}`
+   — note the branch CODE, not the numeric `BAccountID` we set the field to; the modern plane resolves
+   it before baking the redirect).
+3. GET `{base}{url}` with `queryParams` merged in -> the same `__instanceKey` HTML §18's launcher GET
+   also produces.
+4. GET `PX.ReportViewer.axd?InstanceID=<key>&...` -> the rendered bytes. Identical final step to §18's
+   mechanism — both families converge on the SAME viewer handler once an `__instanceKey` exists, they
+   just obtain one completely differently.
+
+**The launcher page itself differs too**: this family uses the STOCK, lowercase, unbranded
+`reportlauncher.aspx` — not `CensofReportLauncher.aspx`, even on the same tenant. §18's docstring note
+("this tenant's launcher is Censof-branded, try the stock name as a fallback") turned out to be
+exactly backwards for this screen family: the STOCK name is the one that's actually live here.
+
+**A real bug caught before shipping, not a hypothetical**: an early version passed `redirect['url']`
+(bare, with its `"?id=<rpx>"` still attached) straight into `httpx.get(url, params=queryParams)`.
+httpx 0.28 **replaces** a URL's existing query string when `params=` is also given rather than merging
+with it (verified directly: `Request('GET', 'https://x/?id=abc', params={'y':'1'})` → `https://x/?y=1`,
+`id` silently gone) — so `id` vanished from every request, the launcher had no report to resolve, and
+`__instanceKey` came back **empty** (not missing — an empty-string `value=""` attribute IS present,
+which is a subtly different failure signature than §18's "attribute absent entirely" case; both need
+checking). Fixed by merging by hand (`urlsplit`/`parse_qsl` the existing query, `dict.update()` with
+`queryParams`, pass the query-free path + merged dict to `params=`). Regression-tested: the test
+asserts the GET URL handed to the client contains no `?` and that `"id"` is actually present in the
+merged params dict — a test that only checked the params dict in isolation (without also asserting the
+URL was query-free) would NOT have caught this, since the bug lived in the interaction between the two,
+not in either value alone.
+
+**Live-proven, `GL601000`/`GL661000`, via the actual shipped `download_filter_report` (not a scratch
+script)**: `OrgBAccountID` set to `MAIN` (a branch with real July 2026 GL activity) rendered 5 real
+accounts summing to 400.00 debit/credit; set to `YMHQ` (a real branch with none) rendered a clean,
+genuinely empty report. Row DATA differed, not just a header — the strongest tier of proof anywhere in
+this file, on the first field tested for this whole second mechanism.
+
+Exposed as the `download_filter_report` MCP tool (sibling of `download_classic_report` — NOT
+interchangeable; `screen_capabilities` tells them apart: a `Filter` view + report action means this
+tool, a `Parameters` container + popup launcher means the other).
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

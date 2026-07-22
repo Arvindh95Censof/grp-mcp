@@ -25,6 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from html import escape, unescape
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 
@@ -3989,7 +3990,6 @@ class ScreenClient:
                 f"download_report_file {self.screen_id}: unknown fmt {fmt!r} — "
                 f"expected one of {sorted(self._REPORT_FORMATS)}"
             )
-        query_suffix, expected_ct, magic_prefixes = self._REPORT_FORMATS[fmt]
         base = self.instance.base_url.rstrip("/")
         rpt = report_filename or f"{self.screen_id}.rpx"
         launcher_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&unum=0&HideScript=On"
@@ -4016,18 +4016,140 @@ class ScreenClient:
             # Post-launcher-URL for the callback omits &unum=0 (matches the live capture).
             callback_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&HideScript=On"
             await self.set_report_parameters(parameters, callback_url, instance_key, tm.group(1))
+        return await self._fetch_rendered_file(instance_key, fmt)
+
+    async def _fetch_rendered_file(self, instance_key: str, fmt: str) -> bytes:
+        """GET PX.ReportViewer.axd for an already-established report instance and
+        validate the response is genuinely the requested format (shared by
+        download_report_file's classic-launcher path and download_filter_report's
+        modern-UI path — both mechanisms end at the SAME viewer handler once an
+        instanceKey exists, they just get one differently)."""
+        if fmt not in self._REPORT_FORMATS:
+            raise ScreenError(
+                f"{self.screen_id}: unknown fmt {fmt!r} — expected one of "
+                f"{sorted(self._REPORT_FORMATS)}"
+            )
+        query_suffix, expected_ct, magic_prefixes = self._REPORT_FORMATS[fmt]
+        base = self.instance.base_url.rstrip("/")
         file_url = f"{base}/PX.ReportViewer.axd?InstanceID={instance_key}&{query_suffix}"
         r2 = await self._http.get(file_url)
         if r2.status_code >= 400:
-            raise ScreenError(
-                f"download_report_file {self.screen_id}: {fmt} GET -> HTTP {r2.status_code}"
-            )
+            raise ScreenError(f"{self.screen_id}: {fmt} GET -> HTTP {r2.status_code}")
         if not r2.content.startswith(magic_prefixes):
             raise ScreenError(
-                f"download_report_file {self.screen_id}: response was not valid {fmt} "
-                f"(expected content-type {expected_ct!r}, got "
-                f"{r2.headers.get('content-type')!r}; first bytes={r2.content[:16]!r}) — "
-                f"the report likely errored server-side, or this instance rejects the "
-                f"{fmt} export enum value (verify the exact casing in a browser capture)."
+                f"{self.screen_id}: response was not valid {fmt} (expected content-type "
+                f"{expected_ct!r}, got {r2.headers.get('content-type')!r}; first bytes="
+                f"{r2.content[:16]!r}) — the report likely errored server-side, or this "
+                f"instance rejects the {fmt} export enum value (verify the exact casing "
+                f"in a browser capture)."
             )
         return r2.content
+
+    async def download_filter_report(
+        self,
+        set_fields: list[dict],
+        action: str = "printReport",
+        fmt: str = "pdf",
+    ) -> bytes:
+        """Render a MODERN-UI "Filter screen + report action" screen (e.g. GL601000
+        "Trial Balance Daily") and return its rendered bytes — a SECOND, DIFFERENT
+        classic-report mechanism from download_report_file's, discovered live on
+        csmdev 2026-07-23 while extending report support beyond AP630500.
+
+        Some report screens are NOT the CensofReportLauncher.aspx popup family at
+        all: ui_get_structure shows a plain "Filter" view (required fields only, no
+        Parameters container) plus a `printReport`-style action ("Run Report").
+        Firing that action returns an `openReport` redirect whose `queryParams`
+        ALREADY carry the fully-resolved filter values baked into a query string —
+        there is no ASPX-callback Params-tab step at all for this family:
+
+          1. ui_bootstrap + ui_set_field per `set_fields` entry (modern JSON plane).
+          2. ui_command(action) -> a 200 whose JSON body carries
+             `redirects: [{settings: {type: "openReport"}, url, queryParams}]`.
+             `url` is the classic launcher path WITH ITS OWN "id=<rpx>" query param
+             already on it (note: the STOCK "reportlauncher.aspx", lowercase, no
+             Censof branding — a DIFFERENT launcher page than AP630500's, even on
+             the same tenant); `queryParams` are the filter values to add alongside.
+          3. GET {base}{url} with `queryParams` merged in -> the same
+             `__instanceKey` HTML this class's classic path also produces.
+          4. _fetch_rendered_file() — identical final step to download_report_file.
+
+        Step 3's merge is done BY HAND (urlsplit/parse_qsl), not via httpx's own
+        `params=` argument — caught live: `url` already carries "?id=<rpx>", and
+        httpx 0.28's `params=` REPLACES a URL's existing query string rather than
+        merging with it, silently dropping "id" and leaving `__instanceKey` empty.
+        Regression-tested (asserts the GET URL passed to the client is query-free
+        and "id" is actually present in the merged params dict).
+
+        Live-proven, GL601000 "Trial Balance Daily" (-> report GL661000): setting
+        `OrgBAccountID` to MAIN's vs YMHQ's branch code rendered genuinely different
+        output — MAIN showed 5 real GL accounts summing to 400.00 debit/credit;
+        YMHQ (a real branch with no GL activity) rendered a clean empty report. Not
+        just a header change — the row DATA differed, the strongest tier of proof
+        used anywhere in this file.
+
+        set_fields: [{"field": <raw field from ui_get_structure's Filter view>,
+            "value": ...}] — e.g. [{"field": "OrgBAccountID", "value": "MAIN"}].
+            `view` is optional (defaults to the sole view when there's only one).
+        action: the report-firing command from ui_get_structure `actions`
+            (default "printReport" — matches every screen seen in this family so
+            far; override if a different screen names it differently).
+
+        Raises ScreenError if the action's response carries no `openReport`
+        redirect (this screen isn't in this family — try download_report_file
+        instead) or if the final file fetch fails/validates wrong (see
+        _fetch_rendered_file).
+        """
+        if fmt not in self._REPORT_FORMATS:
+            raise ScreenError(
+                f"download_filter_report {self.screen_id}: unknown fmt {fmt!r} — "
+                f"expected one of {sorted(self._REPORT_FORMATS)}"
+            )
+        struct = await self.get_ui_structure()
+        views = list(struct.get("views", {}))
+        default_view = views[0] if len(views) == 1 else None
+        await self.ui_bootstrap(views)
+        for entry in set_fields:
+            view = entry.get("view") or default_view
+            if not view:
+                raise ScreenError(
+                    f"download_filter_report {self.screen_id}: set_fields entry "
+                    f"{entry!r} has no 'view' and the screen has {len(views)} views "
+                    f"({views!r}) — 'view' is required when there's more than one."
+                )
+            await self.ui_set_field(view, entry["field"], entry["value"])
+        result = await self.ui_command(action)
+        redirect = next(
+            (r for r in (result.get("redirects") or [])
+             if (r.get("settings") or {}).get("type") == "openReport"),
+            None,
+        )
+        if redirect is None:
+            raise ScreenError(
+                f"download_filter_report {self.screen_id}: {action!r} returned no "
+                f"'openReport' redirect — this screen may not be in the modern "
+                f"Filter+report family; try download_report_file instead."
+            )
+        base = self.instance.base_url.rstrip("/")
+        # `redirect['url']` already carries its own query string ("?id=<rpx>"). httpx's
+        # `params=` REPLACES a URL's existing query string rather than merging with it
+        # (measured live, httpx 0.28: a URL with "?id=x" plus params={"y": "1"} lands
+        # as "?y=1" — "id" silently vanishes) — so merge by hand instead of relying on
+        # the client to combine them, or the launcher never gets its report id at all.
+        split = urlsplit(redirect["url"])
+        merged = dict(parse_qsl(split.query))
+        merged.update(redirect.get("queryParams") or {})
+        launch_url = f"{base}{split.path}"
+        r1 = await self._http.get(launch_url, params=merged)
+        if r1.status_code >= 400:
+            raise ScreenError(
+                f"download_filter_report {self.screen_id}: launcher GET -> "
+                f"HTTP {r1.status_code}"
+            )
+        m = re.search(r'name="__instanceKey"[^>]*value="([a-f0-9]+)"', r1.text)
+        if not m:
+            raise ScreenError(
+                f"download_filter_report {self.screen_id}: __instanceKey not found "
+                f"in launcher response."
+            )
+        return await self._fetch_rendered_file(m.group(1), fmt)

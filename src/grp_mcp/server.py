@@ -8289,7 +8289,11 @@ _GUIDE = {
             "run_report (contract-REST Report entity — needs SM207060 setup first)",
             "download_classic_report (classic report screens, e.g. AP630500 — no setup "
             "needed, works where run_report/screen_capabilities can't reach; supports "
-            "`parameters` to set report filter fields, e.g. ReportFormat/FinancialPeriod)"],
+            "`parameters` to set report filter fields, e.g. ReportFormat/FinancialPeriod)",
+            "download_filter_report (modern-UI 'Filter screen + report action' screens, "
+            "e.g. GL601000 Trial Balance Daily — a DIFFERENT mechanism from "
+            "download_classic_report; use when screen_capabilities shows a Filter view "
+            "+ a report-firing action instead of a Parameters container)"],
         "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],
         "sessions / config / seats": ["release_sessions (free API seats)", "test_connection",
             "reload_config", "set_active_instance", "add_instance", "remove_instance"],
@@ -8884,6 +8888,76 @@ async def download_classic_report(
         "bytes": len(data),
         "path": out_path,
         "parameters": parameters or [],
+        "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
+    }
+
+
+@mcp.tool()
+async def download_filter_report(
+    screen_id: str,
+    out_path: str,
+    set_fields: list[dict],
+    action: str = "printReport",
+    fmt: str = "pdf",
+    instance: str | None = None,
+) -> Any:
+    """Render a MODERN-UI "Filter screen + report action" screen (e.g. GL601000
+    "Trial Balance Daily") and save the rendered file (PDF or Excel) to disk.
+
+    A SECOND, DIFFERENT classic-report mechanism from download_classic_report's —
+    found live on csmdev 2026-07-23. Use screen_capabilities or ui_get_structure
+    first to tell them apart: this family shows a plain "Filter" view (no
+    "Parameters" container, screen_get_schema returns nothing useful) plus a
+    report-firing action ("Run Report" / internal name usually "printReport"). If
+    a screen instead has a "Parameters" container in screen_get_schema and a
+    CensofReportLauncher.aspx-style popup, use download_classic_report — the two
+    tools are NOT interchangeable, they drive completely different protocols.
+
+    Mechanism: set_fields go through the modern JSON plane (like ui_screen_action),
+    then firing `action` returns an `openReport` redirect whose `queryParams`
+    ALREADY carry the fully-resolved filter values as a query string — no
+    ASPX-callback Params-tab step at all. That query string is then GETed against
+    the STOCK (lowercase, unbranded) "reportlauncher.aspx" — note this is a
+    DIFFERENT launcher page than download_classic_report's Censof-branded one,
+    even on the same tenant — to get an `__instanceKey`, then PX.ReportViewer.axd
+    returns the bytes exactly like the classic path.
+
+    Live-proven, GL601000 "Trial Balance Daily" (underlying report GL661000):
+    setting `OrgBAccountID` to a branch with GL activity ("MAIN") vs one without
+    ("YMHQ") rendered genuinely different ROW DATA — 5 real accounts summing to
+    400.00 vs a clean empty report — not just a header change.
+
+    set_fields: [{"field": <raw field name from ui_get_structure's Filter view>,
+        "value": ...}] — e.g. [{"field": "OrgBAccountID", "value": "MAIN"},
+        {"field": "LedgerID", "value": "1"}, {"field": "PeriodStart",
+        "value": "2026-07-01"}, {"field": "PeriodEnd", "value": "2026-07-31"}].
+        Booleans pass as real bool values. `view` is optional per entry — only
+        needed if the screen has more than one Filter-like view.
+    action: the report-firing command (default "printReport" — every screen seen
+        in this family so far uses this name; override if a screen names it
+        differently, per its ui_get_structure `actions`).
+    fmt: "pdf" (default) or "excel" — same format handling as download_classic_report.
+
+    Raises a clear error if `action`'s response carries no `openReport` redirect
+    (this screen isn't in this family — try download_classic_report instead).
+
+    Requires "allow_write": true (fields are staged through a real modern-UI write,
+    even though nothing is persisted — firing a report action does not Save).
+    out_path must be within the instance's write_roots (if configured).
+    """
+    _require_write(instance)
+    dest = _check_write_path(out_path, instance)
+    inst = _cfg().get(instance or _cfg().default)
+    async with ScreenClient(inst, screen_id) as s:
+        data = await s.download_filter_report(set_fields, action=action, fmt=fmt)
+    dest.write_bytes(data)
+    return {
+        "screen_id": screen_id,
+        "fmt": fmt,
+        "bytes": len(data),
+        "path": out_path,
+        "set_fields": set_fields,
+        "action": action,
         "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }
 
