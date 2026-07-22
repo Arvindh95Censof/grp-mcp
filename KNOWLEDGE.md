@@ -1879,15 +1879,32 @@ clean and correct for it. Conclusion: `_state` is a per-field-type opt-in (`Form
 `ScreenClient._COMBO_STATE_FIELDS`), never a blanket "send both, it's harmless" — it categorically is
 NOT harmless for at least one common field shape.
 
-Live-proven, `AP630500`, via the actual shipped code (not just the reverse-engineering scratch script):
-`ReportFormat` "Summary"/"Detailed" (title + row structure genuinely change — Summary collapses to
-vendor-level, no document rows) and `FinancialPeriod` across 5 different months (rendered period label
-changes; months with no data render genuinely empty, matching a live DB check; `07-2026` — the month
-with real `Bill` data — still returns the correct 4 rows), including both parameters together in one
-call. Fields beyond these two (`Branch`/`Company`/`VendorClass`/...) are assumed to follow the
-`PXSelector`/`$text`-only pattern (same shape as the verified `FinancialPeriod`) but have not been
-individually tested — an unrecognized friendly name raises a clear `ScreenError` rather than silently
-doing nothing.
+Live-proven WORKING, `AP630500`, via the actual shipped code (not just the reverse-engineering scratch
+script): `ReportFormat` "Summary"/"Detailed" (title + row structure genuinely change — Summary
+collapses to vendor-level, no document rows) and `FinancialPeriod` across 5 different months (rendered
+period label changes; months with no data render genuinely empty, matching a live DB check; `07-2026`
+— the month with real `Bill` data — still returns the correct 4 rows), including both parameters
+together in one call.
+
+**Live-proven NOT WORKING (2026-07-23, same-day follow-up test) — `Branch` and `VendorClass` are
+silently ignored.** The assumption two paragraphs up ("other PXSelector fields probably follow the
+same `$text`-only pattern as FinancialPeriod") was WRONG for these two specific fields — caught before
+it shipped as fact, but worth recording so it isn't re-assumed. Tried, against a live vendor (`VEND01`,
+class `DEFAULT`, posted to branch `MAIN`):
+- `Branch` = `"YMHQ"` (plain code), `"YMHQ - YAYASAN MELAKA"` (full "CODE - Description" display text,
+  matching what the UI actually shows for this field, unlike FinancialPeriod's bare code) — both
+  rendered with `Branch: MAIN` still in the header, unchanged.
+- `VendorClass` = `"STAFF"` (should exclude a DEFAULT-class vendor) vs `"DEFAULT"` (should include it)
+  — BOTH rendered `VEND01` present. No filtering occurred either way.
+
+No error, no field-error in the response — the `$text` value is accepted and silently discarded by
+whatever mechanism the launcher uses for these two fields, same failure SHAPE as the original
+`submit()` bug this section already documents, but a DIFFERENT root cause (this is after the fix,
+through the now-working ASPX-callback path — these two fields specifically don't respond to it).
+Root cause not yet isolated; would need another browser-capture session focused on changing Branch/
+VendorClass specifically (the original capture only exercised Format and PeriodID). **Only
+`ReportFormat` and `FinancialPeriod` are confirmed working — do not assume any other Parameters field
+does, including ones that look structurally identical to `FinancialPeriod`.**
 
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you

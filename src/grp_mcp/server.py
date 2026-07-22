@@ -8831,14 +8831,22 @@ async def download_classic_report(
         ScreenClient.set_report_parameters's docstring and KNOWLEDGE.md §18 for the
         full story — including a corrected earlier false-positive "proof".)
 
-        Live-verified: ReportFormat "Summary"/"Detailed" (title + row structure
+        Live-verified WORKING: ReportFormat "Summary"/"Detailed" (title + row structure
         genuinely change) and FinancialPeriod (5 different months, rendered period
         label changes, empty months genuinely render empty — matches a live DB check)
-        on AP630500, including both together in one call. Fields OTHER than
-        ReportFormat/FinancialPeriod (Branch/Company/VendorClass/...) are assumed to
-        work the same way (same PXSelector shape as the verified FinancialPeriod) but
-        have not been individually tested — an unrecognized friendly name raises a
-        clear error rather than silently doing nothing.
+        on AP630500, including both together in one call.
+
+        Live-verified NOT WORKING (2026-07-23): Branch and VendorClass are silently
+        IGNORED — every value tried (plain code, "CODE - Description" display text,
+        a genuinely different branch, a vendor class that excludes the test vendor)
+        rendered the SAME unfiltered default output, no error. Unlike FinancialPeriod,
+        these two fields' `$text`-only mechanism does not reach the launcher's real
+        filter state — root cause not yet found (see KNOWLEDGE.md §18). Do not rely on
+        Branch/VendorClass filtering through this tool yet; only ReportFormat and
+        FinancialPeriod are confirmed. An unrecognized friendly name still raises a
+        clear error rather than silently doing nothing (that's a different failure
+        mode from this one — Branch/VendorClass ARE recognized fields, they just don't
+        take effect).
     report_filename: override the default "{screen_id}.rpx" report-file guess if a
         screen's underlying report differs from its screen ID (rare).
 

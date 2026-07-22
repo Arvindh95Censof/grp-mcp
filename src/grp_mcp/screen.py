@@ -3766,14 +3766,28 @@ class ScreenClient:
         "ed" + the raw field name, verified for Format and PeriodID, assumed uniform
         for the rest of the Parameters container.
 
-        Live-proven: AP630500 — ReportFormat "Summary" (title changed to "(Summary)",
-        row structure genuinely collapsed to vendor-level, via $text+_state) and
-        FinancialPeriod "05-2026"/"04-2026"/"03-2026"/"02-2026"/"01-2026" (rendered
-        period label changed cleanly via $text ALONE; period genuinely empty for those
-        months — no bills exist there — matching a live DB check), including both
-        together in one call.
+        Live-proven WORKING: AP630500 — ReportFormat "Summary" (title changed to
+        "(Summary)", row structure genuinely collapsed to vendor-level, via
+        $text+_state) and FinancialPeriod "05-2026"/"04-2026"/"03-2026"/"02-2026"/
+        "01-2026" (rendered period label changed cleanly via $text ALONE; period
+        genuinely empty for those months — no bills exist there — matching a live DB
+        check), including both together in one call.
 
-        Raises ScreenError on an unknown friendly field name or a non-2xx response.
+        Live-proven NOT WORKING (2026-07-23): Branch and VendorClass, via $text alone,
+        are silently ignored — tried a plain code, the full "CODE - Description"
+        display text (matching what the UI shows for these two fields, unlike
+        FinancialPeriod's bare code), a genuinely different branch (YMHQ vs the
+        default MAIN), and a vendor class that should exclude the test vendor
+        (STAFF, when the vendor is class DEFAULT) — every one rendered the SAME
+        unfiltered default output. FinancialPeriod's `$text`-only mechanism does NOT
+        generalize to every PXSelector field on this screen; root cause not yet
+        found (needs another browser-capture session to isolate what these two
+        fields actually need). Do not assume an untested field works — only
+        ReportFormat and FinancialPeriod are confirmed.
+
+        Raises ScreenError on an unknown friendly field name or a non-2xx response —
+        but NOT on a recognized field that silently fails to apply (Branch/VendorClass
+        currently do this; see above).
         """
         schema = await self.get_schema()
         param_fields = schema.get("containers", {}).get("Parameters", {})
