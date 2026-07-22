@@ -1921,7 +1921,7 @@ defaults to the bare-`$text` shape that's correct for `FinancialPeriod`:
 |---|---|---|---|
 | PXTEXT COMBO | `Format` | `<PText Value="<code>"/>` — REQUIRED | full value |
 | BARE SELECTOR | `PeriodID` | **omit entirely** — sending it AT ALL corrupts the value | full value |
-| LOOKUP SELECTOR | `BranchID`, `ClassID` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
+| LOOKUP SELECTOR | `BranchID`, `ClassID`, `OrganizationID` | `<PXSelector Value="<code>"/>` — REQUIRED, `DataValues` not needed | bare code |
 
 Live-proven WORKING via the actual shipped code (not just the reverse-engineering scratch script):
 `Branch` (`MAIN` includes the test vendor's bills, `YMHQ` correctly excludes them — a genuinely
@@ -1929,10 +1929,13 @@ different branch, not just a different label) and `VendorClass` (`DEFAULT` inclu
 correctly excludes it), each independently and combined with `ReportFormat`+`FinancialPeriod` in one
 call (4 parameters at once).
 
-**Unverified: `Company` (`OrganizationID`).** Posts cleanly via the LOOKUP SELECTOR shape (no error,
-same as Branch) — but this tenant has only ONE organization, so there is nothing to switch TO, and the
-actual filtering effect can't be proven the way Branch/VendorClass's could. Only the wire shape is
-confirmed for `Company`, not the filtering behavior.
+**`Company` (`OrganizationID`) — verified 2026-07-22, once a 2nd org existed to test against.** csmdev
+gained a second organization ("YM"/Yayasan Melaka) mid-project, unblocking the test the single-org
+tenant couldn't run before: `Company="YM"` vs the default `"AI STAGING"` changed the printed
+`Company:` header AND emptied the report body (`Company Total` went to 0) — `MAIN` branch's AP bills
+belong to `AI STAGING`'s org, not `YM`'s, so switching org while `Branch` stayed at its `MAIN` default
+correctly returned nothing. Same LOOKUP SELECTOR shape as Branch/VendorClass, now equally proven —
+not just a clean-post wire-shape check.
 
 **The meta-lesson, stated plainly because it cost two ship cycles:** a field that is
 structurally/visually identical to a previously-verified field (Branch and Company both LOOK like

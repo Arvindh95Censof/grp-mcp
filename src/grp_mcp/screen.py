@@ -3739,11 +3739,12 @@ class ScreenClient:
     #      does not need the "<code> - <Description>" form the UI displays either —
     #      the bare code is sufficient (tested).
     #
-    # Company (OrganizationID) is included here too — tried the same PXSelector shape,
-    # posts cleanly (no error, no corruption) — but this tenant has only ONE
-    # organization, so there's nothing to switch TO: the actual FILTERING effect is
-    # unverified, unlike Branch/VendorClass where a second value existed to prove the
-    # report's output genuinely changed. Only the wire shape is confirmed for Company.
+    # Company (OrganizationID) uses the SAME PXSelector shape and its filtering effect
+    # IS proven (2026-07-22, csmdev gained a 2nd org "YM" mid-project): Company="YM" vs
+    # the default "AI STAGING" changed the printed "Company:" header AND emptied the
+    # report body (Company Total went to 0) — MAIN branch's AP bills belong to AI
+    # STAGING's org, not YM's, so switching org with Branch left at its MAIN default
+    # correctly returned nothing. Same shape as Branch/VendorClass, now equally proven.
     # Everything else not listed here defaults to case 2 (bare `$text`), which is
     # CORRECT for PeriodID but unverified for any other untested field. Don't extend
     # either mapping on a guess; measure first — that's exactly how Branch/VendorClass
@@ -3795,14 +3796,14 @@ class ScreenClient:
           excluding a DEFAULT-class vendor) — via LOOKUP SELECTOR shape. This
           corrects the immediately-preceding release, which shipped with these two
           fields defaulting to the WRONG (bare-selector) shape and silently no-op'ing.
+        - Company (AI STAGING vs YM, csmdev's 2nd org) — via LOOKUP SELECTOR shape:
+          the printed "Company:" header changed AND the body genuinely emptied
+          (MAIN branch's bills belong to AI STAGING, not YM).
         All confirmed together in combined calls (format+period, branch+class+period).
 
-        Unverified: Company (OrganizationID) posts cleanly via the same LOOKUP
-        SELECTOR shape but this tenant has only one organization, so the actual
-        FILTERING effect can't be proven the way Branch/VendorClass's could (a second
-        value existed to switch to). Any field not in _PXTEXT_COMBO_FIELDS or
-        _LOOKUP_SELECTOR_FIELDS defaults to the BARE SELECTOR (`$text`-only) shape —
-        correct for PeriodID, unverified for anything else not yet individually tested.
+        Any field not in _PXTEXT_COMBO_FIELDS or _LOOKUP_SELECTOR_FIELDS defaults to
+        the BARE SELECTOR (`$text`-only) shape — correct for PeriodID, unverified for
+        anything else not yet individually tested.
 
         Raises ScreenError on an unknown friendly field name or a non-2xx response —
         but NOT on a recognized field whose shape hasn't been verified and turns out

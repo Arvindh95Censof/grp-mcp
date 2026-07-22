@@ -8834,18 +8834,18 @@ async def download_classic_report(
         Live-verified WORKING, AP630500: ReportFormat "Summary"/"Detailed" (title + row
         structure genuinely change), FinancialPeriod (5 different months, rendered
         period label changes, empty months genuinely render empty — matches a live DB
-        check), and Branch/VendorClass (MAIN vs YMHQ, DEFAULT vs STAFF — correctly
-        included/excluded a test vendor by class and by branch), all confirmed
+        check), Branch/VendorClass (MAIN vs YMHQ, DEFAULT vs STAFF — correctly
+        included/excluded a test vendor by class and by branch), and Company (AI
+        STAGING vs YM, csmdev's 2nd org — the header changed AND the body genuinely
+        emptied since MAIN branch's bills belong to the other org), all confirmed
         together in combined calls. A prior release shipped Branch/VendorClass
         defaulting to the wrong wire shape and silently no-op'ing; that's fixed — see
         KNOWLEDGE.md §18 for the three distinct field-type shapes this now handles
         automatically (you don't need to know which shape a field uses).
 
-        Unverified: Company (OrganizationID) — posts without error via the same shape
-        as Branch, but this tenant has only one organization, so the actual filtering
-        effect can't be proven. Any Parameters field not yet individually tested
-        defaults to the shape verified for FinancialPeriod, which may not be correct
-        for every field. An unrecognized friendly name raises a clear error.
+        Any Parameters field not yet individually tested defaults to the shape
+        verified for FinancialPeriod, which may not be correct for every field. An
+        unrecognized friendly name raises a clear error.
     report_filename: override the default "{screen_id}.rpx" report-file guess if a
         screen's underlying report differs from its screen ID (rare).
 

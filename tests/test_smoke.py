@@ -3730,6 +3730,7 @@ _FAKE_REPORT_SCHEMA = {
             "ReportFormat": {"object": "Parameters", "field": "Format"},
             "FinancialPeriod": {"object": "Parameters", "field": "PeriodID"},
             "Branch": {"object": "Parameters", "field": "BranchID"},
+            "Company": {"object": "Parameters", "field": "OrganizationID"},
         }
     }
 }
@@ -3807,7 +3808,8 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     asyncio.run(ScreenClient.set_report_parameters(
         c, [{"set": "ReportFormat", "to": "Summary"},
             {"set": "FinancialPeriod", "to": "03-2026"},
-            {"set": "Branch", "to": "YMHQ"}],
+            {"set": "Branch", "to": "YMHQ"},
+            {"set": "Company", "to": "YM"}],
         "https://example.invalid/launcher", "key123", "tok123"))
     form = calls[-1][2]
     # shape 1: PXTEXT COMBO
@@ -3816,9 +3818,11 @@ def test_download_report_file_three_field_shapes_get_distinct_wire_forms():
     # shape 2: BARE SELECTOR — _state must be absent
     assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form
     assert form["viewer$par$tab$t0$pForm$edPeriodID$text"] == "03-2026"
-    # shape 3: LOOKUP SELECTOR
+    # shape 3: LOOKUP SELECTOR (Branch, and Company shares the same shape)
     assert form["viewer_par_tab_t0_pForm_edBranchID_state"] == '<PXSelector Value="YMHQ"/>'
     assert form["viewer$par$tab$t0$pForm$edBranchID$text"] == "YMHQ"
+    assert form["viewer_par_tab_t0_pForm_edOrganizationID_state"] == '<PXSelector Value="YM"/>'
+    assert form["viewer$par$tab$t0$pForm$edOrganizationID$text"] == "YM"
 
 
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
