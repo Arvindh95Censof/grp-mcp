@@ -8293,7 +8293,10 @@ _GUIDE = {
             "download_filter_report (modern-UI 'Filter screen + report action' screens, "
             "e.g. GL601000 Trial Balance Daily — a DIFFERENT mechanism from "
             "download_classic_report; use when screen_capabilities shows a Filter view "
-            "+ a report-firing action instead of a Parameters container)"],
+            "+ a report-firing action instead of a Parameters container)",
+            "report_param_probe (discover a classic report screen's parameter wire-shapes "
+            "from its rendered DOM — only for an UNFAMILIAR screen whose filters don't "
+            "take effect; feeds param_contract into download_classic_report)"],
         "actions": ["list_actions", "invoke_action", "poll_action (async 202)"],
         "sessions / config / seats": ["release_sessions (free API seats)", "test_connection",
             "reload_config", "set_active_instance", "add_instance", "remove_instance"],
@@ -8805,12 +8808,17 @@ async def download_classic_report(
     parameters: list[dict] | None = None,
     report_filename: str | None = None,
     fmt: str = "pdf",
+    param_contract: dict | None = None,
     instance: str | None = None,
 ) -> Any:
     """Render a CLASSIC report screen (AP630500, AR6xxxxx, SM2xxxxx family — the ones
     screen_capabilities/ui_get_structure fail on with "the view doesn't exist") and
     save the rendered file (PDF or Excel) to disk. Fully headless — no browser, no
     SM207060 endpoint entity needed.
+
+    param_contract (optional): a `{raw_field: {"shape": ...}}` map from report_param_probe
+    — supply it only for an UNFAMILIAR report screen whose parameters don't filter with
+    the built-in shapes. The known AP/AR/GL report families need nothing here.
 
     This is a DIFFERENT mechanism from run_report (which drives a contract-REST
     Report-type endpoint entity — requires SM207060 setup per report and only works
@@ -8888,7 +8896,8 @@ async def download_classic_report(
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
         data = await s.download_report_file(
-            parameters=parameters, report_filename=report_filename, fmt=fmt)
+            parameters=parameters, report_filename=report_filename, fmt=fmt,
+            param_contract=param_contract)
     dest.write_bytes(data)
     return {
         "screen_id": screen_id,
@@ -8898,6 +8907,46 @@ async def download_classic_report(
         "parameters": parameters or [],
         "sandbox": _cfg().get(instance or _cfg().default).fs_sandbox("write"),
     }
+
+
+@mcp.tool()
+async def report_param_probe(probed_fields: list[dict] | None = None) -> Any:
+    """Discover a classic report screen's parameter wire-shapes as a machine-readable
+    contract — the deterministic alternative to guessing shapes field-by-field.
+
+    Classic report screens publish NO server-side contract for how to submit each
+    parameter (ui_get_structure fails; SOAP GetSchema has field names only; the launcher
+    HTML has no descriptor — the widgets are built client-side). The ONE machine-readable
+    source is the RENDERED DOM: each parameter widget's CSS class + initial `_state`
+    value deterministically encode its wire shape. This tool bridges that.
+
+    TWO modes:
+      • No args -> returns {probe_js, howto}. Run `probe_js` in the report screen's page
+        (a browser MCP: navigate to Main?ScreenId=<SCREEN>, wait for load, execute the
+        script — it auto-finds the launcher iframe). It returns one row per parameter:
+        {field, template, widgetClass, stateInit}.
+      • probed_fields=<that list> -> returns {contract} — a {raw_field: {"shape": ...}}
+        map ready to pass to download_classic_report(param_contract=...).
+
+    You only need this for an UNFAMILIAR report screen whose filters don't take effect
+    with the built-in shapes; the known AP/AR/GL report families work with no probe. Once
+    probed, cache the contract — every later render of that screen is pure HTTP, no
+    browser. Read-only (pure classification; no ERP call, no write).
+    """
+    from . import report_params
+    if probed_fields is None:
+        return {
+            "probe_js": report_params.PROBE_JS,
+            "howto": ("1) Open the report screen in a browser MCP: navigate to "
+                      "{base}/Main?ScreenId=<SCREEN>, wait ~4s for the launcher to render. "
+                      "2) Execute probe_js (it locates the launcher iframe and reads each "
+                      "parameter's widget class + initial _state). 3) Pass its output back "
+                      "here as probed_fields to get the contract. 4) Pass that contract to "
+                      "download_classic_report(param_contract=...)."),
+            "shapes": list(report_params.SHAPES),
+        }
+    contract = report_params.build_contract(probed_fields)
+    return {"contract": contract, "field_count": len(contract)}
 
 
 @mcp.tool()

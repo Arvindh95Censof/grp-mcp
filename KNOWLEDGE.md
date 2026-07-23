@@ -2044,6 +2044,42 @@ GL632000 regressions still pass (the extra unknown-name fields are ignored there
 field name works on screen A but no-ops on screen B, suspect the CONTAINER PATH, not just the field —
 and if you can't read the layout from the server response, send both and let the server pick.
 
+**The machine-readable contract for report params — it EXISTS, but only in the rendered DOM (0.69.3,
+`report_params.py`).** After ten screen-by-screen gotchas the pattern was clear enough to make
+deterministic. Confirmed NOT machine-readable: SOAP GetSchema (field NAMES only, zero control-type
+info — the only XML attributes are namespace decls); the launcher's static HTML (no descriptor — params
+are built client-side by bundle JS); and the runtime callbacks aren't cleanly httpx-replayable. What IS
+a deterministic contract: the RENDERED DOM. Each parameter widget's CSS class + its initial `_state`
+value unambiguously encode the wire shape, and the element id encodes the control template. Verified
+across AP630500 / AP631200 / AR631000 (AP+AR+GL):
+
+| widget CSS class | initial `_state` | wire shape | emit |
+|---|---|---|---|
+| `drop-down__editor` / `dropDown` | `<PText …>` | combo | `_state=<PText Value="{code}"/>` + `$text` |
+| `selector` | `<PXSelector …>` or empty | lookup | `_state=<PXSelector Value="{v}"/>` + `$text` |
+| `selector` (financial-period field) | empty | **bare_selector** | `$text` ONLY — `_state` CORRUPTS a dash value |
+| `branch-selector__editor` | empty | bare_name | bare control name = v, `_state`="" |
+| `qp-datetime__editor` | empty | date | `$text` ONLY (dd/mm/yyyy) |
+| `qp-checkbox` | empty | bool | `$text` true/false (unverified filtering) |
+| `qp-integer` / `qp-text-editor` | empty | text | `$text` ONLY |
+
+The ONE genuine ambiguity: a financial-period selector (`PeriodID`) renders with the SAME `selector`
+class as a lookup, but `_state` corrupts its dash value (verified: `<PXSelector Value="03-2026"/>` →
+the report prints "Fin. Period: 03- 202"), so it must post bare `$text`. The DOM can't separate it by
+class — `report_params.PERIOD_SELECTOR_FIELDS` does it by field name. Everything else is class-derived.
+`AgeDate` verified live: aging as of `01/06/2027` (dd/mm/yyyy, bare `$text`) correctly moved the invoices
+from "1-30 Days" to "Over 180 Days".
+
+Wiring: `report_params.classify_param()` maps the two DOM signals to a shape; `PROBE_JS` reads them off
+the live launcher (the ONE browser step, cached forever after per screen); `build_contract()` +
+`report_param_probe` MCP tool turn a probe into `{field:{shape}}`; `download_classic_report(
+param_contract=...)` applies it, overriding the legacy registries. Proven end-to-end on the FRESH
+AR631000 screen: `CustomerID` (in no registry) was DOM-classified `lookup` and filtered the report to
+"Customer: CUST01" with only its 2 docs. So any report screen is now deterministic on first contact —
+one DOM probe, no field-by-field A/B guessing. (grp-mcp has no headless browser; the DOM read is
+agent-driven via a browser MCP, then httpx forever after. Full in-tool auto-probe would need playwright
+added — deliberately not done.)
+
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
 point at a different `.rpx` if the `{ScreenID}.rpx` convention doesn't hold, but the LAUNCHER PAGE

@@ -3875,11 +3875,54 @@ class ScreenClient:
         ("viewer_par_tab_t0_ed", "viewer$par$tab$t0$ed"),              # tab-direct layout
     )
 
+    def _emit_report_param(self, form: dict, raw_field: str, value,
+                           shape: str, options: dict | None = None) -> None:
+        """Write one report parameter into `form` under BOTH control templates, using the
+        given wire `shape` (from report_params.classify_param or the legacy registries).
+
+        Shapes (see report_params.py): combo / lookup / bare_name / bare_selector / date
+        / bool / text. All but combo/lookup/bare_name post bare `$text` with no `_state`
+        (sending `_state` to a bare_selector like PeriodID CORRUPTS a dash value)."""
+        v = str(value)
+        for state_pfx, post_pfx in self._CONTROL_PREFIXES:
+            if shape == "combo":
+                code = (options or {}).get(v.strip().lower(), value)
+                form[f"{state_pfx}{raw_field}_state"] = f'<PText Value="{escape(str(code))}"/>'
+                form[f"{post_pfx}{raw_field}$text"] = v
+            elif shape == "lookup":
+                form[f"{state_pfx}{raw_field}_state"] = f'<PXSelector Value="{escape(v)}"/>'
+                form[f"{post_pfx}{raw_field}$text"] = v
+            elif shape == "bare_name":
+                form[f"{post_pfx}{raw_field}"] = v
+                form[f"{state_pfx}{raw_field}_state"] = ""
+            else:  # bare_selector / date / bool / text -> `$text` only, NO `_state`
+                form[f"{post_pfx}{raw_field}$text"] = v
+
+    def _legacy_shape_for(self, raw_field: str) -> tuple[str, dict | None]:
+        """The wire shape for a raw field from the hardcoded registries — the fallback
+        when no discovered contract is supplied. Mirrors report_params classification for
+        the fields characterised on AP630500/AP631200/GL632000."""
+        combo = self._PXTEXT_COMBO_FIELDS.get(raw_field)
+        if combo is not None:
+            return "combo", combo
+        if raw_field in self._BARE_NAME_FIELDS:
+            return "bare_name", None
+        if raw_field in self._LOOKUP_SELECTOR_FIELDS:
+            return "lookup", None
+        return "bare_selector", None  # PeriodID + any untested field -> bare `$text`
+
     async def set_report_parameters(
-        self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
+        self, parameters: list[dict], launcher_url: str, instance_key: str, token: str,
+        param_contract: dict[str, dict] | None = None,
     ) -> None:
         """POST an ASPX CALLBACK to the report-launcher page itself, applying
         `parameters` to the SAME graph instance the launcher renders from.
+
+        `param_contract` (optional): a `{raw_field: {"shape": ..., "options"?: {...}}}`
+        map discovered by probing the screen's DOM (see report_params.PROBE_JS /
+        build_contract). When a field is in it, its shape drives submission; otherwise the
+        legacy registries (`_legacy_shape_for`) do. This lets an UNFAMILIAR report screen
+        be driven deterministically after one browser probe, with no per-field guessing.
 
         This is the REAL parameter mechanism (corrects an earlier wrong claim that
         submit()/screen_submit against the classic SOAP `.asmx` endpoint worked — it
@@ -4002,28 +4045,13 @@ class ScreenClient:
                     f"{friendly!r} — known: {sorted(param_fields)} (from screen_get_schema)"
                 )
             raw_field = entry["field"]
-            combo = self._PXTEXT_COMBO_FIELDS.get(raw_field)
-            is_bare_name = raw_field in self._BARE_NAME_FIELDS
-            is_lookup = raw_field in self._LOOKUP_SELECTOR_FIELDS
-            # Emit each param under BOTH control-ID templates (see _CONTROL_PREFIXES):
-            # the server binds the one that exists on this screen and ignores the other.
-            for state_pfx, post_pfx in self._CONTROL_PREFIXES:
-                if is_bare_name:
-                    # Company/Branch tree-selector: value on the BARE control name (NO
-                    # `$text` suffix), `_state` present-but-empty.
-                    form[f"{post_pfx}{raw_field}"] = str(value)
-                    form[f"{state_pfx}{raw_field}_state"] = ""
-                elif combo is not None:
-                    code = combo.get(str(value).strip().lower(), value)
-                    form[f"{state_pfx}{raw_field}_state"] = f'<PText Value="{escape(str(code))}"/>'
-                    form[f"{post_pfx}{raw_field}$text"] = str(value)
-                elif is_lookup:
-                    form[f"{state_pfx}{raw_field}_state"] = f'<PXSelector Value="{escape(str(value))}"/>'
-                    form[f"{post_pfx}{raw_field}$text"] = str(value)
-                else:
-                    # BARE SELECTOR shape (e.g. PeriodID) — `_state` deliberately omitted
-                    # (sending it corrupts a dash-containing value).
-                    form[f"{post_pfx}{raw_field}$text"] = str(value)
+            # A discovered contract (DOM-probed) wins; else the legacy registries.
+            override = (param_contract or {}).get(raw_field)
+            if override is not None:
+                shape, options = override["shape"], override.get("options")
+            else:
+                shape, options = self._legacy_shape_for(raw_field)
+            self._emit_report_param(form, raw_field, value, shape, options)
         resp = await self._http.post(launcher_url, data=form)
         if resp.status_code >= 400:
             raise ScreenError(
@@ -4035,6 +4063,7 @@ class ScreenClient:
         parameters: list[dict] | None = None,
         report_filename: str | None = None,
         fmt: str = "pdf",
+        param_contract: dict[str, dict] | None = None,
     ) -> bytes:
         """Render a classic report screen (SM200xxx/AR6xxxxx/AP6xxxxx/... family) and
         return its rendered bytes (PDF or Excel) — the ONLY headless path for a report
@@ -4104,7 +4133,8 @@ class ScreenClient:
                 )
             # Post-launcher-URL for the callback omits &unum=0 (matches the live capture).
             callback_url = f"{base}/Frames/CensofReportLauncher.aspx?ID={rpt}&HideScript=On"
-            await self.set_report_parameters(parameters, callback_url, instance_key, tm.group(1))
+            await self.set_report_parameters(parameters, callback_url, instance_key,
+                                             tm.group(1), param_contract=param_contract)
         return await self._fetch_rendered_file(instance_key, fmt)
 
     async def _fetch_rendered_file(self, instance_key: str, fmt: str) -> bytes:

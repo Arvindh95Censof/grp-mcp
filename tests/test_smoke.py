@@ -3897,6 +3897,60 @@ def test_download_report_file_emits_params_under_both_control_templates():
     assert "viewer$par$tab$t0$edOrgBAccountID$text" not in form
 
 
+def test_classify_param_maps_dom_signals_to_verified_shapes():
+    # The DOM-signal -> wire-shape classifier (report_params). Every mapping here was
+    # verified live on AP630500/AP631200/AR631000 (KNOWLEDGE §19).
+    from grp_mcp.report_params import classify_param as cp
+    # combo: dropDown class, or a <PText default state
+    assert cp("Format", "drop-down__editor dropDown", "") == "combo"
+    assert cp("Format", "", "<PText Value=\"D\"/>") == "combo"
+    # lookup: selector class, or a <PXSelector default state
+    assert cp("BranchID", "selector", "") == "lookup"
+    assert cp("BranchID", "selector", "<PXSelector Value=\"MAIN\"/>") == "lookup"
+    assert cp("VendorID", "selector", "") == "lookup"
+    # bare_name: the Company/Branch tree selector
+    assert cp("OrgBAccountID", "branch-selector__editor", "") == "bare_name"
+    # bare_selector: a financial-period selector — SAME 'selector' class as a lookup,
+    # but must post bare $text (verified: _state garbles "03-2026" -> "03- 202")
+    assert cp("PeriodID", "selector", "") == "bare_selector"
+    # date / checkbox / integer / plain text
+    assert cp("AgeDate", "qp-datetime__editor dropDown", "") == "date"
+    assert cp("IncludeChild", "qp-checkbox checkBox", "") == "bool"
+    assert cp("int0", "qp-text-editor qp-integer editor", "") == "text"
+
+
+def test_build_contract_and_set_report_parameters_override():
+    # Probe output -> contract -> drives set_report_parameters, overriding the legacy
+    # registries. Proves an UNFAMILIAR screen's shapes can be supplied via the contract.
+    from grp_mcp.report_params import build_contract
+    probed = [
+        {"field": "Format", "widgetClass": "drop-down__editor dropDown", "stateInit": "<PText Value=\"D\"/>"},
+        {"field": "CustomerID", "widgetClass": "selector", "stateInit": ""},
+        {"field": "PeriodID", "widgetClass": "selector", "stateInit": ""},
+    ]
+    contract = build_contract(probed)
+    assert contract["CustomerID"]["shape"] == "lookup"
+    assert contract["PeriodID"]["shape"] == "bare_selector"
+    # feed the contract through set_report_parameters — CustomerID isn't in any legacy
+    # registry, so only the contract makes it a lookup (else it'd default to bare-selector)
+    schema = {"containers": {"Parameters": {
+        "Customer": {"object": "Parameters", "field": "CustomerID"},
+        "FinancialPeriod": {"object": "Parameters", "field": "PeriodID"}}}}
+    c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
+    async def _get_schema():
+        return schema
+    c.get_schema = _get_schema
+    asyncio.run(ScreenClient.set_report_parameters(
+        c, [{"set": "Customer", "to": "CUST01"}, {"set": "FinancialPeriod", "to": "03-2026"}],
+        "https://example.invalid/launcher", "key1", "tok1", param_contract=contract))
+    form = calls[-1][2]
+    # CustomerID -> lookup (from contract): _state present
+    assert form["viewer_par_tab_t0_edCustomerID_state"] == '<PXSelector Value="CUST01"/>'
+    # PeriodID -> bare_selector: NO _state
+    assert "viewer_par_tab_t0_edPeriodID_state" not in form
+    assert form["viewer$par$tab$t0$edPeriodID$text"] == "03-2026"
+
+
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),
