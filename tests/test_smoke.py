@@ -3531,6 +3531,20 @@ def test_preflight_enforce_allows_when_kb_available(monkeypatch):
     assert pf["blocked"] is False
 
 
+def test_ui_payload_and_page_expose_enforcement_fields():
+    from grp_mcp import ui
+    from grp_mcp.config import Config
+    inst = _inst(risk="production")
+    payload = ui._profiles_payload(Config(default="p", instances={"p": inst}))
+    p = payload["instances"][0]
+    for k in ("risk", "enforcement", "effective_enforcement", "allow_unrestricted_fs"):
+        assert k in p, f"UI profile payload missing {k}"
+    assert p["effective_enforcement"] == "warn"   # production derives warn
+    # the config page ships the matching form controls
+    for token in ('id="risk"', 'id="enforcement"', 'id="allow_unrestricted_fs"'):
+        assert token in ui.PAGE, f"config UI page missing control {token}"
+
+
 def test_effective_enforcement_derives_from_risk():
     # dev (default) -> off
     assert _inst().effective_enforcement() == "off"

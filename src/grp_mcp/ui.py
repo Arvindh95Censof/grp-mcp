@@ -78,16 +78,18 @@ PAGE = """<!DOCTYPE html>
   form{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-top:18px}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   label{font-size:12px;color:var(--mut);display:block;margin-bottom:3px}
-  input[type=text],input[type=password]{width:100%;font:inherit;font-size:14px;padding:7px 9px;
+  input[type=text],input[type=password],select{width:100%;font:inherit;font-size:14px;padding:7px 9px;
          background:var(--bg);color:var(--tx);border:1px solid var(--bd2);border-radius:7px}
   .full{grid-column:1/-1}
+  .gates b.enf{color:var(--ac)}
+  .hint{font-size:11px;color:var(--mut);margin-top:2px}
   .checks{display:flex;gap:18px;margin:12px 0;flex-wrap:wrap}
   .checks label{display:flex;align-items:center;gap:6px;color:var(--tx);font-size:14px;margin:0}
   .msg{font-size:13px;padding:8px 12px;border-radius:8px;margin-top:10px;display:none}
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 5</span></h1>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 6</span></h1>
 <p class="sub" id="src">loading…</p>
 <div class="banner">Editing here writes <code>connections.json</code>. To apply changes to the live connector, run <code>reload_config</code> in Claude (no restart needed) — or restart the grp-mcp server.</div>
 <div id="list"></div>
@@ -111,6 +113,21 @@ PAGE = """<!DOCTYPE html>
     <label><input type="checkbox" id="allow_publish"> allow publish</label>
     <label><input type="checkbox" id="set_active"> set active</label>
   </div>
+  <div style="font-weight:600;margin:14px 0 8px;font-size:13px">Enforcement (KB-consult preflight before writes)</div>
+  <div class="grid">
+    <div><label>Risk</label><select id="risk"><option value="dev">dev</option><option value="production">production</option></select>
+      <div class="hint">production defaults enforcement to “warn”; dev to “off”.</div></div>
+    <div><label>Enforcement</label><select id="enforcement">
+        <option value="">auto (from risk)</option>
+        <option value="off">off — no preflight (legacy)</option>
+        <option value="warn">warn — consult KB, attach evidence, proceed</option>
+        <option value="enforce">enforce — block the write if the KB can’t be consulted</option>
+      </select>
+      <div class="hint">warn/enforce need a valid <code>kb_server.json</code> (kb-mcp-dual).</div></div>
+  </div>
+  <div class="checks">
+    <label><input type="checkbox" id="allow_unrestricted_fs"> allow unrestricted filesystem (default: confine to working dir)</label>
+  </div>
   <button class="pri" type="submit">Save profile</button>
   <button type="button" id="clear">Clear</button>
   <div class="msg" id="formmsg"></div>
@@ -133,7 +150,8 @@ async function load(){
       +'<div class="row"><div><div class="name">'+esc(p.name)+(p.name===d.active?'<span class="pill">active</span>':'')+'</div>'
       +'<div class="meta">'+esc(p.base_url)+'</div>'
       +'<div class="meta">tenant '+esc(p.tenant||'—')+' · '+esc(p.endpoint_name)+'/'+esc(p.endpoint_version)+((p.has_client_secret&&p.has_password)?'':' · <span style="color:var(--err)">no secret</span>')+'</div>'
-      +'<div class="gates">'+g(p.allow_write,'write')+' '+g(p.allow_delete,'delete')+' '+g(p.allow_publish,'publish')+'</div></div>'
+      +'<div class="gates">'+g(p.allow_write,'write')+' '+g(p.allow_delete,'delete')+' '+g(p.allow_publish,'publish')
+      +' · <b class="enf">enforcement: '+esc(p.effective_enforcement)+'</b>'+(p.enforcement?'':' <span style="opacity:.6">(auto from '+esc(p.risk)+')</span>')+'</div></div>'
       +'<div class="acts">'
       +(p.name===d.active?'':'<button data-a="active" data-n="'+esc(p.name)+'">Set active</button>')
       +'<button data-a="test" data-n="'+esc(p.name)+'">Test</button>'
@@ -153,13 +171,15 @@ $('list').addEventListener('click',async e=>{const b=e.target.closest('button');
       $('client_secret').placeholder=p.has_client_secret?'•••••••• (set — leave blank to keep)':'';
       $('password').placeholder=p.has_password?'•••••••• (set — leave blank to keep)':'';
       $('allow_write').checked=!!p.allow_write;$('allow_delete').checked=!!p.allow_delete;$('allow_publish').checked=!!p.allow_publish;
+      $('risk').value=p.risk||'dev';$('enforcement').value=p.enforcement||'';$('allow_unrestricted_fs').checked=!!p.allow_unrestricted_fs;
       showTop('Editing '+n+' — re-enter secret + password to change them (leave blank to keep).');$('name').scrollIntoView({behavior:'smooth'})}
   }catch(err){showTop(err.message,true)}
 });
-$('clear').onclick=()=>{FIELDS.forEach(f=>$(f).value='');$('client_secret').placeholder='';$('password').placeholder='';['allow_write','allow_delete','allow_publish','set_active'].forEach(c=>$(c).checked=false);$('formmsg').className='msg'};
+$('clear').onclick=()=>{FIELDS.forEach(f=>$(f).value='');$('client_secret').placeholder='';$('password').placeholder='';['allow_write','allow_delete','allow_publish','set_active','allow_unrestricted_fs'].forEach(c=>$(c).checked=false);$('risk').value='dev';$('enforcement').value='';$('formmsg').className='msg'};
 $('form').addEventListener('submit',async e=>{e.preventDefault();
   const body={};FIELDS.forEach(f=>body[f]=$(f).value.trim());
-  ['allow_write','allow_delete','allow_publish','set_active'].forEach(c=>body[c]=$(c).checked);
+  ['allow_write','allow_delete','allow_publish','set_active','allow_unrestricted_fs'].forEach(c=>body[c]=$(c).checked);
+  body.risk=$('risk').value;body.enforcement=$('enforcement').value;
   const m=$('formmsg');
   try{const r=await api('/api/profile',{method:'POST',body:JSON.stringify(body)});m.className='msg ok';m.textContent='Saved "'+r.name+'". Restart grp-mcp to apply.';$('clear').click();await load()}
   catch(err){m.className='msg bad';m.textContent=err.message}
@@ -182,6 +202,10 @@ def _profiles_payload(cfg) -> dict:
                 "allow_write": i.allow_write,
                 "allow_delete": i.allow_delete,
                 "allow_publish": i.allow_publish,
+                "risk": i.risk,
+                "enforcement": i.enforcement,
+                "effective_enforcement": i.effective_enforcement(),
+                "allow_unrestricted_fs": i.allow_unrestricted_fs,
                 "has_client_secret": bool(i.client_secret),
                 "has_password": bool(i.password),
             }
@@ -301,6 +325,10 @@ class _Handler(BaseHTTPRequestHandler):
             allow_write=bool(b.get("allow_write")),
             allow_delete=bool(b.get("allow_delete")),
             allow_publish=bool(b.get("allow_publish")),
+            # enforcement: "" (auto) -> None so it derives from risk
+            risk=(b.get("risk") or "dev").strip(),
+            enforcement=((b.get("enforcement") or "").strip() or None),
+            allow_unrestricted_fs=bool(b.get("allow_unrestricted_fs")),
         )
         inst = existing.model_copy(update=updates) if existing else Instance(**updates)
         cfg.instances[name] = inst
