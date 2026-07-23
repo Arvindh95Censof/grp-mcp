@@ -20,6 +20,7 @@ import asyncio
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import kb_client
 from .acumatica import AcumaticaClient
 from .config import Config, ConfigNotFoundError, Instance, load_config, save_config
 
@@ -78,8 +79,9 @@ PAGE = """<!DOCTYPE html>
   form{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-top:18px}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   label{font-size:12px;color:var(--mut);display:block;margin-bottom:3px}
-  input[type=text],input[type=password],select{width:100%;font:inherit;font-size:14px;padding:7px 9px;
+  input[type=text],input[type=password],select,textarea{width:100%;font:inherit;font-size:14px;padding:7px 9px;
          background:var(--bg);color:var(--tx);border:1px solid var(--bd2);border-radius:7px}
+  textarea{resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:13px}
   .full{grid-column:1/-1}
   .gates b.enf{color:var(--ac)}
   .hint{font-size:11px;color:var(--mut);margin-top:2px}
@@ -89,7 +91,7 @@ PAGE = """<!DOCTYPE html>
   .msg.ok{display:block;background:var(--okbg);color:var(--ok)}
   .msg.bad{display:block;background:var(--errbg);color:var(--err)}
 </style></head><body><div class="wrap">
-<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 6</span></h1>
+<h1>grp-mcp profiles <span style="font-size:11px;font-weight:400;color:var(--mut)">build 7</span></h1>
 <p class="sub" id="src">loading…</p>
 <div class="banner">Editing here writes <code>connections.json</code>. To apply changes to the live connector, run <code>reload_config</code> in Claude (no restart needed) — or restart the grp-mcp server.</div>
 <div id="list"></div>
@@ -132,6 +134,23 @@ PAGE = """<!DOCTYPE html>
   <button type="button" id="clear">Clear</button>
   <div class="msg" id="formmsg"></div>
 </form>
+
+<form id="kbform" autocomplete="off">
+  <div style="font-weight:600;margin-bottom:4px">KB server (kb-mcp-dual)</div>
+  <p class="sub" style="margin:0 0 12px">Used by <code>warn</code>/<code>enforce</code> enforcement: grp-mcp launches this and calls its <code>search_kb</code> before every write. Written to <span id="kbpath" style="word-break:break-all">…</span>.</p>
+  <div class="grid">
+    <div class="full"><label>Command (python.exe of the kb-mcp-dual venv)</label><input type="text" id="kb_command" placeholder="C:\\MCPs\\kb-mcp-venv\\Scripts\\python.exe"></div>
+    <div class="full"><label>Args — one per line (usually the kb-mcp-dual server.py path)</label><textarea id="kb_args" rows="2" placeholder="C:\\...\\grp-kb\\server.py"></textarea></div>
+    <div class="full"><label>Env — KEY=VALUE per line (vault + index dirs, offline flags)</label><textarea id="kb_env" rows="5" placeholder="KB_VAULT_DIR=C:\\...\\Acumatica-KB&#10;KB_INDEX_DIR=C:\\...\\index_minilm_full&#10;HF_HUB_OFFLINE=1&#10;TRANSFORMERS_OFFLINE=1"></textarea></div>
+  </div>
+  <div style="display:flex;gap:6px;margin-top:12px">
+    <button class="pri" type="submit">Save KB server</button>
+    <button type="button" id="kbtest">Test KB server</button>
+    <button type="button" id="kbclear">Clear</button>
+  </div>
+  <div class="msg" id="kbmsg"></div>
+</form>
+
 <div class="msg" id="topmsg" style="margin-top:14px"></div>
 </div>
 <script>
@@ -184,7 +203,35 @@ $('form').addEventListener('submit',async e=>{e.preventDefault();
   try{const r=await api('/api/profile',{method:'POST',body:JSON.stringify(body)});m.className='msg ok';m.textContent='Saved "'+r.name+'". Restart grp-mcp to apply.';$('clear').click();await load()}
   catch(err){m.className='msg bad';m.textContent=err.message}
 });
-load();
+
+async function loadKb(){
+  try{const d=await api('/api/kb_server');
+    $('kbpath').textContent=d.path||'(unknown)';
+    $('kb_command').value=d.command||'';
+    $('kb_args').value=(d.args||[]).join('\n');
+    $('kb_env').value=Object.entries(d.env||{}).map(([k,v])=>k+'='+v).join('\n');
+  }catch(err){$('kbpath').textContent='(could not read: '+err.message+')'}
+}
+function kbBody(){
+  const args=$('kb_args').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const env={};$('kb_env').value.split('\n').forEach(l=>{const i=l.indexOf('=');if(i>0){env[l.slice(0,i).trim()]=l.slice(i+1).trim()}});
+  return {command:$('kb_command').value.trim(),args,env};
+}
+$('kbform').addEventListener('submit',async e=>{e.preventDefault();const m=$('kbmsg');
+  try{const r=await api('/api/kb_server',{method:'POST',body:JSON.stringify(kbBody())});
+    m.className='msg ok';m.textContent='Saved → '+r.path+'. Run reload_config or restart grp-mcp to apply.';await loadKb()}
+  catch(err){m.className='msg bad';m.textContent=err.message}
+});
+$('kbtest').onclick=async()=>{const m=$('kbmsg'),b=$('kbtest');b.textContent='testing… (~20s cold)';b.disabled=true;
+  try{const r=await api('/api/kb_server_test',{method:'POST',body:JSON.stringify(kbBody())});
+    m.className='msg '+(r.available?'ok':'bad');
+    m.textContent=r.available?('✓ KB reachable — '+r.match_count+' matches for a sample query'+(r.sample?' (e.g. '+r.sample+')'):''):('✗ '+(r.reason||'unavailable'));
+  }catch(err){m.className='msg bad';m.textContent=err.message}
+  finally{b.textContent='Test KB server';b.disabled=false}
+};
+$('kbclear').onclick=()=>{$('kb_command').value='';$('kb_args').value='';$('kb_env').value='';$('kbmsg').className='msg'};
+
+load();loadKb();
 </script></body></html>"""
 
 
@@ -229,6 +276,37 @@ def _is_same_origin(headers, expected: str) -> bool:
     return referer == expected or referer.startswith(expected + "/")
 
 
+def _kb_spec_from_body(b: dict) -> dict:
+    """Normalise the KB-server form body into a {command, args, env} spec."""
+    args = [str(a).strip() for a in (b.get("args") or []) if str(a).strip()]
+    env = {str(k): str(v) for k, v in (b.get("env") or {}).items() if str(k).strip()}
+    return {"command": (b.get("command") or "").strip(), "args": args, "env": env}
+
+
+def _kb_server_payload() -> dict:
+    """Current kb_server.json (or blanks) plus the path the UI writes to."""
+    spec = kb_client.load_spec() or {}
+    return {
+        "path": str(kb_client.default_spec_path()),
+        "command": spec.get("command", ""),
+        "args": spec.get("args", []),
+        "env": spec.get("env", {}),
+    }
+
+
+async def _kb_server_test(b: dict) -> dict:
+    """Live-test the (edited, unsaved) KB-server spec: launch kb-mcp-dual and run a
+    sample search. ~20s cold. Bypasses the cache so it always exercises the spawn."""
+    spec = _kb_spec_from_body(b)
+    if not spec["command"]:
+        return {"available": False, "reason": "command is required"}
+    r = await kb_client.consult("financial period setup", spec=spec, use_cache=False)
+    sample = (r.get("matched") or [{}])[0].get("path") if r.get("available") else None
+    return {"available": bool(r.get("available")),
+            "match_count": r.get("match_count", 0),
+            "reason": r.get("reason"), "sample": sample}
+
+
 async def _test(inst: Instance) -> dict:
     client = AcumaticaClient(inst)
     try:
@@ -270,6 +348,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif self.path == "/api/profiles":
                 self._json(_profiles_payload(_load()))
+            elif self.path == "/api/kb_server":
+                self._json(_kb_server_payload())
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001 - surface config errors as JSON
@@ -289,6 +369,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._remove(body)
             elif self.path == "/api/test":
                 self._do_test(body)
+            elif self.path == "/api/kb_server":
+                self._save_kb_server(body)
+            elif self.path == "/api/kb_server_test":
+                self._json(asyncio.run(_kb_server_test(body)))
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001
@@ -365,6 +449,15 @@ class _Handler(BaseHTTPRequestHandler):
         if name not in cfg.instances:
             raise ValueError(f"unknown profile '{name}'")
         self._json(asyncio.run(_test(cfg.instances[name])))
+
+    def _save_kb_server(self, b: dict) -> None:
+        spec = _kb_spec_from_body(b)
+        if not spec["command"]:
+            raise ValueError("command is required (path to the kb-mcp-dual venv python)")
+        path = kb_client.default_spec_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+        self._json({"path": str(path)})
 
 
 def main() -> None:

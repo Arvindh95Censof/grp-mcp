@@ -57,18 +57,36 @@ def _read_spec(p: Path) -> dict | None:
     return None
 
 
+def _fallback_paths() -> list[Path]:
+    """kb_server.json search paths (no explicit/env), most-specific first:
+    beside connections.json (where the config UI writes it), the working dir,
+    then the grp-mcp repo root."""
+    paths: list[Path] = []
+    conn = os.environ.get("GRP_MCP_CONNECTIONS")
+    if conn:
+        paths.append(Path(conn).expanduser().resolve().parent / "kb_server.json")
+    paths.append(Path.cwd() / "kb_server.json")
+    paths.append(Path(__file__).resolve().parents[2] / "kb_server.json")
+    return paths
+
+
+def default_spec_path() -> Path:
+    """Where the config UI should WRITE kb_server.json: beside connections.json
+    if that location is known (GRP_MCP_CONNECTIONS), else the working dir. Kept in
+    sync with _fallback_paths so a UI-written file is found by the running server."""
+    return _fallback_paths()[0]
+
+
 def load_spec(explicit: str | None = None) -> dict | None:
     """Resolve the kb-mcp-dual launch spec, or None if not configured.
 
     An explicit path (argument or GRP_MCP_KB_SERVER) is AUTHORITATIVE — if given
     but missing/invalid, returns None rather than silently using a different
-    file. Only when no path is specified does it fall back to kb_server.json in
-    the working directory, then at the grp-mcp repo root."""
+    file. Only when no path is specified does it fall back to _fallback_paths()."""
     cand = explicit or os.environ.get(_ENV_SPEC)
     if cand:
         return _read_spec(Path(cand))
-    here = Path(__file__).resolve()
-    for p in (Path.cwd() / "kb_server.json", here.parents[2] / "kb_server.json"):
+    for p in _fallback_paths():
         spec = _read_spec(p)
         if spec:
             return spec

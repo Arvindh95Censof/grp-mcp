@@ -3545,6 +3545,28 @@ def test_ui_payload_and_page_expose_enforcement_fields():
         assert token in ui.PAGE, f"config UI page missing control {token}"
 
 
+def test_ui_kb_server_panel(tmp_path, monkeypatch):
+    from grp_mcp import ui, kb_client
+    # page ships the KB-server controls
+    for token in ('id="kb_command"', 'id="kb_args"', 'id="kb_env"',
+                  '/api/kb_server', '/api/kb_server_test'):
+        assert token in ui.PAGE, f"KB panel missing {token}"
+    # body normaliser drops blank args / blank env keys and trims
+    spec = ui._kb_spec_from_body(
+        {"command": "  py ", "args": ["a", "", " b "], "env": {"K": "v", " ": "x"}})
+    assert spec == {"command": "py", "args": ["a", "b"], "env": {"K": "v"}}
+    # save writes kb_server.json to default_spec_path, which load_spec then reads
+    monkeypatch.setenv("GRP_MCP_CONNECTIONS", str(tmp_path / "connections.json"))
+    p = kb_client.default_spec_path()
+    assert p == tmp_path / "kb_server.json"
+    import json as _json
+    p.write_text(_json.dumps({"command": "python", "args": ["s.py"], "env": {}}),
+                 encoding="utf-8")
+    assert kb_client.load_spec()["command"] == "python"  # found beside connections.json
+    payload = ui._kb_server_payload()
+    assert payload["command"] == "python" and payload["path"] == str(p)
+
+
 def test_effective_enforcement_derives_from_risk():
     # dev (default) -> off
     assert _inst().effective_enforcement() == "off"
