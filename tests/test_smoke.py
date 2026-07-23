@@ -3545,6 +3545,36 @@ def test_ui_payload_and_page_expose_enforcement_fields():
         assert token in ui.PAGE, f"config UI page missing control {token}"
 
 
+def test_ui_page_script_is_valid_javascript():
+    """The config UI ships its JS inside a Python triple-quoted string — an easy
+    place to hide a syntax error (a stray backslash-n, an unbalanced ternary) that
+    no Python test catches but which breaks the ENTIRE page (nothing loads). If
+    node is available, syntax-check the embedded <script>. Regression guard for
+    the 0.70.3 'profiles stuck on loading…' bug."""
+    import os
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available to syntax-check the UI script")
+    from grp_mcp import ui
+    m = re.search(r"<script>(.*)</script>", ui.PAGE, re.S)
+    assert m, "no <script> block found in ui.PAGE"
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(m.group(1))
+            path = f.name
+        r = subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert r.returncode == 0, f"UI PAGE has a JS syntax error:\n{r.stderr}"
+    finally:
+        if path and os.path.exists(path):
+            os.unlink(path)
+
+
 def test_ui_kb_server_panel(tmp_path, monkeypatch):
     from grp_mcp import ui, kb_client
     # page ships the KB-server controls

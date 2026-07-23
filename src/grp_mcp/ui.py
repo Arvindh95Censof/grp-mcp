@@ -208,13 +208,13 @@ async function loadKb(){
   try{const d=await api('/api/kb_server');
     $('kbpath').textContent=d.path||'(unknown)';
     $('kb_command').value=d.command||'';
-    $('kb_args').value=(d.args||[]).join('\n');
-    $('kb_env').value=Object.entries(d.env||{}).map(([k,v])=>k+'='+v).join('\n');
+    $('kb_args').value=(d.args||[]).join('\\n');
+    $('kb_env').value=Object.entries(d.env||{}).map(([k,v])=>k+'='+v).join('\\n');
   }catch(err){$('kbpath').textContent='(could not read: '+err.message+')'}
 }
 function kbBody(){
-  const args=$('kb_args').value.split('\n').map(s=>s.trim()).filter(Boolean);
-  const env={};$('kb_env').value.split('\n').forEach(l=>{const i=l.indexOf('=');if(i>0){env[l.slice(0,i).trim()]=l.slice(i+1).trim()}});
+  const args=$('kb_args').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+  const env={};$('kb_env').value.split('\\n').forEach(l=>{const i=l.indexOf('=');if(i>0){env[l.slice(0,i).trim()]=l.slice(i+1).trim()}});
   return {command:$('kb_command').value.trim(),args,env};
 }
 $('kbform').addEventListener('submit',async e=>{e.preventDefault();const m=$('kbmsg');
@@ -224,8 +224,8 @@ $('kbform').addEventListener('submit',async e=>{e.preventDefault();const m=$('kb
 });
 $('kbtest').onclick=async()=>{const m=$('kbmsg'),b=$('kbtest');b.textContent='testing… (~20s cold)';b.disabled=true;
   try{const r=await api('/api/kb_server_test',{method:'POST',body:JSON.stringify(kbBody())});
-    m.className='msg '+(r.available?'ok':'bad');
-    m.textContent=r.available?('✓ KB reachable — '+r.match_count+' matches for a sample query'+(r.sample?' (e.g. '+r.sample+')'):''):('✗ '+(r.reason||'unavailable'));
+    if(r.available){const eg=r.sample?(' (e.g. '+r.sample+')'):'';m.className='msg ok';m.textContent='✓ KB reachable — '+r.match_count+' matches'+eg}
+    else{m.className='msg bad';m.textContent='✗ '+(r.reason||'unavailable')}
   }catch(err){m.className='msg bad';m.textContent=err.message}
   finally{b.textContent='Test KB server';b.disabled=false}
 };
