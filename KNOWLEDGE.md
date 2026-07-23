@@ -2154,6 +2154,66 @@ Exposed as the `download_filter_report` MCP tool (sibling of `download_classic_r
 interchangeable; `screen_capabilities` tells them apart: a `Filter` view + report action means this
 tool, a `Parameters` container + popup launcher means the other).
 
+## §20 Enforcement layer — classification, verification, KB-consult preflight (v0.70.0)
+
+Makes the KB-first policy and "a clean 200 is not proof" ENFORCEABLE instead of advisory.
+Four modules, all additive; enforcement defaults to OFF so nothing changes until a
+production instance opts in.
+
+**Tool classification registry** (`enforcement.py` `TOOL_CLASS`). Every registered tool
+has one risk class: read / write / delete / publish / bg_job / diagnostic_write /
+filesystem / admin. It documents intent; it does NOT re-route the existing scattered
+`_require_*` gates (many are runtime write-vs-delete branches a decorator can't capture).
+Tests keep it honest against source via AST: every tool is classified (no unclassified /
+stale), every ERP-mutation-class tool actually calls a `_require_*` gate, and the gate KIND
+matches the class. `generate_endpoint_entity` gates via a delegated helper (`extend_endpoint`),
+so it's allowlisted in `DELEGATED_GATE`; `screen_autofill` is graph-only (no Save) so it's in
+`GATELESS_MUTATION_ALLOW`.
+
+**Post-write verification** (`enforcement.verify_state` / `normalize_verification` /
+`stamp_verification`). Three terminal states — `verified` (read-back matches), `rejected`
+(server refused OR read-back proves a silent no-op), `unverified` (success-shaped but
+unprovable — a LEGIT state, e.g. read-back-inert grids like PY309000 child grids). NO
+`rolled_back`: auto-rollback across the five planes is unsafe (no cross-plane txn, creates
+have side effects, delete-to-undo hits referential guards) — a failed verify is surfaced
+loudly, never silently reversed. `normalize_verification` collapses the existing scattered
+flags (`save_verified`/`delete_verified`/`grid_rows_readable`/`graph_is_dirty`) to one
+verdict, worst-case wins. Stamped where genuine read-back aggregates: the ASPX grid batch
+and the classic delete. NOT stamped on REST creates (no read-back) or bare modern actions
+(`graph_is_dirty` is graph state, not persistence) — stamping those would fabricate verdicts.
+
+**Trusted KB-consult preflight** (`kb_client.py` + `kb.py` + `preflight.py`). The KB-first
+policy was fakeable — grp-mcp can't prove an agent called kb-mcp-dual. Fix: grp-mcp itself
+consults it. Order per write: (1) **kb-mcp-dual** — grp-mcp launches it as a subprocess MCP
+client and runs its `search_kb` semantic search (it owns the finding: a multilingual
+embedding index), digesting the results = server-produced, unforgeable evidence; (2)
+**KNOWLEDGE.md** — grp-mcp's own experience notes, also digested (`kb.gather_evidence`);
+(3) the live prerequisite check stays with the per-screen preflight tools. Launch spec in
+`kb_server.json` (gitignored + package-excluded, like connections.json; `GRP_MCP_KB_SERVER`
+overrides). Cold consult ≈20s (loads an embedding model + index per spawn) so results are
+process-cached; a persistent session is the future optimisation. Consulting NEVER raises —
+a missing/unreachable KB degrades to `available:false`.
+
+**Enforcement level** (`config.py` per-instance `risk` dev|production + `enforcement`
+off|warn|enforce; `effective_enforcement()` derives warn for production, off for dev unless
+set). `off` skips preflight; `warn` gathers evidence, attaches it, proceeds; `enforce` BLOCKS
+the write if kb-mcp-dual couldn't be consulted (opting into enforce = opting into the KB
+dependency). Wired into ALL 51 ERP-mutation tools: four INLINE (`enforcement.PREFLIGHT_INLINE`
+— `screen_submit`, `create_or_update_entity`, `ui_screen_action`, `delete_entity`, which need
+bespoke skip/stamp logic) and the rest via the `@_preflight_write(...)` decorator (sits BELOW
+`@mcp.tool()` so the tool schema is unchanged — verified: a functools.wraps wrapper preserves
+name/description/params/required). The decorator auto-skips non-persisting calls (dry_run=True,
+save=False, do_import=False) and takes the KB query from a named arg (screen_id / entity) or a
+constant. Two mutation-class tools are exempt (`enforcement.PREFLIGHT_EXEMPT`): `screen_autofill`
+(graph-only, no Save) and `screen_discover_prereqs` (a discovery probe, not a user write). A
+test asserts EVERY mutation tool is wired or exempt, so a new one can't ship without a preflight.
+With enforcement off (the default) the decorator is a pass-through — behaviour is unchanged.
+
+**Filesystem safe-by-default** (`config.py`). Empty `read_roots`/`write_roots` NO LONGER
+means whole-disk — it confines to the working directory. Whole-disk access is an explicit
+opt-in: `allow_unrestricted_fs=true`. `effective_roots(kind)` resolves it; explicit roots
+always win.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

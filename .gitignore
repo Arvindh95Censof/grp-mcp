@@ -12,6 +12,7 @@ env/
 # Secrets / local config
 .env
 connections.json
+kb_server.json
 
 # IDE
 .vscode/

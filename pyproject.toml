@@ -1,6 +1,6 @@
 [project]
 name = "grp-mcp"
-version = "0.69.3"
+version = "0.70.0"
 description = "MCP server exposing Acumatica ERP (contract-based REST API) as tools for AI agents. Multi-instance, OAuth2."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,7 @@ exclude = [
   ".claude",
   ".venv",
   "connections.json",   # local ERP credentials — also gitignored; never package it
+  "kb_server.json",     # local kb-mcp-dual launch paths — gitignored; never package it
   "*.docx",
 ]
 

@@ -2037,16 +2037,29 @@ def test_admin_gate_remove_instance_persist_blocked(cfg, monkeypatch):
         server.remove_instance("rw", persist=True)
 
 
-# ---- fs sandbox status is honest about "empty roots = unrestricted" ----------
+# ---- fs sandbox: safe-by-default (empty roots => working dir), opt-in whole disk
 
-def test_fs_sandbox_unrestricted_when_empty():
+def test_fs_sandbox_defaults_to_working_dir_when_empty():
+    # empty roots is NO LONGER whole-disk: it confines to the working directory.
+    import os
     s = _inst().fs_sandbox("write")
+    assert "UNRESTRICTED" not in s
+    assert "working directory" in s
+    assert _inst().effective_roots("write") == [os.getcwd()]
+
+
+def test_fs_sandbox_unrestricted_only_with_explicit_optin():
+    s = _inst(allow_unrestricted_fs=True).fs_sandbox("write")
     assert "UNRESTRICTED" in s and "write_roots" in s
+    # opt-in yields a truly empty (no-sandbox) effective root list
+    assert _inst(allow_unrestricted_fs=True).effective_roots("write") == []
 
 
 def test_fs_sandbox_restricted_when_set():
     s = _inst(read_roots=["C:/data"]).fs_sandbox("read")
     assert "restricted to" in s and "C:/data" in s
+    # explicit roots win even if allow_unrestricted_fs is set
+    assert _inst(read_roots=["C:/data"], allow_unrestricted_fs=True).effective_roots("read") == ["C:/data"]
 
 
 # ---- publish job view / status (non-blocking publish) -----------------------
@@ -3240,6 +3253,335 @@ def test_every_public_function_is_a_registered_tool():
     assert not missing, (
         f"public function(s) in server.py not registered as MCP tools (lost/stolen "
         f"@mcp.tool() decorator?): {missing} — if intentional, add to NOT_TOOLS")
+
+
+# ---- enforcement layer: tool classification registry ----------------------
+# The registry (grp_mcp/enforcement.py) is the single source of truth for every
+# tool's risk class. These tests make it impossible for a tool to (a) exist
+# without a class, or (b) claim a mutating class while calling no write gate.
+
+def _server_tool_gates() -> dict[str, set[str]]:
+    """Map each registered tool -> the set of _require_* gates it calls
+    LEXICALLY in its own body (via AST). Delegated gates are not visible here;
+    that is what enforcement.DELEGATED_GATE covers."""
+    import ast
+    import inspect
+    from grp_mcp import enforcement
+
+    src = inspect.getsource(server)
+    tree = ast.parse(src)
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in names:
+            continue
+        if not any("mcp.tool" in ast.unparse(d) for d in node.decorator_list):
+            continue
+        gates: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                f = ast.unparse(sub.func)
+                if f in ("_require_write", "_require_delete",
+                         "_require_publish", "_require_admin"):
+                    gates.add(f.replace("_require_", ""))
+        out[node.name] = gates
+    return out
+
+
+def test_every_registered_tool_is_classified():
+    from grp_mcp import enforcement
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    registry = set(enforcement.TOOL_CLASS)
+    unclassified = names - registry
+    stale = registry - names
+    assert not unclassified, (
+        f"registered tool(s) with no class in enforcement.TOOL_CLASS: "
+        f"{sorted(unclassified)} — add each to the registry")
+    assert not stale, (
+        f"enforcement.TOOL_CLASS names a tool that is no longer registered: "
+        f"{sorted(stale)} — remove it")
+
+
+def test_all_tool_classes_are_valid():
+    from grp_mcp import enforcement
+    bad = {n: c for n, c in enforcement.TOOL_CLASS.items()
+           if c not in enforcement.TOOL_CLASSES}
+    assert not bad, f"tool(s) with an unknown class: {bad}"
+
+
+def test_erp_mutation_tools_are_actually_gated():
+    """Any tool the registry calls an ERP mutation MUST pass a real _require_*
+    gate (write/delete/publish) — unless it is explicitly allowlisted as
+    gateless-by-design or its gate is delegated to a helper. This is the check
+    the scattered inline gates can't give you: proof that no mutating tool is
+    silently ungated."""
+    from grp_mcp import enforcement
+    gates = _server_tool_gates()
+    offenders = []
+    for name, cls in enforcement.TOOL_CLASS.items():
+        if cls not in enforcement.ERP_MUTATION_CLASSES:
+            continue
+        if name in enforcement.GATELESS_MUTATION_ALLOW:
+            continue
+        if name in enforcement.DELEGATED_GATE:
+            continue
+        if not gates.get(name):
+            offenders.append(name)
+    assert not offenders, (
+        f"mutation-class tool(s) with no _require_* gate in the body: "
+        f"{offenders} — gate them, or justify in GATELESS_MUTATION_ALLOW / "
+        f"DELEGATED_GATE")
+
+
+def test_gate_kind_matches_declared_class():
+    """A delete-class tool must delete-gate; a publish-class tool must
+    publish-gate; write/bg/diagnostic tools must write-gate. (Write tools may
+    ALSO carry a delete branch — that's fine, we only require the floor gate.)"""
+    from grp_mcp import enforcement
+    gates = _server_tool_gates()
+    need = {
+        enforcement.DELETE: "delete",
+        enforcement.PUBLISH: "publish",
+        enforcement.WRITE: "write",
+        enforcement.BG_JOB: "write",
+        enforcement.DIAGNOSTIC_WRITE: "write",
+    }
+    mismatches = []
+    for name, cls in enforcement.TOOL_CLASS.items():
+        want = need.get(cls)
+        if want is None:
+            continue
+        if name in enforcement.GATELESS_MUTATION_ALLOW:
+            continue
+        if enforcement.DELEGATED_GATE.get(name) == cls:
+            continue
+        if want not in gates.get(name, set()):
+            mismatches.append((name, cls, want, sorted(gates.get(name, set()))))
+    assert not mismatches, (
+        f"tool(s) whose real gate does not match their class "
+        f"(name, class, needs, has): {mismatches}")
+
+
+def test_verify_state_machine():
+    from grp_mcp import enforcement as e
+    # server refused the change outright -> rejected, regardless of read-back
+    assert e.verify_state(changed=True, readable=True, matched=True) == e.REJECTED
+    # target cannot be read back (inert grid) -> unverified, never false-reject
+    assert e.verify_state(changed=None, readable=False, matched=None) == e.UNVERIFIED
+    assert e.verify_state(changed=False, readable=False, matched=None) == e.UNVERIFIED
+    # readable + matches expected -> verified
+    assert e.verify_state(changed=None, readable=True, matched=True) == e.VERIFIED
+    # readable + does NOT match -> rejected (silent no-op caught)
+    assert e.verify_state(changed=None, readable=True, matched=False) == e.REJECTED
+    # readable but match indeterminate -> unverified
+    assert e.verify_state(changed=None, readable=True, matched=None) == e.UNVERIFIED
+    # every result is a legal terminal state
+    for ch in (True, False, None):
+        for rd in (True, False):
+            for mt in (True, False, None):
+                assert e.verify_state(changed=ch, readable=rd, matched=mt) in e.VERIFY_STATES
+
+
+def _preflight_wiring() -> dict[str, set[str]]:
+    """AST scan of server.py: for each registered tool, how it is preflight-wired
+    — {'inline'} if its body calls _write_preflight, {'decorator'} if it carries
+    the @_preflight_write decorator, both, or empty."""
+    import ast
+    import inspect
+    src = inspect.getsource(server)
+    tree = ast.parse(src)
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in names:
+            continue
+        how: set[str] = set()
+        for d in node.decorator_list:
+            if "_preflight_write" in ast.unparse(d):
+                how.add("decorator")
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "_write_preflight":
+                how.add("inline")
+        out[node.name] = how
+    return out
+
+
+def test_every_mutation_tool_is_preflight_wired():
+    """FULL coverage: every ERP-mutation tool runs the write-preflight (inline or
+    via @_preflight_write), except those explicitly justified in PREFLIGHT_EXEMPT.
+    A new mutation tool therefore cannot ship without a KB-consult preflight."""
+    from grp_mcp import enforcement
+    wiring = _preflight_wiring()
+    unwired = []
+    for name, cls in enforcement.TOOL_CLASS.items():
+        if cls not in enforcement.ERP_MUTATION_CLASSES:
+            continue
+        if name in enforcement.PREFLIGHT_EXEMPT:
+            continue
+        if not wiring.get(name):
+            unwired.append(name)
+    assert not unwired, (
+        f"ERP-mutation tool(s) with NO write-preflight (inline or @_preflight_write): "
+        f"{sorted(unwired)} — wire them, or justify in enforcement.PREFLIGHT_EXEMPT")
+
+
+def test_preflight_inline_registry_matches_source():
+    """The four tools wired INLINE must be exactly enforcement.PREFLIGHT_INLINE, and
+    a non-mutation tool must never be preflight-wired."""
+    from grp_mcp import enforcement
+    wiring = _preflight_wiring()
+    inline = {n for n, how in wiring.items() if "inline" in how}
+    assert inline == set(enforcement.PREFLIGHT_INLINE), (
+        f"inline-wired tools {sorted(inline)} != PREFLIGHT_INLINE "
+        f"{sorted(enforcement.PREFLIGHT_INLINE)}")
+    non_mut = [n for n, how in wiring.items()
+               if how and not enforcement.is_erp_mutation(n)]
+    assert not non_mut, f"preflight wired on non-mutation tool(s): {non_mut}"
+
+
+def test_preflight_decorator_blocks_before_running_body(monkeypatch):
+    """A @_preflight_write-decorated tool must refuse — without running its body,
+    so no ERP client is touched — when the preflight blocks."""
+    # decorated tools carry the marker
+    assert getattr(server.create_ledger, "__preflight_wired__", False) is True
+
+    async def _blocked(*a, **k):
+        return {"blocked": True, "block_reason": "KB down", "level": "enforce"}
+    monkeypatch.setattr(server, "_write_preflight", _blocked)
+    # if the body ran it would need a real client and fail; a clean refusal proves
+    # the decorator short-circuited before the body
+    res = asyncio.run(server.create_ledger("ACTUAL", "Actual ledger", instance=None))
+    assert res.get("ok") is False
+    assert res.get("blocked_by_enforcement") == "KB down"
+    assert res["preflight"]["level"] == "enforce"
+
+
+def test_kb_client_helpers_and_cache():
+    from grp_mcp import kb_client
+    assert kb_client._digest("x").startswith("sha256:")
+    # a broken spec -> available False, degrades gracefully (never raises, never
+    # spawns the real KB). Bogus command fails fast instead of loading a model.
+    kb_client.clear_cache()
+    r = asyncio.run(kb_client.consult(
+        "anything", spec={"command": "___no_such_cmd___", "args": []}, timeout=5))
+    assert isinstance(r, dict) and r["available"] is False and r["reason"]
+    # cache: a primed result is returned without spawning anything
+    kb_client._CACHE[("q", 8, "")] = {"available": True, "matched": [], "match_count": 0}
+    c = asyncio.run(kb_client.consult("q", top_k=8))
+    assert c["cached"] is True and c["available"] is True
+    kb_client.clear_cache()
+
+
+def test_kb_client_load_spec_from_file(tmp_path):
+    from grp_mcp import kb_client
+    p = tmp_path / "kb_server.json"
+    p.write_text('{"command": "python", "args": ["s.py"], "env": {"A": "1"}}',
+                 encoding="utf-8")
+    spec = kb_client.load_spec(str(p))
+    assert spec and spec["command"] == "python" and spec["args"] == ["s.py"]
+    # a spec file without a command is ignored
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"args": []}', encoding="utf-8")
+    assert kb_client.load_spec(str(bad)) is None
+
+
+def _mock_consult(available, **extra):
+    async def _c(query, **kw):
+        return {"available": available, "source": "kb-mcp-dual", "query": query,
+                "match_count": 0, "matched": [], **extra}
+    return _c
+
+
+def test_preflight_off_returns_none():
+    from grp_mcp import preflight
+    assert asyncio.run(preflight.gather("screen_submit", level="off",
+                                        screen_id="GL301000")) is None
+
+
+def test_preflight_warn_gathers_evidence_never_blocks(monkeypatch):
+    from grp_mcp import preflight
+    monkeypatch.setattr(preflight.kb_client, "consult", _mock_consult(True))
+    pf = asyncio.run(preflight.gather("screen_submit", level="warn",
+                                      screen_id="GL301000"))
+    assert pf["blocked"] is False
+    assert pf["consult_order"] == ["kb-mcp-dual", "KNOWLEDGE.md"]
+    assert pf["kb"]["available"] is True
+    assert "knowledge" in pf and "matched" in pf["knowledge"]  # KNOWLEDGE.md evidence
+
+
+def test_preflight_enforce_blocks_when_kb_unavailable(monkeypatch):
+    from grp_mcp import preflight
+    monkeypatch.setattr(preflight.kb_client, "consult",
+                        _mock_consult(False, reason="kb down"))
+    pf = asyncio.run(preflight.gather("create_or_update_entity", level="enforce",
+                                      query="Customer"))
+    assert pf["blocked"] is True
+    assert "could not be consulted" in pf["block_reason"]
+
+
+def test_preflight_enforce_allows_when_kb_available(monkeypatch):
+    from grp_mcp import preflight
+    monkeypatch.setattr(preflight.kb_client, "consult", _mock_consult(True))
+    pf = asyncio.run(preflight.gather("create_or_update_entity", level="enforce",
+                                      query="Customer"))
+    assert pf["blocked"] is False
+
+
+def test_effective_enforcement_derives_from_risk():
+    # dev (default) -> off
+    assert _inst().effective_enforcement() == "off"
+    assert _inst(risk="dev").effective_enforcement() == "off"
+    # production -> warn (unless overridden)
+    assert _inst(risk="production").effective_enforcement() == "warn"
+    # explicit setting always wins
+    assert _inst(risk="dev", enforcement="enforce").effective_enforcement() == "enforce"
+    assert _inst(risk="production", enforcement="off").effective_enforcement() == "off"
+    # a garbage value falls back to the risk-derived default
+    assert _inst(risk="production", enforcement="bogus").effective_enforcement() == "warn"
+
+
+def test_normalize_verification_maps_existing_flags():
+    from grp_mcp import enforcement as e
+    # no verifiable signal at all -> None (a clean 200 is NOT proof)
+    assert e.normalize_verification({"ok": True}) is None
+    assert e.normalize_verification("not a dict") is None
+    # positive read-back -> verified
+    assert e.normalize_verification({"save_verified": True}) == e.VERIFIED
+    assert e.normalize_verification({"delete_verified": True}) == e.VERIFIED
+    assert e.normalize_verification({"all_verified": True}) == e.VERIFIED
+    # explicit refusal -> rejected
+    assert e.normalize_verification({"delete_verified": False}) == e.REJECTED
+    # "unverified" / None tri-state -> unverified
+    assert e.normalize_verification({"save_verified": "unverified"}) == e.UNVERIFIED
+    assert e.normalize_verification({"delete_verified": None}) == e.UNVERIFIED
+    # inert grid / dirty graph -> unverified
+    assert e.normalize_verification({"grid_rows_readable": False}) == e.UNVERIFIED
+    assert e.normalize_verification({"graph_is_dirty": True}) == e.UNVERIFIED
+    # worst-case wins: a refusal anywhere poisons the batch
+    assert e.normalize_verification(
+        {"save_verified": True, "delete_verified": False}) == e.REJECTED
+    assert e.normalize_verification(
+        {"save_verified": True, "grid_rows_readable": False}) == e.UNVERIFIED
+
+
+def test_stamp_verification_is_idempotent_and_noop_safe():
+    from grp_mcp import enforcement as e
+    # stamps when a signal exists
+    r = {"delete_verified": True}
+    e.stamp_verification(r)
+    assert r["verification"] == e.VERIFIED
+    # does not overwrite an existing verdict
+    r2 = {"delete_verified": False, "verification": "verified"}
+    e.stamp_verification(r2)
+    assert r2["verification"] == "verified"
+    # no signal -> no key added
+    r3 = {"ok": True}
+    e.stamp_verification(r3)
+    assert "verification" not in r3
 
 
 # ---- v0.52.4: insert_rows one-Submit-per-row (fixes the CS205010 cross-row

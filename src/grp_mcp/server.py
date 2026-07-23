@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import functools
 import importlib.resources
+import inspect
 import json
 import os
 import re
@@ -21,6 +23,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from . import enforcement, kb, preflight
 from .acumatica import AcumaticaClient, AcumaticaError
 from .aspx import AspxDiagnostic, _tree_node_dom_id
 from .config import Config, Instance, load_config, save_config
@@ -344,6 +347,88 @@ def _require_write(instance: str | None) -> None:
         )
 
 
+async def _write_preflight(tool_name: str, instance: str | None,
+                           screen_id: str | None = None,
+                           query: str | None = None) -> dict | None:
+    """Run the enforcement preflight for a write: consult kb-mcp-dual (first),
+    then KNOWLEDGE.md, per the instance's enforcement level. Returns a decision
+    dict (with .blocked) or None when enforcement is 'off'. See preflight.py.
+
+    Wrapped so a preflight failure can never itself break a write — on an
+    unexpected error it returns None (treated as 'off') rather than raising.
+    """
+    try:
+        cfg = _cfg()
+        inst = cfg.get(instance or cfg.default)
+        level = inst.effective_enforcement()
+        return await preflight.gather(tool_name, level=level,
+                                      screen_id=screen_id, query=query)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _blocked_result(pf: dict) -> dict:
+    """Uniform 'refused by enforcement' result for a blocked preflight."""
+    return {"ok": False, "blocked_by_enforcement": pf.get("block_reason"),
+            "preflight": pf}
+
+
+def _preflight_write(*, query_arg: str | None = None, query_const: str | None = None,
+                     skip_when=None):
+    """Decorator that runs the enforcement write-preflight before a tool body,
+    then folds the evidence into the result. Sits BELOW @mcp.tool() (so the tool
+    schema is unchanged — verified) and ABOVE the tool function.
+
+    query_arg:   name of the tool argument to use as the KB query. If it's
+                 "screen_id" it's passed as the screen id; any other arg is passed
+                 as free-text query. Falls back to query_const, then the tool name.
+    query_const: a fixed query string for tools with no screen_id/entity arg.
+    skip_when:   optional predicate(bound_args_dict) -> bool; when True, the
+                 preflight is skipped (e.g. a specific non-persisting action).
+
+    Also auto-skips when the call plainly persists nothing: dry_run=True,
+    save=False, or do_import=False (resolved against the tool's real defaults).
+    """
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrap(*a, **k):
+            try:
+                bound = sig.bind(*a, **k)
+                bound.apply_defaults()
+                ba = dict(bound.arguments)
+            except TypeError:
+                ba = dict(k)
+            # non-persisting invocations need no KB consult
+            if (ba.get("dry_run") is True or ba.get("save") is False
+                    or ba.get("do_import") is False
+                    or (skip_when and skip_when(ba))):
+                return await fn(*a, **k)
+            instance = ba.get("instance")
+            screen_id = None
+            query = query_const
+            if query_arg:
+                val = ba.get(query_arg)
+                if query_arg == "screen_id":
+                    screen_id = val
+                elif val:
+                    query = str(val)
+            pf = await _write_preflight(fn.__name__, instance,
+                                        screen_id=screen_id, query=query)
+            if pf and pf.get("blocked"):
+                return _blocked_result(pf)
+            res = await fn(*a, **k)
+            if pf and isinstance(res, dict):
+                res.setdefault("preflight", pf)
+            return res
+
+        wrap.__preflight_wired__ = True  # marker the coverage test looks for
+        return wrap
+
+    return deco
+
+
 # Screen/UI actions that DELETE data — held to the stricter allow_delete gate (not
 # just allow_write) so neither the classic screen SOAP nor the modern /ui/screen/
 # plane can sidestep it. Covers a record Delete AND detail-row deletes.
@@ -621,10 +706,11 @@ def _check_read_path(path: str, instance: str | None):
     p = Path(path).expanduser().resolve()
     if not p.is_file():
         raise FileNotFoundError(f"file not found: {path}")
-    roots = _resolve_roots(inst.read_roots)
+    roots = _resolve_roots(inst.effective_roots("read"))
     if roots and not _within(p, roots):
         raise PermissionError(
-            f"Reading '{p}' is not allowed. Permitted read_roots: {[str(r) for r in roots]}."
+            f"Reading '{p}' is not allowed. Permitted read_roots: {[str(r) for r in roots]} "
+            f"(set read_roots, or allow_unrestricted_fs=true for whole-disk access)."
         )
     size = p.stat().st_size
     if inst.max_file_bytes and size > inst.max_file_bytes:
@@ -641,10 +727,11 @@ def _check_write_path(path: str, instance: str | None):
     cfg = _cfg()
     inst = cfg.get(instance or cfg.default)
     p = Path(path).expanduser().resolve()
-    roots = _resolve_roots(inst.write_roots)
+    roots = _resolve_roots(inst.effective_roots("write"))
     if roots and not _within(p.parent, roots) and not _within(p, roots):
         raise PermissionError(
-            f"Writing to '{p}' is not allowed. Permitted write_roots: {[str(r) for r in roots]}."
+            f"Writing to '{p}' is not allowed. Permitted write_roots: {[str(r) for r in roots]} "
+            f"(set write_roots, or allow_unrestricted_fs=true for whole-disk access)."
         )
     return p
 
@@ -1102,6 +1189,7 @@ def _edm_to_valuetype(t: str | None) -> str:
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def generate_endpoint_entity(
     screen_id: str,
     name: str,
@@ -1474,6 +1562,9 @@ async def create_or_update_entity(
     be fetched.
     """
     _require_write(instance)
+    _pf = await _write_preflight("create_or_update_entity", instance, query=entity)
+    if _pf and _pf.get("blocked"):
+        return _blocked_result(_pf)
     client = _client(instance, endpoint)
     # Pre-flight: reject field names the schema doesn't know, BEFORE the PUT.
     # Zero-cost after the first call (swagger.json is cached per client).
@@ -1539,6 +1630,7 @@ async def create_or_update_entity(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def attach_file(
     entity: str,
     record_id: str,
@@ -1582,6 +1674,7 @@ async def attach_file(
 
 
 @mcp.tool()
+@_preflight_write()
 async def attach_file_to_provider(
     record_id: str,
     file_path: str,
@@ -2124,6 +2217,10 @@ async def ui_screen_action(
     # so the modern plane can't sidestep it (parity with delete_entity).
     if action in _DESTRUCTIVE_ACTIONS:
         _require_delete(instance)
+    if action not in ("Cancel", "Repaint"):  # these persist nothing
+        _pf = await _write_preflight("ui_screen_action", instance, screen_id=screen_id)
+        if _pf and _pf.get("blocked"):
+            return _blocked_result(_pf)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
         # Preflight against /structure: unknown actions AND unknown fields both
@@ -2402,6 +2499,7 @@ async def ui_lookup(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_run_process(
     screen_id: str,
     action: str,
@@ -2446,6 +2544,7 @@ async def ui_run_process(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_grid_row_action(
     screen_id: str,
     grid_view: str,
@@ -2514,6 +2613,7 @@ async def ui_grid_row_action(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_tree_dialog_insert(
     screen_id: str,
     tree_view: str,
@@ -2588,6 +2688,7 @@ async def ui_tree_dialog_insert(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity_object_name")
 async def ui_populate_endpoint_entity_fields(
     endpoint_name: str,
     endpoint_version: str,
@@ -2644,6 +2745,7 @@ async def ui_populate_endpoint_entity_fields(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ensure_entity_on_endpoint(
     screen_id: str,
     entity_name: str,
@@ -2816,6 +2918,7 @@ async def ui_read_grid(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_update_grid_row(
     screen_id: str,
     grid_view: str,
@@ -2869,6 +2972,7 @@ async def ui_update_grid_row(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_update_grid_rows(
     screen_id: str,
     grid_view: str,
@@ -2922,6 +3026,7 @@ async def ui_update_grid_rows(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_insert_grid_row(
     screen_id: str,
     grid_view: str,
@@ -2981,6 +3086,7 @@ async def ui_insert_grid_row(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def ui_delete_grid_row(
     screen_id: str,
     grid_view: str,
@@ -3015,6 +3121,7 @@ async def ui_delete_grid_row(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def diagnose_save_error(
     screen_id: str,
     record_key: dict,
@@ -3127,6 +3234,7 @@ async def diagnose_save_error(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def aspx_delete_grid_row(
     screen_id: str,
     record_key: dict,
@@ -3276,6 +3384,7 @@ async def export_screen_xml(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def import_screen_xml(
     screen_id: str,
     xml: str | None = None,
@@ -3377,6 +3486,7 @@ async def import_screen_xml(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def aspx_grid_batch(
     screen_id: str,
     record_key: dict,
@@ -3462,6 +3572,7 @@ async def aspx_grid_batch(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def aspx_tree_node_action(
     screen_id: str,
     node_key: int,
@@ -3645,13 +3756,22 @@ async def screen_submit(
         for c in commands if isinstance(c, dict)
     ):
         _require_delete(instance)
+    pf = None
+    if not dry_run:  # dry_run persists nothing — no preflight needed
+        pf = await _write_preflight("screen_submit", instance, screen_id=screen_id)
+        if pf and pf.get("blocked"):
+            return _blocked_result(pf)
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
-        return await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer,
-                              skip_validation=skip_validation)
+        result = await s.submit(commands, dry_run=dry_run, auto_answer=auto_answer,
+                                skip_validation=skip_validation)
+    if pf and isinstance(result, dict):
+        result.setdefault("preflight", pf)
+    return result
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def screen_insert_rows(
     screen_id: str,
     container: str,
@@ -3716,6 +3836,7 @@ async def screen_insert_rows(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def screen_bulk_load(
     screen_id: str,
     rows: list[dict],
@@ -3814,6 +3935,7 @@ async def screen_bulk_load(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def screen_record(
     screen_id: str,
     key_field: str,
@@ -4111,6 +4233,7 @@ async def whoami(instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+@_preflight_write()
 async def enable_features(
     features: list[str], activate: bool = False, instance: str | None = None
 ) -> Any:
@@ -4180,6 +4303,7 @@ async def _activation_status(inst, poll_interval: float, budget: float) -> str |
 
 
 @mcp.tool()
+@_preflight_write()
 async def activate_features(wait_seconds: float = 40.0, instance: str | None = None) -> Any:
     """Activate/install the staged feature set on CS100000 (the "Enable" button) —
     NON-BLOCKING (won't hang on the recompile).
@@ -4279,6 +4403,7 @@ async def activate_features_status(instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+@_preflight_write()
 async def create_financial_calendar(
     first_year: str,
     starts_on: str | None = None,
@@ -4343,6 +4468,7 @@ async def create_financial_calendar(
 
 
 @mcp.tool()
+@_preflight_write()
 async def delete_financial_year(year: str, instance: str | None = None) -> Any:
     """Delete ONE financial year (and its periods) from the Master Calendar (GL201000).
 
@@ -4374,6 +4500,7 @@ async def delete_financial_year(year: str, instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+@_preflight_write()
 async def reset_calendar(
     from_year: str, to_year: str | None = None, instance: str | None = None
 ) -> Any:
@@ -4412,6 +4539,7 @@ async def reset_calendar(
 
 
 @mcp.tool()
+@_preflight_write()
 async def create_ledger(
     ledger_id: str,
     description: str,
@@ -4441,6 +4569,7 @@ async def create_ledger(
 
 
 @mcp.tool()
+@_preflight_write()
 async def set_gl_preferences(
     retained_earnings: str,
     ytd_net_income: str,
@@ -4524,6 +4653,7 @@ def _normalize_coa_type(value: Any, type_map: dict | None = None) -> str:
 
 
 @mcp.tool()
+@_preflight_write()
 async def chart_of_accounts(
     accounts: list[dict],
     save: bool = True,
@@ -4615,6 +4745,7 @@ def _flatten_tree_parents(nodes: list, parent: str | None = None,
 
 
 @mcp.tool()
+@_preflight_write()
 async def build_company_tree(
     structure: Any,
     skip_if_root_exists: bool = True,
@@ -4739,6 +4870,7 @@ async def build_company_tree(
 
 
 @mcp.tool()
+@_preflight_write()
 async def add_workgroup_member(
     workgroup: Any,
     member: Any,
@@ -4901,6 +5033,7 @@ def _approval_map_xml(name: str, entity: str, graph_type: str,
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def build_approval_map(
     name: str,
     entity: str,
@@ -5026,6 +5159,7 @@ async def build_approval_map(
 
 
 @mcp.tool()
+@_preflight_write()
 async def generate_master_calendar(
     from_year: str, to_year: str | None = None, instance: str | None = None
 ) -> Any:
@@ -5087,6 +5221,7 @@ async def generate_master_calendar(
 
 
 @mcp.tool()
+@_preflight_write()
 async def manage_financial_periods(
     from_year: str,
     to_year: str | None = None,
@@ -5136,6 +5271,7 @@ async def manage_financial_periods(
 
 
 @mcp.tool()
+@_preflight_write()
 async def create_numbering_sequence(
     numbering_id: str,
     description: str,
@@ -5199,6 +5335,7 @@ async def create_numbering_sequence(
 
 
 @mcp.tool()
+@_preflight_write()
 async def create_segmented_key(
     key_id: str,
     description: str,
@@ -5276,6 +5413,7 @@ async def create_segmented_key(
 
 
 @mcp.tool()
+@_preflight_write()
 async def set_segment_value(
     segmented_key_id: str,
     value: str,
@@ -5330,6 +5468,7 @@ async def set_segment_value(
 
 
 @mcp.tool()
+@_preflight_write()
 async def delete_segmented_key(key_id: str, instance: str | None = None) -> Any:
     """Delete a segmented key with the correct children-first teardown.
 
@@ -5788,6 +5927,7 @@ async def screen_autofill(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def load_from_excel(
     entity: str,
     path: str,
@@ -6213,6 +6353,7 @@ async def stock_scenario_info(screen_id: str, instance: str | None = None) -> di
 
 
 @mcp.tool()
+@_preflight_write()
 async def setup_data_provider(
     name: str,
     file_path: str,
@@ -6383,6 +6524,7 @@ async def _await_scenario_change(client, scenario_name: str, field: str, old,
 
 
 @mcp.tool()
+@_preflight_write()
 async def import_excel(
     scenario_name: str,
     file_path: str,
@@ -6959,6 +7101,7 @@ async def validate_import_setup(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="screen_id")
 async def build_import_scenario(
     name: str,
     screen_id: str,
@@ -7190,7 +7333,13 @@ async def delete_entity(entity: str, record_id: str, endpoint: str | None = None
     Requires the instance's "allow_delete": true (default off, stricter than write).
     """
     _require_delete(instance)
-    return await _client(instance, endpoint).delete_entity(entity, record_id)
+    _pf = await _write_preflight("delete_entity", instance, query=entity)
+    if _pf and _pf.get("blocked"):
+        return _blocked_result(_pf)
+    result = await _client(instance, endpoint).delete_entity(entity, record_id)
+    if _pf and isinstance(result, dict):
+        result.setdefault("preflight", _pf)
+    return result
 
 
 @mcp.tool()
@@ -7289,6 +7438,7 @@ async def list_generic_inquiries(instance: str | None = None) -> Any:
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def invoke_action(
     entity: str,
     action: str,
@@ -7314,6 +7464,7 @@ async def invoke_action(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def run_import_scenario(
     scenario_name: str,
     do_import: bool = False,
@@ -8377,46 +8528,11 @@ def guide(topic: str | None = None) -> Any:
     return _GUIDE
 
 
-def _knowledge_text() -> str | None:
-    """Read the bundled KNOWLEDGE.md (pure, no API). Works both from an installed wheel
-    (packaged as grp_mcp/KNOWLEDGE.md via force-include) and from an editable/src checkout
-    (repo-root KNOWLEDGE.md, two dirs up from this file)."""
-    try:
-        p = importlib.resources.files("grp_mcp").joinpath("KNOWLEDGE.md")
-        if p.is_file():
-            return p.read_text(encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
-    here = Path(__file__).resolve()
-    for base in (here.parents[2], here.parents[1], here.parent):
-        cand = base / "KNOWLEDGE.md"
-        if cand.is_file():
-            return cand.read_text(encoding="utf-8")
-    return None
-
-
-def _split_knowledge_sections(text: str) -> list[dict]:
-    """Split KNOWLEDGE.md into its top-level `## N. Title` sections (pure, unit-testable).
-    Returns [{num, title, heading, body}] in document order; content before the first
-    numbered heading is dropped (it's the intro)."""
-    out: list[dict] = []
-    cur: dict | None = None
-    lines: list[str] = []
-    for line in text.splitlines():
-        m = re.match(r"^##\s+(\d+)\.\s+(.*)$", line)
-        if m:
-            if cur is not None:
-                cur["body"] = "\n".join(lines).strip()
-                out.append(cur)
-            cur = {"num": m.group(1), "title": m.group(2).strip(),
-                   "heading": f"{m.group(1)}. {m.group(2).strip()}"}
-            lines = [line]
-        elif cur is not None:
-            lines.append(line)
-    if cur is not None:
-        cur["body"] = "\n".join(lines).strip()
-        out.append(cur)
-    return out
+# KNOWLEDGE.md loading/splitting lives in kb.py (neutral, no server import) so the
+# enforcement/preflight path can reuse it without a circular import. Kept under the
+# old private names here for the `knowledge` tool below.
+_knowledge_text = kb.knowledge_text
+_split_knowledge_sections = kb.split_sections
 
 
 @mcp.tool()
@@ -9020,6 +9136,7 @@ async def download_filter_report(
 
 
 @mcp.tool()
+@_preflight_write(query_arg="entity")
 async def set_note(
     entity: str, record_id: str, note: str, instance: str | None = None
 ) -> Any:
@@ -9103,6 +9220,7 @@ async def export_customization(
 
 
 @mcp.tool()
+@_preflight_write()
 async def import_customization(
     project_name: str,
     zip_path: str,
@@ -9184,6 +9302,7 @@ def _published_project_names(raw: Any) -> list[str]:
 
 
 @mcp.tool()
+@_preflight_write()
 async def publish_customization(
     project_names: list[str],
     tenant_mode: str = "Current",
@@ -9360,6 +9479,7 @@ async def publish_status(job: str | None = None, instance: str | None = None) ->
 
 
 @mcp.tool()
+@_preflight_write()
 async def unpublish_customization(
     tenant_mode: str = "Current",
     tenant_login_names: list[str] | None = None,

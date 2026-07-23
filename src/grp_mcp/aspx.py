@@ -1363,4 +1363,6 @@ class AspxDiagnostic:
             result["all_verified"] = all(v["save_verified"] is True for v in verifs)
             result["rows_before"] = len(rows_before)
             result["rows_after"] = len(rows_after)
+        from . import enforcement
+        enforcement.stamp_verification(result)
         return result

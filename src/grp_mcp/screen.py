@@ -3008,6 +3008,8 @@ class ScreenClient:
                 )
             else:
                 result["delete_verified"] = True
+        from . import enforcement
+        enforcement.stamp_verification(result)
         return result
 
     @staticmethod

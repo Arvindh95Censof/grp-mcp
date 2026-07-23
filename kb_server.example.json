@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to kb_server.json (gitignored) so grp-mcp can consult kb-mcp-dual during write preflight. grp-mcp launches this as a subprocess and calls its search_kb tool. Point GRP_MCP_KB_SERVER at this file to override the location. If absent, the KB-consult step is skipped and preflight falls back to KNOWLEDGE.md + live checks.",
+  "command": "C:\\path\\to\\kb-mcp-venv\\Scripts\\python.exe",
+  "args": [
+    "C:\\path\\to\\grp-kb\\server.py"
+  ],
+  "env": {
+    "KB_VAULT_DIR": "C:\\path\\to\\Acumatica-KB",
+    "KB_INDEX_DIR": "C:\\path\\to\\index_minilm_full",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1"
+  }
+}
