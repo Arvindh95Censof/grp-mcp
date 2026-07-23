@@ -3843,10 +3843,37 @@ class ScreenClient:
     }
     _LOOKUP_SELECTOR_FIELDS: set[str] = {
         "BranchID", "ClassID", "OrganizationID", "CategoryValue", "int0",
+        # AP631200 magnifier selectors (added 2026-07-23). VendorID is live two-direction
+        # proven (MCPBANK -> empty, VEND01 -> its docs). ManagerID/ProjectCD are the same
+        # PXSelector magnifier control type on the same screen — ManagerID verified
+        # (EMP001 -> empty, since this tenant's AP docs carry no project manager, proving
+        # the filter binds); ProjectCD has only one value (X, non-project) so it can't be
+        # two-direction-proven here, but it's the identical control shape.
+        "VendorID", "ManagerID", "ProjectCD",
     }
     # Fields whose value posts on the BARE control name (no `$text` suffix), `_state`
     # present-but-empty — the Company/Branch tree-selector shape. See the block above.
     _BARE_NAME_FIELDS: set[str] = {"OrgBAccountID"}
+
+    # The param-control ID TEMPLATE differs BETWEEN report screens — a TENTH gotcha,
+    # found 2026-07-23 on AP631200 ("AP Aging by Project"). Most screens nest params in
+    # a `pForm` sub-container (AP630500/GL632000: `viewer_par_tab_t0_pForm_ed<Field>`),
+    # but some place them DIRECTLY under the tab (AP631200: `viewer_par_tab_t0_ed<Field>`
+    # — no `pForm` segment). The full control names are NOT in the launcher's server HTML
+    # (built client-side — verified: a raw GET of any launcher has zero
+    # `viewer_par_tab_t0_..ed<Field>` matches, even AP630500 which works), so the tool
+    # CANNOT detect which template a screen uses by reading the GET. Instead it emits each
+    # param under BOTH templates: the server binds the field name that exists on that
+    # screen and SILENTLY IGNORES the other (proven: unknown control names return callback
+    # success and no-op — that same silent-ignore is exactly why the wrong single template
+    # looked inert on AP631200). Live two-direction proof, AP631200 VendorID: `MCPBANK`
+    # (real vendor, no AP docs) -> report header "Vendor: MCPBANK" + empty body; `VEND01`
+    # -> its 4 docs retained. Each pair is (state-name prefix using `_`, POST-name prefix
+    # using `$`). Adding more layouts here is safe — extra unknown names are ignored.
+    _CONTROL_PREFIXES: tuple[tuple[str, str], ...] = (
+        ("viewer_par_tab_t0_pForm_ed", "viewer$par$tab$t0$pForm$ed"),  # pForm layout
+        ("viewer_par_tab_t0_ed", "viewer$par$tab$t0$ed"),              # tab-direct layout
+    )
 
     async def set_report_parameters(
         self, parameters: list[dict], launcher_url: str, instance_key: str, token: str
@@ -3881,8 +3908,11 @@ class ScreenClient:
 
         `<RawField>` is screen_get_schema's "Parameters" container field name for the
         friendly name given (e.g. FinancialPeriod -> PeriodID, so the control ID is
-        `viewer_par_tab_t0_pForm_edPeriodID`) — the classic control ID is always
-        "ed" + the raw field name, verified for every field type tested so far.
+        `ed` + the raw field name). The `viewer_par_tab_t0_pForm_` prefix shown above is
+        only ONE of the layouts — some screens (AP631200) drop the `pForm` segment and
+        use `viewer_par_tab_t0_ed<RawField>`. Since the full names aren't in the launcher
+        HTML, each param is emitted under BOTH templates (_CONTROL_PREFIXES); the server
+        binds the one that exists and ignores the other.
 
         Live-proven WORKING, AP630500:
         - ReportFormat "Summary"/"Detailed" — title + row structure genuinely change
@@ -3923,6 +3953,18 @@ class ScreenClient:
           shape still no-op'd (confirming the bug was exactly the field-name suffix).
           Combined with FinancialPeriod in one call.
 
+        Live-proven WORKING, AP631200 "AP Aging by Project" (the `viewer_par_tab_t0_ed`
+        NO-pForm layout — see _CONTROL_PREFIXES):
+        - Vendor (`VendorID`, LOOKUP) — MCPBANK (real vendor, no AP docs) -> header
+          "Vendor: MCPBANK" + empty body; VEND01 -> its 4 docs. Full two-direction proof.
+        - ProjectManager (`ManagerID`, LOOKUP) — EMP001 -> empty (this tenant's AP docs
+          carry no project manager, so the filter binding is what empties it).
+        - VendorClass (`ClassID`) and CompanyBranch (`OrgBAccountID`) — both bind here too
+          (STAFF and YMHQ each empty the report). ReportFormat+Vendor+CompanyBranch
+          combined in one call render a Summary-layout, VEND01-only, MAIN report.
+          Before this fix ALL of AP631200's selector params silently no-op'd because the
+          tool posted only the `pForm` template, which doesn't exist on this screen.
+
         Any field in NONE of the registries defaults to the BARE SELECTOR (`$text`-only,
         no `_state`) shape — correct for PeriodID, unverified for anything else not yet
         individually tested. `AttributeID` (raw `attributeID`, Category's paired
@@ -3960,22 +4002,28 @@ class ScreenClient:
                     f"{friendly!r} — known: {sorted(param_fields)} (from screen_get_schema)"
                 )
             raw_field = entry["field"]
-            control = f"viewer_par_tab_t0_pForm_ed{raw_field}"
-            if raw_field in self._BARE_NAME_FIELDS:
-                # Company/Branch tree-selector: value on the BARE control name (NO
-                # `$text` suffix), `_state` present-but-empty. This is the ONLY shape
-                # that does not append `$text`, so it's handled first and standalone.
-                form[f"viewer$par$tab$t0$pForm$ed{raw_field}"] = str(value)
-                form[f"{control}_state"] = ""
-                continue
             combo = self._PXTEXT_COMBO_FIELDS.get(raw_field)
-            if combo is not None:
-                code = combo.get(str(value).strip().lower(), value)
-                form[f"{control}_state"] = f'<PText Value="{escape(str(code))}"/>'
-            elif raw_field in self._LOOKUP_SELECTOR_FIELDS:
-                form[f"{control}_state"] = f'<PXSelector Value="{escape(str(value))}"/>'
-            # else: BARE SELECTOR shape (e.g. PeriodID) — `_state` deliberately omitted.
-            form[f"viewer$par$tab$t0$pForm$ed{raw_field}$text"] = str(value)
+            is_bare_name = raw_field in self._BARE_NAME_FIELDS
+            is_lookup = raw_field in self._LOOKUP_SELECTOR_FIELDS
+            # Emit each param under BOTH control-ID templates (see _CONTROL_PREFIXES):
+            # the server binds the one that exists on this screen and ignores the other.
+            for state_pfx, post_pfx in self._CONTROL_PREFIXES:
+                if is_bare_name:
+                    # Company/Branch tree-selector: value on the BARE control name (NO
+                    # `$text` suffix), `_state` present-but-empty.
+                    form[f"{post_pfx}{raw_field}"] = str(value)
+                    form[f"{state_pfx}{raw_field}_state"] = ""
+                elif combo is not None:
+                    code = combo.get(str(value).strip().lower(), value)
+                    form[f"{state_pfx}{raw_field}_state"] = f'<PText Value="{escape(str(code))}"/>'
+                    form[f"{post_pfx}{raw_field}$text"] = str(value)
+                elif is_lookup:
+                    form[f"{state_pfx}{raw_field}_state"] = f'<PXSelector Value="{escape(str(value))}"/>'
+                    form[f"{post_pfx}{raw_field}$text"] = str(value)
+                else:
+                    # BARE SELECTOR shape (e.g. PeriodID) — `_state` deliberately omitted
+                    # (sending it corrupts a dash-containing value).
+                    form[f"{post_pfx}{raw_field}$text"] = str(value)
         resp = await self._http.post(launcher_url, data=form)
         if resp.status_code >= 400:
             raise ScreenError(

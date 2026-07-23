@@ -3865,6 +3865,38 @@ def test_download_report_file_bare_name_field_omits_text_suffix():
     assert form["viewer_par_tab_t0_pForm_edOrgBAccountID_state"] == ""
 
 
+def test_download_report_file_emits_params_under_both_control_templates():
+    # Live gotcha (AP631200): the param control-ID template differs between report
+    # screens — most nest params in a `pForm` sub-container
+    # (viewer_par_tab_t0_pForm_ed<F>), but some place them directly under the tab
+    # (viewer_par_tab_t0_ed<F>, no pForm). The names aren't in the launcher HTML, so
+    # the tool emits every param under BOTH templates; the server binds the one that
+    # exists and ignores the other. This asserts both are present for each shape.
+    c, calls = _report_client([_FakeGetResp(200, text=_LAUNCHER_HTML_OK)])
+    asyncio.run(ScreenClient.set_report_parameters(
+        c, [{"set": "ReportFormat", "to": "Summary"},      # PXTEXT COMBO
+            {"set": "FinancialPeriod", "to": "03-2026"},   # BARE SELECTOR
+            {"set": "Branch", "to": "YMHQ"},               # LOOKUP SELECTOR
+            {"set": "CompanyBranch", "to": "MAIN"}],       # BARE NAME (OrgBAccountID)
+        "https://example.invalid/launcher", "key123", "tok123"))
+    form = calls[-1][2]
+    # PXTEXT COMBO under both templates
+    assert form["viewer_par_tab_t0_pForm_edFormat_state"] == '<PText Value="S"/>'
+    assert form["viewer_par_tab_t0_edFormat_state"] == '<PText Value="S"/>'
+    assert form["viewer$par$tab$t0$edFormat$text"] == "Summary"
+    # BARE SELECTOR under both — `_state` omitted for BOTH
+    assert form["viewer$par$tab$t0$edPeriodID$text"] == "03-2026"
+    assert "viewer_par_tab_t0_edPeriodID_state" not in form
+    assert "viewer_par_tab_t0_pForm_edPeriodID_state" not in form
+    # LOOKUP SELECTOR under both
+    assert form["viewer_par_tab_t0_edBranchID_state"] == '<PXSelector Value="YMHQ"/>'
+    assert form["viewer$par$tab$t0$edBranchID$text"] == "YMHQ"
+    # BARE NAME under both — bare control name, `_state` empty, no `$text`
+    assert form["viewer$par$tab$t0$edOrgBAccountID"] == "MAIN"
+    assert form["viewer_par_tab_t0_edOrgBAccountID_state"] == ""
+    assert "viewer$par$tab$t0$edOrgBAccountID$text" not in form
+
+
 def test_download_report_file_excel_uses_export_optype_and_validates_zip_magic():
     c, calls = _report_client([
         _FakeGetResp(200, text=_LAUNCHER_HTML_OK),

@@ -2024,6 +2024,26 @@ edge to the lesson: when several `_state` variants all fail identically, don't a
 MECHANISM is wrong (the "needs a full postback" dead-end) — check the value's POST FIELD NAME first,
 because a widget can quietly drop the `$text` suffix every other field uses.
 
+**`OrgBAccountID`'s POST-name has a SECOND trap — the control-ID TEMPLATE itself differs between report
+screens. A TENTH gotcha, AP631200 "AP Aging by Project", 2026-07-23.** On AP630500/GL632000 the params
+nest in a `pForm` sub-container (`viewer_par_tab_t0_pForm_ed<Field>`); on AP631200 they sit DIRECTLY
+under the tab (`viewer_par_tab_t0_ed<Field>` — no `pForm`). So on AP631200 EVERY selector param
+(Vendor, Vendor Class, Company/Branch, Project Manager) silently no-op'd — the tool posted only the
+`pForm`-prefixed names, which don't exist on that screen. Confounder ruled out first: the params are
+NOT in the launcher's server HTML at all (a raw GET of ANY launcher — even AP630500, which works — has
+zero `viewer_par_tab_t0_..ed<Field>` matches; they're built client-side), so the template can't be
+discovered by grepping the GET. The DOM after JS load DOES have them — that's where the `_t0_ed` (no
+pForm) name was read directly off `form.elements`. Fix: emit each param under BOTH templates
+(`_CONTROL_PREFIXES`); the server binds the name that exists on that screen and silently ignores the
+other (that same silent-ignore — proven earlier — is exactly why the wrong single template looked
+inert). Also this round: AP631200's `VendorID`/`ManagerID`/`ProjectCD` are ordinary PXSelector
+magnifiers -> added to `_LOOKUP_SELECTOR_FIELDS`. Live two-direction proof via the shipped
+`download_report_file`: `Vendor=MCPBANK` (real vendor, no AP docs) -> header "Vendor: MCPBANK" + empty
+body; `VEND01` -> its 4 docs; `ProjectManager=EMP001` -> empty (docs carry no manager); AP630500 +
+GL632000 regressions still pass (the extra unknown-name fields are ignored there). META add-on: when a
+field name works on screen A but no-ops on screen B, suspect the CONTAINER PATH, not just the field —
+and if you can't read the layout from the server response, send both and let the server pick.
+
 **`CensofReportLauncher.aspx` is this tenant's CUSTOM-branded launcher page** — the stock Acumatica
 name is plain `ReportLauncher.aspx`. `download_report_file`'s `report_filename=` override lets you
 point at a different `.rpx` if the `{ScreenID}.rpx` convention doesn't hold, but the LAUNCHER PAGE
