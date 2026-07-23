@@ -27,7 +27,10 @@ if errorlevel 1 (
 )
 
 echo Starting the config server in a new window...
-start "grp-mcp config UI - close this window when you're done editing" cmd /k uvx --from grp-mcp grp-mcp-ui
+rem --refresh forces uvx to pull the LATEST grp-mcp from PyPI instead of a stale
+rem cached wheel. Without it, uvx keeps serving whatever version it first cached,
+rem so shipped UI fixes never reach you (symptom: the page hangs on "loading...").
+start "grp-mcp config UI - close this window when you're done editing" cmd /k uvx --refresh --from grp-mcp grp-mcp-ui
 
 echo Waiting for it to start...
 timeout /t 3 /nobreak >nul
