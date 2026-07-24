@@ -2233,5 +2233,55 @@ called. No config, no enforcement level — always on, always soft.
 
 ---
 
+## §21 Classic key-nav no-op, insert_rows leakage, record_key validation (v0.72.0)
+
+An external audit (code-grounded, verified line-by-line against 0.71.0 source before acting on
+it) found two real correctness bugs in the classic SOAP plane plus one missing input-validation
+guard. All three fixed; three smaller hardening items included.
+
+**Classic key-navigation no-op reported as `ok:true`** (`screen.py` `submit()`). The existing
+no-bind guard (`_NOBIND_LEN=1500`) only catches a LARGE response body (full-page re-render =
+didn't bind). When a `{"set": <key_field>}` command's friendly name is ambiguous and gets
+container-qualified, navigation can silently not fire — the graph stays on the current/blank
+record, the following Save persists nothing, yet Acumatica still returns the small ~335-byte
+empty `<SubmitResult/>`, which read as success (reproduced live, IV301000: `Hold` set `false`,
+stayed `true`). Fix: `_navigating_key_sets()` detects which `{"set":...}` commands target a field
+whose schema descriptor carries a `LinkedCommand` (the navigation-chain marker `_ensure_tree`'s
+docstring already named but nothing checked programmatically — confirmed real by `export()`'s own
+comment that it deliberately builds bare FieldName/ObjectName commands "because the full
+descriptor... confuses Export"). When such a field was set and the Save looks like a small-body
+success, `_verify_navigation()` re-`export()`s the OTHER fields set in the same batch (reusing the
+exact `export(fields, top=1, filters=[...])` primitive `check_existing`/`set_record` already use —
+no new read-back mechanism invented) and flips `ok:false` + `nav_failed` on mismatch. Zero added
+cost on the common case (only runs when a navigating key was actually set).
+
+**`insert_rows` can accumulate rows across dry-run/failed calls** (`screen.py` `submit()` +
+`insert_rows()`). The 2026-07-13 fix (one Submit per row) stops rows colliding WITHIN a call, but
+`submit()`'s dry_run filter only drops `{"action"}`/`{"delete_row"}` — a `{"new_row": ...}` has
+neither key, so it's sent live even under `dry_run=True`. Nothing ever cancelled it, so a
+dry-run's (or a failed real Save's) staged row-add could ride the shared session into a LATER
+call's Save. Fix: `submit()` appends `{"action": "Cancel"}` in the SAME envelope after a dry_run
+that staged a `new_row` (best-effort — skipped if the screen has no generic Cancel action, same
+prior behavior); `insert_rows()` issues an explicit Cancel after a row's real Save fails, before
+moving to the next row.
+
+**`record_key["view"]` unguarded** (`server.py` `ui_screen_action`). `_require_explicit_target`
+only checks non-None, never shape — a bare `{keyField: value}` (the natural but wrong guess)
+raised `KeyError: 'view'` instead of a clear error. Fix: explicit isinstance/key-presence guard
+before the subscript, and the shape now spelled out in the docstring (matching how `tree_select`'s
+shape already was).
+
+**Minor hardening, same session:** `delete_entity` on a composite-keyed entity (e.g. Payment)
+now gets a HINT appended when the condition-not-satisfied 500 fires, naming the keys-path fix;
+`get_entity`'s BQL-delegate retry (`ImportScenarios`/`VendorClass`/`Payment`-shaped) now also
+covers a BARE call (no `$select`/`$expand` to drop) with a clear hint instead of a raw 500, and
+recognizes the `"key not present in dictionary"` wording variant alongside the original phrasing;
+`insert_rows()` now runs the SAME key-mangle detection `ui_insert_grid_row` already had
+(`_is_altered_key` — punctuation-to-space or right-truncation) via this plane's own `export()`,
+since `_verify_stored_key` itself is modern-plane-shaped (reads `controlsData`/`ui_grid_read`) and
+can't be called from classic `insert_rows` directly.
+
+---
+
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,
 per-client configuration) is intentionally excluded and should never be committed to a public repo.*

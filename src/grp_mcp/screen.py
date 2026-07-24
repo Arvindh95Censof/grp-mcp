@@ -3238,6 +3238,81 @@ class ScreenClient:
                 issues.append(fi)
         return issues
 
+    def _navigating_key_sets(self, commands: list[dict]) -> list[tuple[str, Any]]:
+        """Which `{"set": ...}` commands target a NAVIGATING key field — one whose
+        descriptor carries a LinkedCommand (see _ensure_tree: "the LinkedCommand
+        navigation chain" is what actually loads/selects the record; Export builds
+        its own bare FieldName/ObjectName commands specifically to AVOID it, see
+        export()). Setting one of these is supposed to switch the graph onto a
+        DIFFERENT existing record before the rest of the batch edits it — if the
+        friendly name was ambiguous and got container-qualified, the qualified form
+        does not carry the chain and navigation silently doesn't fire (see
+        submit()'s post-Save verification). Best-effort: a field that can't be
+        resolved is skipped, never raises."""
+        out: list[tuple[str, Any]] = []
+        for c in commands:
+            if "set" not in c:
+                continue
+            try:
+                el = self._find_field(c["set"])
+            except ScreenError:
+                continue
+            if el.find("LinkedCommand") is not None:
+                out.append((c["set"], c.get("to")))
+        return out
+
+    async def _verify_navigation(self, commands: list[dict],
+                                 nav_sets: list[tuple[str, Any]], result: dict) -> dict:
+        """Best-effort post-Save check for the ambiguous-key no-op (reproduced live
+        on IV301000): re-Export the OTHER fields this batch set, filtered by the
+        first navigating key, and confirm they actually landed. A Save that
+        reported ok:true but whose own edits don't show up on read-back means
+        navigation never selected the intended record and nothing meaningful
+        persisted. Never raises — an Export failure/timeout leaves `result` as-is
+        (unverified, not un-done)."""
+        try:
+            key_field, key_value = nav_sets[0]
+            other_sets = {c["set"]: c["to"] for c in commands
+                         if "set" in c and c["set"] != key_field}
+            if not other_sets:
+                return result
+            pre = await self.export([key_field, *other_sets], top=1,
+                                    filters=[{"field": key_field, "value": key_value}])
+            rows = pre.get("rows") or []
+            if not rows:
+                return result  # can't confirm either way — leave result as-is
+            stored = rows[0]
+
+            def _norm(v: Any) -> str:
+                s = str(v).strip()
+                low = s.lower()
+                if low in ("true", "1", "yes", "y"):
+                    return "true"
+                if low in ("false", "0", "no", "n", ""):
+                    return "false"
+                return low
+
+            mismatches = {
+                f: {"sent": v, "stored": stored.get(f)}
+                for f, v in other_sets.items()
+                if f in stored and _norm(stored.get(f)) != _norm(v)
+            }
+            if mismatches:
+                result["ok"] = False
+                result["nav_failed"] = {"key_field": key_field, "key_value": key_value,
+                                        "mismatches": mismatches}
+                result["warning"] = (
+                    f"Navigation by {key_field}={key_value!r} did not select the "
+                    "intended record — the fields you set do not match what is "
+                    "stored (Save persisted nothing meaningful, reporting a false "
+                    "ok:true). If the key's friendly name was ambiguous, the "
+                    "container-qualified form may not trigger navigation; resolve "
+                    "to the primary key descriptor, or confirm the record exists."
+                )
+        except Exception:  # noqa: BLE001 — verification is best-effort, never block
+            pass
+        return result
+
     async def submit(
         self,
         commands: list[dict],
@@ -3256,7 +3331,10 @@ class ScreenClient:
 
         dry_run=True drops the committing commands (button actions + row deletes)
         so the field SETs run but nothing persists — a safe preview that still
-        surfaces field-level errors.
+        surfaces field-level errors. Validates field-bind/enum only, not
+        graph-level Save validations (required-field/business rules only surface
+        on the real Save). A staged {"new_row": ...} is cancelled in this same
+        envelope so nothing rides the shared session into a later call.
 
         auto_answer (e.g. "Yes"): if the Submit faults, re-submit once with a
         DialogAnswer appended for each referenced container that exposes one —
@@ -3291,6 +3369,19 @@ class ScreenClient:
             # preview: drop the committing commands (button actions + row deletes)
             # so the field SETs run but nothing persists; surfaces field errors.
             commands = [c for c in commands if not ("action" in c or "delete_row" in c)]
+            # A {"new_row": ...} has neither key above, so it's still SENT even under
+            # dry_run — the row genuinely gets staged server-side (needed so the
+            # following Sets have something to bind to for validation). Left
+            # uncancelled, that staged row rides on the SHARED session into whatever
+            # the NEXT Submit call does (insert_rows' inter-call sibling of the
+            # 2026-07-13 intra-call fix below). Discard it in THIS same envelope —
+            # best-effort: only append Cancel when this screen actually has one.
+            if any("new_row" in c for c in commands):
+                try:
+                    self._find_field("Cancel")
+                    commands = commands + [{"action": "Cancel"}]
+                except ScreenError:
+                    pass  # no generic Cancel action here — leave prior behavior
         inner = "".join(self._spec_to_command(c) for c in commands)
         try:
             xml = await self._call(
@@ -3416,6 +3507,15 @@ class ScreenClient:
                 "by reading the record back; check that navigation selected the "
                 "intended record."
             )
+        # Ambiguous-key navigation no-op guard: the no-bind guard above only catches
+        # a LARGE re-render body. A container-qualified (ambiguous) key set can fail
+        # to navigate while Save still returns the SMALL empty-success body — see
+        # _verify_navigation. Only fires when a navigating key was actually set, so
+        # it costs nothing on the common case (plain edits, grid inserts).
+        if not dry_run and result["ok"] and not result.get("nobind_suspected"):
+            nav_sets = self._navigating_key_sets(commands)
+            if nav_sets:
+                result = await self._verify_navigation(commands, nav_sets, result)
         # delete_row silent no-op guard — see _verify_deletes.
         if not dry_run and result["ok"] and any("delete_row" in c for c in commands):
             result = await self._verify_deletes(commands, result)
@@ -3481,6 +3581,17 @@ class ScreenClient:
         isolated (matches the already-safe pattern in screen_bulk_load and the
         modern-plane ui_insert_grid_row).
 
+        FIXED (inter-call sibling of the above): one Submit per row stops rows
+        colliding WITHIN a call, but a dry_run's or a failed real Save's NewRow/Set
+        still rode the shared session INTO a later call (2 dry-runs + 1 failed +
+        1 succeeding real insert could all land on the final successful Save).
+        submit() now cancels a dry_run's staged row in the same envelope, and this
+        loop cancels a failed row's staged edits before moving on — see submit()'s
+        dry_run handling and the Cancel call below.
+
+        dry_run validates field-bind/enum only, not graph-level Save validations —
+        required-field/business rules only surface on the real Save.
+
         check_existing (default True): on a MASTER grid (no header context), each
         row's key value is pre-checked by Export — a classic-SOAP "insert" of an
         existing key silently NAVIGATES to and OVERWRITES the record in place while
@@ -3535,6 +3646,47 @@ class ScreenClient:
             r = await self.submit(cmds, dry_run=dry_run, auto_answer=auto_answer)
             r["index"] = i
             results.append(r)
+            if not dry_run and not r.get("ok"):
+                # A failed real Save leaves its NewRow/Set staged on the shared
+                # session — discard it so the NEXT row (or a later call) can't
+                # inherit it and get committed by that row's eventual successful
+                # Save. Best-effort: never let cleanup mask the real failure above.
+                try:
+                    await self.submit([{"action": "Cancel"}], dry_run=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not dry_run and r.get("ok") and isinstance(row, dict):
+                # Key-mangle guard (classic-plane counterpart of ui_insert_grid_row's
+                # _verify_stored_key — that helper reads modern controlsData/
+                # ui_grid_read and can't be called from here; same _is_altered_key
+                # comparison, via this plane's own export() read-back instead).
+                # Acumatica can silently alter a key on save (punctuation -> spaces,
+                # or right-truncation at the field length) — a later lookup/update/
+                # delete/import by the ORIGINAL key then misses. LL102000 stored
+                # "HOUSING" as "HOUSIN" (6-char mask), reporting ok:true, no warning.
+                try:
+                    kv = await self._row_key_field(container, row)
+                    if kv:
+                        k, sent_v = kv
+                        exact = await self.export([k], top=1,
+                                                  filters=[{"field": k, "value": sent_v}])
+                        if not exact.get("rows"):
+                            probe = await self.export([k], top=25)
+                            for cand in (probe.get("rows") or []):
+                                stored_v = cand.get(k)
+                                if stored_v and self._is_altered_key(sent_v, stored_v):
+                                    r["key_mangled"] = True
+                                    r["warning"] = (
+                                        "the row persisted under a DIFFERENT key than "
+                                        f"sent ({k}: {sent_v!r} -> {stored_v!r}) — the "
+                                        "screen silently altered it on save (punctuation "
+                                        "replaced with spaces, or truncated at the field "
+                                        "length). Reference the STORED key in later "
+                                        "lookups, updates, deletes, and imports."
+                                    )
+                                    break
+                except Exception:  # noqa: BLE001 — verification is best-effort, never block
+                    pass
         all_ok = all(r.get("ok") for r in results)
         merged_messages = [m for r in results for m in (r.get("messages") or [])]
         merged_field_errors = [fe for r in results for fe in (r.get("field_errors") or [])]

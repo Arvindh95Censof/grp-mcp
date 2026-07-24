@@ -3663,7 +3663,13 @@ def test_insert_rows_one_submit_per_row_and_header():
         calls.append(cmds)
         return {"ok": True, "messages": [], "field_errors": []}
 
+    async def fake_export(fields, top=10, filters=None):
+        # every row's key-mangle read-back finds the sent value unaltered
+        val = filters[0]["value"] if filters else ""
+        return {"rows": [{fields[0]: val}]}
+
     s.submit = fake_submit
+    s.export = fake_export
     rows = [
         {"Building": "A", "Description": "Bldg A"},
         {"Building": "B", "Description": "Bldg B"},
@@ -3686,14 +3692,19 @@ def test_insert_rows_one_submit_per_row_and_header():
     assert result["succeeded"] == 3
     assert result["failed"] == 0
     assert len(result["results"]) == 3
+    assert all("key_mangled" not in r for r in result["results"])  # no false positives
 
 
 def test_insert_rows_partial_failure_does_not_abort_remaining_rows():
     """One bad row should not block the rest — each row is isolated."""
     s = ScreenClient(_inst(), "CS205010")
     seen_rows = []
+    cancels = []
 
     async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        if cmds == [{"action": "Cancel"}]:
+            cancels.append(True)
+            return {"ok": True}
         # identify which row this is from its Building value
         building = next((c["to"] for c in cmds if c.get("set") == "Building"), None)
         seen_rows.append(building)
@@ -3701,15 +3712,24 @@ def test_insert_rows_partial_failure_does_not_abort_remaining_rows():
             return {"ok": False, "messages": ["Building 'B' already exists"], "field_errors": []}
         return {"ok": True, "messages": [], "field_errors": []}
 
+    async def fake_export(fields, top=10, filters=None):
+        val = filters[0]["value"] if filters else ""
+        return {"rows": [{fields[0]: val}]}
+
     s.submit = fake_submit
+    s.export = fake_export
     rows = [
         {"Building": "A", "Description": "Bldg A"},
         {"Building": "B", "Description": "Bldg B"},
         {"Building": "C", "Description": "Bldg C"},
     ]
-    result = asyncio.run(s.insert_rows("Buildings", rows))
+    # check_existing=False: this test is about per-row isolation, not the
+    # pre-check — fake_export always reporting a "match" would otherwise look
+    # like every row already exists and short-circuit before the loop runs.
+    result = asyncio.run(s.insert_rows("Buildings", rows, check_existing=False))
 
     assert seen_rows == ["A", "B", "C"]   # all 3 attempted despite B failing
+    assert cancels == [True]   # the failed row's staged edits were cancelled — Fix 2
     assert result["ok"] is False
     assert result["succeeded"] == 2
     assert result["failed"] == 1
@@ -3735,6 +3755,299 @@ def test_insert_rows_header_failure_skips_all_rows():
     assert len(calls) == 1   # only the header submit — no row was attempted
     assert result["ok"] is False
     assert "note" in result
+
+
+# ---- Fix 1: classic key-navigation no-op reported as ok:true --------------
+#
+# Root cause (GRP_MCP_PATCHES_2026-07-24.md, verified against source): a
+# container-qualified (ambiguous) key SET can fail to navigate while Save still
+# returns the small empty-success body the existing no-bind guard (_NOBIND_LEN)
+# treats as ok:true. Reproduced live on IV301000 (Hold stayed True after being
+# set False). _navigating_key_sets/_verify_navigation catch it via the SAME
+# export() primitive already used by check_existing/set_record's insert-guard.
+
+def test_navigating_key_sets_detects_linked_command_fields():
+    import xml.etree.ElementTree as ET
+    s = _screen_stub()
+
+    def fake_find_field(name):
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = name
+        ET.SubElement(el, "ObjectName").text = "InvMaster"
+        if name == "InvestmentNumber":
+            ET.SubElement(el, "LinkedCommand")   # schema marks this a navigating key
+        return el
+
+    s._find_field = fake_find_field
+    commands = [{"set": "InvestmentNumber", "to": "26000001"},
+                {"set": "Hold", "to": False},
+                {"action": "Save"}]
+    assert s._navigating_key_sets(commands) == [("InvestmentNumber", "26000001")]
+    # a plain field-only batch (no navigating key) yields nothing
+    assert s._navigating_key_sets([{"set": "Hold", "to": False}]) == []
+
+
+def test_verify_navigation_flags_ambiguous_key_no_op():
+    """The exact IV301000 reproduction: Hold was set False but read back True —
+    the Save persisted nothing meaningful despite navigating-key + Save + ok:true."""
+    s = _screen_stub()
+
+    async def fake_export(fields, top=10, filters=None):
+        return {"rows": [{"InvestmentNumber": "26000001", "Hold": "True"}]}
+
+    s.export = fake_export
+    commands = [{"set": "InvestmentNumber", "to": "26000001"},
+                {"set": "Hold", "to": False},
+                {"action": "Save"}]
+    result = asyncio.run(s._verify_navigation(
+        commands, [("InvestmentNumber", "26000001")], {"ok": True}))
+    assert result["ok"] is False
+    assert result["nav_failed"]["key_field"] == "InvestmentNumber"
+    assert "Hold" in result["nav_failed"]["mismatches"]
+    assert "did not select" in result["warning"]
+
+
+def test_verify_navigation_confirms_when_fields_match():
+    """No false positive: when the read-back agrees with what was sent, ok stays
+    True and no nav_failed is attached."""
+    s = _screen_stub()
+
+    async def fake_export(fields, top=10, filters=None):
+        return {"rows": [{"InvestmentNumber": "26000001", "Hold": "False"}]}
+
+    s.export = fake_export
+    commands = [{"set": "InvestmentNumber", "to": "26000001"},
+                {"set": "Hold", "to": False},
+                {"action": "Save"}]
+    result = asyncio.run(s._verify_navigation(
+        commands, [("InvestmentNumber", "26000001")], {"ok": True}))
+    assert result["ok"] is True
+    assert "nav_failed" not in result
+
+
+def test_verify_navigation_no_op_when_export_finds_nothing():
+    """Export unavailable/empty -> leave the result as-is (unverified, not undone)."""
+    s = _screen_stub()
+
+    async def fake_export(fields, top=10, filters=None):
+        return {"rows": []}
+
+    s.export = fake_export
+    result = asyncio.run(s._verify_navigation(
+        [{"set": "InvestmentNumber", "to": "26000001"}, {"set": "Hold", "to": False}],
+        [("InvestmentNumber", "26000001")], {"ok": True}))
+    assert result["ok"] is True
+    assert "nav_failed" not in result
+
+
+def test_submit_end_to_end_flags_ambiguous_key_no_op():
+    """Wiring check: submit() itself invokes the nav-check at the right point —
+    small body, ok:true, no nobind_suspected, a navigating key was set."""
+    import xml.etree.ElementTree as ET
+    s = ScreenClient(_inst(), "IV301000")
+    s._tree = ET.Element("root")   # skip _ensure_tree's network fetch
+
+    def fake_find_field(name):
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = name
+        ET.SubElement(el, "ObjectName").text = "InvMaster"
+        if name == "InvMaster.InvestmentNumber":
+            ET.SubElement(el, "LinkedCommand")
+        return el
+
+    async def fake_call(op, inner_xml, _seat_retried=False):
+        return "<SubmitResult/>"   # the small empty body -- today's false-success shape
+
+    async def fake_export(fields, top=10, filters=None):
+        return {"rows": [{"InvMaster.InvestmentNumber": "26000001", "InvMaster.Hold": "True"}]}
+
+    s._find_field = fake_find_field
+    s._call = fake_call
+    s.export = fake_export
+    result = asyncio.run(s.submit([
+        {"set": "InvMaster.InvestmentNumber", "to": "26000001"},
+        {"set": "InvMaster.Hold", "to": False},
+        {"action": "Save"},
+    ]))
+    assert result["ok"] is False
+    assert result["nav_failed"]["key_field"] == "InvMaster.InvestmentNumber"
+
+
+def test_submit_skips_nav_check_under_dry_run():
+    import xml.etree.ElementTree as ET
+    s = ScreenClient(_inst(), "IV301000")
+    s._tree = ET.Element("root")
+
+    def fake_find_field(name):
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = name
+        ET.SubElement(el, "ObjectName").text = "InvMaster"
+        if name == "InvMaster.InvestmentNumber":
+            ET.SubElement(el, "LinkedCommand")
+        return el
+
+    calls = {"export": 0}
+
+    async def fake_call(op, inner_xml, _seat_retried=False):
+        return "<SubmitResult/>"
+
+    async def fake_export(fields, top=10, filters=None):
+        calls["export"] += 1
+        return {"rows": []}
+
+    s._find_field = fake_find_field
+    s._call = fake_call
+    s.export = fake_export
+    result = asyncio.run(s.submit([
+        {"set": "InvMaster.InvestmentNumber", "to": "26000001"},
+        {"set": "InvMaster.Hold", "to": False},
+    ], dry_run=True))
+    assert calls["export"] == 0   # nav-check never runs under dry_run
+    assert result["ok"] is True
+
+
+# ---- Fix 2: insert_rows dry_run/failed-Save row leakage across calls ------
+#
+# Root cause (verified against source): submit()'s dry_run filter drops
+# {"action"} and {"delete_row"} commands but a {"new_row": ...} has neither
+# key, so it IS sent live even under dry_run — and nothing ever cancelled it,
+# so it (or a failed real Save's staged edits) could ride the shared session
+# into a LATER call. This is the inter-call sibling of the 2026-07-13 fix.
+
+def test_dry_run_new_row_gets_cancelled_in_same_envelope():
+    import xml.etree.ElementTree as ET
+    s = ScreenClient(_inst(), "CS205010")
+    s._tree = ET.Element("root")
+
+    def fake_find_field(name):
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = name
+        ET.SubElement(el, "ObjectName").text = "Obj"
+        return el
+
+    def fake_service(container, which):
+        return fake_find_field(which)
+
+    sent = {}
+
+    async def fake_call(op, inner_xml, _seat_retried=False):
+        sent["inner"] = inner_xml
+        return "<SubmitResult/>"
+
+    s._find_field = fake_find_field
+    s._service = fake_service
+    s._call = fake_call
+    result = asyncio.run(s.submit(
+        [{"new_row": "Buildings"}, {"set": "Building", "to": "X"}, {"action": "Save"}],
+        dry_run=True,
+    ))
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    # NewRow still passes through (the Sets need it to bind to for preview
+    # validation) but must be cancelled in the SAME envelope so nothing stays
+    # staged for a later call to inherit.
+    assert sent["inner"].count('xsi:type="NewRow"') == 1
+    assert "Cancel" in sent["inner"]
+    assert "Save" not in sent["inner"]   # the real committing action was dropped
+
+
+def test_dry_run_skips_cancel_when_screen_has_no_cancel_action():
+    """Defensive fallback: if this screen has no generic Cancel action,
+    _find_field("Cancel") raises -- must degrade to prior behavior (no crash),
+    never let the cleanup attempt break a previously-working dry_run."""
+    import xml.etree.ElementTree as ET
+    s = ScreenClient(_inst(), "CS205010")
+    s._tree = ET.Element("root")
+
+    def fake_find_field(name):
+        if name == "Cancel":
+            raise ScreenError("field 'Cancel' not found")
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = name
+        ET.SubElement(el, "ObjectName").text = "Obj"
+        return el
+
+    def fake_service(container, which):
+        el = ET.Element("x")
+        ET.SubElement(el, "FieldName").text = which
+        ET.SubElement(el, "ObjectName").text = "Obj"
+        return el
+
+    sent = {}
+
+    async def fake_call(op, inner_xml, _seat_retried=False):
+        sent["inner"] = inner_xml
+        return "<SubmitResult/>"
+
+    s._find_field = fake_find_field
+    s._service = fake_service
+    s._call = fake_call
+    result = asyncio.run(s.submit(
+        [{"new_row": "Buildings"}, {"set": "Building", "to": "X"}, {"action": "Save"}],
+        dry_run=True,
+    ))
+    assert result["ok"] is True   # degrades safely, no crash
+    assert "Cancel" not in sent["inner"]
+
+
+def test_insert_rows_cancels_after_failed_row_before_next_row():
+    """A failed row's real Save must be explicitly cancelled before the loop
+    moves on, so it can't be inherited by the next row's Save."""
+    s = ScreenClient(_inst(), "CS205010")
+    calls = []
+
+    async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        calls.append(cmds)
+        if cmds == [{"action": "Cancel"}]:
+            return {"ok": True}
+        building = next((c["to"] for c in cmds if c.get("set") == "Building"), None)
+        if building == "B":
+            return {"ok": False, "messages": ["Building 'B' already exists"], "field_errors": []}
+        return {"ok": True, "messages": [], "field_errors": []}
+
+    async def fake_export(fields, top=10, filters=None):
+        val = filters[0]["value"] if filters else ""
+        return {"rows": [{fields[0]: val}]}
+
+    s.submit = fake_submit
+    s.export = fake_export
+    rows = [{"Building": "A"}, {"Building": "B"}, {"Building": "C"}]
+    asyncio.run(s.insert_rows("Buildings", rows, check_existing=False))
+
+    # the Cancel must appear IMMEDIATELY after row B's failed Save, before row C
+    save_shapes = [c for c in calls]
+    b_idx = next(i for i, c in enumerate(save_shapes)
+                if any(x.get("to") == "B" for x in c if "set" in x))
+    assert save_shapes[b_idx + 1] == [{"action": "Cancel"}]
+
+
+def test_insert_rows_detects_key_mangled_on_save():
+    """LL102000 reproduction: 'HOUSING' stored as 'HOUSIN' (6-char mask),
+    ok:true, no warning today -- the classic-plane counterpart of
+    ui_insert_grid_row's _verify_stored_key (that helper reads modern
+    controlsData and can't be called here; same _is_altered_key comparison,
+    via this plane's own export())."""
+    s = ScreenClient(_inst(), "LL102000")
+
+    async def fake_submit(cmds, dry_run=False, auto_answer=None):
+        return {"ok": True, "messages": [], "field_errors": []}
+
+    async def fake_row_key_field(container, row):
+        return ("HousingCD", row["HousingCD"])
+
+    async def fake_export(fields, top=10, filters=None):
+        if filters:  # exact-match check: the sent value was NOT stored as-is
+            return {"rows": []}
+        return {"rows": [{"HousingCD": "HOUSIN"}]}   # broader probe finds the truncated form
+
+    s.submit = fake_submit
+    s._row_key_field = fake_row_key_field
+    s.export = fake_export
+    result = asyncio.run(s.insert_rows(
+        "HousingRecords", [{"HousingCD": "HOUSING"}], check_existing=False))
+    row_result = result["results"][0]
+    assert row_result.get("key_mangled") is True
+    assert "HOUSING" in row_result["warning"] and "HOUSIN" in row_result["warning"]
 
 
 # ---- v0.52.5: ui_insert_grid_row key-mangle read-back guard -----------------
@@ -5317,3 +5630,101 @@ def test_ui_screen_action_stamps_hint_until_guide_consulted(cfg, monkeypatch):
     assert "tool_selection_hint" not in out2
     guide_nudge.reset()
     guide_nudge.mark_consulted()  # leave the process in its normal steady state
+
+
+# ---- Patch A: record_key shape validation in ui_screen_action --------------
+#
+# Root cause (verified against source): server.py's ui_screen_action did
+# `record_key["view"]` with no prior shape check — _require_explicit_target only
+# confirms record_key is non-None, never that it has the right keys. A bare
+# {keyField: value} (the natural but wrong shape to guess) raised a bare
+# KeyError: 'view' instead of a clear, actionable error.
+
+def test_ui_screen_action_record_key_bad_shape_raises_clear_error(cfg):
+    with pytest.raises(ScreenError, match="record_key must be"):
+        asyncio.run(server.ui_screen_action(
+            "PY309000", "Save", record_key={"RefNbr": "000001"}, instance="rw"))
+
+
+def test_ui_screen_action_record_key_missing_key_raises_clear_error(cfg):
+    with pytest.raises(ScreenError, match="record_key must be"):
+        asyncio.run(server.ui_screen_action(
+            "PY309000", "Save", record_key={"view": "Purchase"}, instance="rw"))
+
+
+def test_ui_screen_action_record_key_well_formed_passes_shape_guard(cfg, monkeypatch):
+    """A correctly-shaped record_key must NOT be rejected by the new guard —
+    it should fail later (unknown view, on this fake struct) rather than here."""
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    with pytest.raises(ScreenError, match="unknown view"):
+        asyncio.run(server.ui_screen_action(
+            "PY309000", "Save",
+            record_key={"view": "NoSuchView", "key": {"RefNbr": "000001"}},
+            instance="rw"))
+
+
+# ---- Fix 4 minor hardening --------------------------------------------------
+
+def test_delete_entity_composite_key_gets_actionable_hint(cfg, monkeypatch):
+    """delete_entity sends record_id verbatim as a URL path segment — a NoteID
+    GUID against a composite-keyed entity (e.g. Payment's Type+RefNbr) 500s with
+    a condition-not-satisfied message. Turn that into an actionable hint."""
+    class FakeClient:
+        async def delete_entity(self, entity, record_id):
+            raise AcumaticaError("500: No entity satisfies the condition.")
+
+    monkeypatch.setattr(server, "_client", lambda instance=None, endpoint=None: FakeClient())
+    with pytest.raises(AcumaticaError) as exc:
+        asyncio.run(server.delete_entity(
+            "Payment", "3fa85f64-5717-4562-b3fc-2c963f66afa6", instance="rw"))
+    msg = str(exc.value)
+    assert "COMPOSITE key" in msg
+    assert "get_entity_schema" in msg
+
+
+def test_delete_entity_other_errors_pass_through_unhinted(cfg, monkeypatch):
+    """Only the specific composite-key-shaped message gets the hint — any other
+    AcumaticaError must propagate unchanged."""
+    class FakeClient:
+        async def delete_entity(self, entity, record_id):
+            raise AcumaticaError("401: Unauthorized")
+
+    monkeypatch.setattr(server, "_client", lambda instance=None, endpoint=None: FakeClient())
+    with pytest.raises(AcumaticaError, match="^401: Unauthorized$"):
+        asyncio.run(server.delete_entity("Payment", "x", instance="rw"))
+
+
+def test_get_entity_bare_bql_delegate_read_gets_actionable_hint(cfg, monkeypatch):
+    """A bare get_entity('Payment') (no record_id, no $select/$expand) hits the
+    same BQL-delegate signature the existing $select/$expand retry already
+    handles, but had nothing to retry with -- surface a clear hint instead of
+    the raw 500."""
+    class FakeClient:
+        async def get_entity(self, entity, record_id, params):
+            raise AcumaticaError("500: given key not present in dictionary")
+
+    monkeypatch.setattr(server, "_client", lambda instance=None, endpoint=None: FakeClient())
+    with pytest.raises(AcumaticaError) as exc:
+        asyncio.run(server.get_entity("Payment", instance="ro"))
+    msg = str(exc.value)
+    assert "BQL-delegate" in msg
+    assert "$filter" in msg
+
+
+def test_get_entity_select_expand_retry_still_works(cfg, monkeypatch):
+    """The existing $select/$expand drop-and-retry path must be unaffected by
+    widening `retryable` to also cover the bare-call case."""
+    calls = []
+
+    class FakeClient:
+        async def get_entity(self, entity, record_id, params):
+            calls.append(dict(params))
+            if "$select" in params:
+                raise AcumaticaError("500: Optimization cannot be performed")
+            return {"id": "x"}
+
+    monkeypatch.setattr(server, "_client", lambda instance=None, endpoint=None: FakeClient())
+    out = asyncio.run(server.get_entity("VendorClass", select="ClassID", instance="ro"))
+    assert out["result"] == {"id": "x"}   # pre-existing wrap: {"_warning", "result"}
+    assert len(calls) == 2   # first with $select (fails), retried without it

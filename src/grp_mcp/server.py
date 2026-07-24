@@ -1392,15 +1392,27 @@ async def get_entity(
         # present". Retry once without $select (the usual culprit), then without
         # $expand, and flag what was dropped instead of failing outright.
         msg = str(e)
-        retryable = record_id is None and (select or expand) and any(
+        retryable = record_id is None and any(
             s in msg for s in (
                 "Optimization cannot be performed",
                 "key was not present in the dictionary",
+                "key not present in dictionary",   # observed wording variant, e.g. Payment
                 "has BQL delegate",
             )
         )
         if not retryable:
             raise
+        if not (select or expand):
+            # A bare list call (no $select/$expand to drop) hit the same
+            # BQL-delegate signature — there is nothing to retry differently, the
+            # entity's list view is fundamentally incompatible with a broad query
+            # on this endpoint (e.g. Payment). Surface a clear, actionable error
+            # instead of the raw 500.
+            raise AcumaticaError(
+                f"{e} | HINT: '{entity}' has a BQL-delegate view that breaks a bare "
+                f"list query on this endpoint. Query it filtered ($filter/$top), or "
+                f"read one record at a time by its id."
+            ) from e
         dropped: list[str] = []
         retry = dict(params)
         if "$select" in retry:
@@ -2184,6 +2196,9 @@ async def ui_screen_action(
         loaded" — it means the record the LAST operation left current, which is how a
         live approval map got renamed. Singleton setup screens with no key (GL102000,
         CS100000) pass target="current".
+        record_key = {"view": <ViewName>, "key": {<keyField>: <value>, ...}} — the KEY
+        FIELDS go under "key"; only the view name is top-level (e.g.
+        record_key={"view": "Purchase", "key": {"RefNbr": "000001"}}).
         tree_select = {"view", "key", "parent_key"?, "ancestor_keys"?, "select_command"?}.
         `select_command` defaults to SM207060's "EnablePopulate"; on any other tree screen
         pass that screen's own selection-changed handler (from this screen's `actions`).
@@ -2232,6 +2247,15 @@ async def ui_screen_action(
     if action not in _TARGETLESS_ACTIONS:
         _require_explicit_target("ui_screen_action", "record_key",
                                  record_key, target)
+    if record_key is not None and (
+        not isinstance(record_key, dict) or "view" not in record_key or "key" not in record_key
+    ):
+        raise ScreenError(
+            "ui_screen_action: record_key must be "
+            "{'view': <ViewName>, 'key': {<keyField>: <value>}} — got "
+            f"{record_key!r}. The KEY FIELDS go under 'key'; only the view name is "
+            "top-level (e.g. record_key={'view': 'Purchase', 'key': {'RefNbr': '000001'}})."
+        )
     _require_write(instance)
     # A destructive action deletes data — hold it to the stricter allow_delete gate,
     # so the modern plane can't sidestep it (parity with delete_entity).
@@ -7353,12 +7377,28 @@ async def delete_entity(entity: str, record_id: str, endpoint: str | None = None
 
     endpoint: override as '<Name>/<Version>' (e.g. 'grp_mcp/25.200.001').
     Requires the instance's "allow_delete": true (default off, stricter than write).
+
+    record_id is sent as-is in the URL path — for an entity keyed by a COMPOSITE
+    key (e.g. Payment's Type+RefNbr), that means a keys-path like "Check/000123",
+    NOT the record's NoteID GUID. A GUID there 500s with a condition-not-satisfied
+    error (get_entity_schema shows whether an entity's key is composite).
     """
     _require_delete(instance)
     _pf = await _write_preflight("delete_entity", instance, query=entity)
     if _pf and _pf.get("blocked"):
         return _blocked_result(_pf)
-    result = await _client(instance, endpoint).delete_entity(entity, record_id)
+    try:
+        result = await _client(instance, endpoint).delete_entity(entity, record_id)
+    except AcumaticaError as e:
+        msg = str(e)
+        if any(s in msg for s in ("No entity satisfies the condition",
+                                  "given key not present in dictionary")):
+            raise AcumaticaError(
+                f"{e} | HINT: '{entity}' may have a COMPOSITE key (e.g. Type+RefNbr) — "
+                f"record_id must be that keys-path (\"Type/RefNbr\"), not a NoteID GUID. "
+                f"Check get_entity_schema('{entity}')."
+            ) from e
+        raise
     if _pf and isinstance(result, dict):
         result.setdefault("preflight", _pf)
     return result
