@@ -5186,3 +5186,134 @@ def test_build_approval_map_refuses_duplicate(cfg, monkeypatch):
         "Dup", "PX.Objects.GL.Batch",
         [{"name": "Approve", "workgroup": 16864}], graph_type="G"))
     assert out.get("skipped") is True and out["assignment_map_id"] == 99
+
+
+# ---- guide_nudge: soft tool-selection hint ---------------------------------
+#
+# "Call guide() first" has only ever been prose in the server's MCP instructions
+# blob -- nothing checks or even hints whether an agent actually did. Unlike the
+# write-preflight (KB-first, can BLOCK under enforcement=enforce), this is a
+# warn-only reminder: it never blocks anything, at any level. It stamps once,
+# on the first ERP-mutation tool result of the process, if no discovery tool
+# (guide / screen_capabilities / get_setup_guidance) has been called yet.
+
+def test_guide_nudge_maybe_hint_only_for_erp_mutation_until_consulted():
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    assert guide_nudge.maybe_hint("create_or_update_entity") == guide_nudge.HINT
+    assert guide_nudge.maybe_hint("get_entity") is None  # READ class -> never nudged
+    guide_nudge.mark_consulted()
+    assert guide_nudge.maybe_hint("create_or_update_entity") is None
+    guide_nudge.reset()
+
+
+def test_guide_nudge_stamp_hint_is_idempotent_and_dict_only():
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    out = guide_nudge.stamp_hint({"ok": True}, "delete_entity")
+    assert out["tool_selection_hint"] == guide_nudge.HINT
+    # already-stamped result is left alone, not overwritten or duplicated
+    again = guide_nudge.stamp_hint(out, "delete_entity")
+    assert again is out and again["tool_selection_hint"] == guide_nudge.HINT
+    # non-dict results and non-mutation tools are untouched
+    assert guide_nudge.stamp_hint("not a dict", "delete_entity") == "not a dict"
+    assert "tool_selection_hint" not in guide_nudge.stamp_hint({"ok": True}, "get_entity")
+    guide_nudge.mark_consulted()
+    assert "tool_selection_hint" not in guide_nudge.stamp_hint({"ok": True}, "delete_entity")
+    guide_nudge.reset()
+
+
+def test_guide_marks_consulted():
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    server.guide()
+    assert guide_nudge._consulted is True
+    guide_nudge.reset()
+
+
+def test_get_setup_guidance_marks_consulted():
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    server.get_setup_guidance()
+    assert guide_nudge._consulted is True
+    guide_nudge.reset()
+
+
+def test_screen_capabilities_marks_consulted_even_on_error(cfg, monkeypatch):
+    """mark_consulted() runs BEFORE the ScreenClient is even constructed, so it
+    fires regardless of whether the probe itself succeeds."""
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    _patch_screen_client(monkeypatch, _RaisingUIScreenClient(ScreenError("boom")))
+    with pytest.raises(ScreenError):
+        asyncio.run(server.screen_capabilities("X", instance="ro"))
+    assert guide_nudge._consulted is True
+    guide_nudge.reset()
+
+
+def test_preflight_write_decorator_invokes_guide_nudge_stamp(monkeypatch):
+    """@_preflight_write must fold the tool-selection nudge into whatever the
+    tool body returned, tagged with the REAL tool name (fn.__name__), not just
+    run it and forget it."""
+    from grp_mcp import guide_nudge
+    calls = []
+
+    def _spy(result, tool_name):
+        calls.append((result, tool_name))
+        return result
+    monkeypatch.setattr(guide_nudge, "stamp_hint", _spy)
+
+    async def _no_pf(*a, **k):
+        return None
+    monkeypatch.setattr(server, "_write_preflight", _no_pf)
+
+    @server._preflight_write()
+    async def _dummy_write(instance=None):
+        return {"ok": True}
+
+    out = asyncio.run(_dummy_write())
+    assert out == {"ok": True}
+    assert calls == [({"ok": True}, "_dummy_write")]
+
+
+def test_hint_only_decorator_invokes_guide_nudge_stamp(monkeypatch):
+    """The 4 inline-preflight tools skip @_preflight_write (bespoke inline gate
+    logic) but still get @_hint_only for the generic nudge stamping."""
+    from grp_mcp import guide_nudge
+    calls = []
+
+    def _spy(result, tool_name):
+        calls.append((result, tool_name))
+        return result
+    monkeypatch.setattr(guide_nudge, "stamp_hint", _spy)
+
+    @server._hint_only
+    async def _dummy_inline(instance=None):
+        return {"ok": True}
+
+    out = asyncio.run(_dummy_inline())
+    assert out == {"ok": True}
+    assert calls == [({"ok": True}, "_dummy_inline")]
+
+
+def test_ui_screen_action_stamps_hint_until_guide_consulted(cfg, monkeypatch):
+    """End-to-end on a real @_hint_only tool: the hint appears on the first
+    mutation, then stops once a discovery tool has been consulted."""
+    from grp_mcp import guide_nudge
+    guide_nudge.reset()
+    client = _FakeUIScreenClient(_PY_LIKE_STRUCT)
+    _patch_screen_client(monkeypatch, client)
+    out = asyncio.run(server.ui_screen_action(
+        "PY309000", "Save",
+        set_fields=[{"view": "Employments", "field": "BasicPay", "value": 1000}],
+        target="current", instance="rw"))
+    assert out["tool_selection_hint"] == guide_nudge.HINT
+
+    guide_nudge.mark_consulted()
+    out2 = asyncio.run(server.ui_screen_action(
+        "PY309000", "Save",
+        set_fields=[{"view": "Employments", "field": "BasicPay", "value": 1000}],
+        target="current", instance="rw"))
+    assert "tool_selection_hint" not in out2
+    guide_nudge.reset()
+    guide_nudge.mark_consulted()  # leave the process in its normal steady state

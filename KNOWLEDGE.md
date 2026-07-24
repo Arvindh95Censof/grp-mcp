@@ -2214,6 +2214,23 @@ means whole-disk — it confines to the working directory. Whole-disk access is 
 opt-in: `allow_unrestricted_fs=true`. `effective_roots(kind)` resolves it; explicit roots
 always win.
 
+**Tool-selection nudge** (`guide_nudge.py`, v0.71.0). A separate, smaller problem: "call
+`guide()`/`screen_capabilities()` first to pick the right plane" has only ever been prose in
+the server's MCP instructions blob — nothing checked or even hinted whether an agent actually
+did it. Unlike the write-preflight above, this NEVER blocks, at any level — a wrong-plane READ
+just costs a retry (cheap, self-correcting), so a hard gate isn't worth the added latency on
+every ambiguous call; only writes get the nudge, since a wrong-plane WRITE is a real mutation
+attempt. Mechanism: a process-lifetime flag (`_consulted`, same "one process = one session"
+proxy as `kb_client`'s cache) flips true the moment `guide`, `screen_capabilities`, or
+`get_setup_guidance` is called (first line of each, so it fires even if the rest of the call
+errors). Every ERP-mutation tool result gets a one-shot `tool_selection_hint` key stamped in
+via `guide_nudge.stamp_hint` — folded into the existing `@_preflight_write` decorator for the
+47 decorator-wired tools, and via a new tiny `@_hint_only` decorator for the 4 inline ones
+(`create_or_update_entity`, `delete_entity`, `ui_screen_action`, `screen_submit` — their
+preflight logic is bespoke/inline, but the nudge isn't, so duplicating it at every early-return
+site would've been noise). Fires once per session; silent forever after any discovery tool is
+called. No config, no enforcement level — always on, always soft.
+
 ---
 
 *This file is generic operational knowledge. Instance-specific state (credentials, tenant names,

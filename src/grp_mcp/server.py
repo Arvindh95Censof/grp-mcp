@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import enforcement, kb, preflight
+from . import enforcement, guide_nudge, kb, preflight
 from .acumatica import AcumaticaClient, AcumaticaError
 from .aspx import AspxDiagnostic, _tree_node_dom_id
 from .config import Config, Instance, load_config, save_config
@@ -421,12 +421,29 @@ def _preflight_write(*, query_arg: str | None = None, query_const: str | None = 
             res = await fn(*a, **k)
             if pf and isinstance(res, dict):
                 res.setdefault("preflight", pf)
-            return res
+            return guide_nudge.stamp_hint(res, fn.__name__)
 
         wrap.__preflight_wired__ = True  # marker the coverage test looks for
         return wrap
 
     return deco
+
+
+def _hint_only(fn):
+    """Stamp the tool-selection nudge (guide_nudge) onto a tool's result.
+
+    For the four inline-preflight tools (create_or_update_entity,
+    delete_entity, ui_screen_action, screen_submit) — their write-preflight is
+    bespoke/inline rather than routed through @_preflight_write, but the
+    tool-selection nudge is generic, so it's applied here instead of
+    duplicating stamp_hint at every early-return site in those bodies.
+    """
+    @functools.wraps(fn)
+    async def wrap(*a, **k):
+        res = await fn(*a, **k)
+        return guide_nudge.stamp_hint(res, fn.__name__)
+
+    return wrap
 
 
 # Screen/UI actions that DELETE data — held to the stricter allow_delete gate (not
@@ -1507,6 +1524,7 @@ def _put_operation(result: dict) -> str | None:
 
 
 @mcp.tool()
+@_hint_only
 async def create_or_update_entity(
     entity: str,
     fields: dict,
@@ -1833,6 +1851,7 @@ async def screen_capabilities(screen_id: str, instance: str | None = None) -> An
     documented rule is stable, but always confirm the live required/enabled state
     with ui_get_structure before a write. (KB-first policy still applies.)
     """
+    guide_nudge.mark_consulted()
     inst = _cfg().get(instance or _cfg().default)
     async with ScreenClient(inst, screen_id) as s:
         try:
@@ -2130,6 +2149,7 @@ async def ui_resolve_selector(
 
 
 @mcp.tool()
+@_hint_only
 async def ui_screen_action(
     screen_id: str,
     action: str,
@@ -3689,6 +3709,7 @@ async def aspx_tree_node_action(
 
 
 @mcp.tool()
+@_hint_only
 async def screen_submit(
     screen_id: str,
     commands: list[dict],
@@ -7325,6 +7346,7 @@ async def build_import_scenario(
 
 
 @mcp.tool()
+@_hint_only
 async def delete_entity(entity: str, record_id: str, endpoint: str | None = None,
                         instance: str | None = None) -> Any:
     """Delete a record by its id (the record's key GUID or keys path).
@@ -8495,6 +8517,7 @@ def guide(topic: str | None = None) -> Any:
         arg shapes, live-proven traps and worked examples kept out of its docstring so
         they don't cost every request. Pass one before driving an unfamiliar screen.
     """
+    guide_nudge.mark_consulted()
     if topic:
         t = topic.strip().lower()
         note = _TOOL_NOTES.get(t)
@@ -8605,6 +8628,7 @@ def get_setup_guidance(screen_id: str | None = None, area: str | None = None) ->
     Read-only, no API session. Scope is the financial foundation only (not Distribution/
     Projects/Manufacturing/etc. nor the transactional layer).
     """
+    guide_nudge.mark_consulted()
     m = _setup_map()
     live_reminder = m["layers"]["live"]
     if screen_id:
